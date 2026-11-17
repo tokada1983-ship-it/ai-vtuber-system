@@ -20,38 +20,51 @@
 
 ## アーキテクチャ概要
 
-```
- 視聴者コメント                            マイク音声 (STT)
- (YouTube / Twitch / ツイキャス)               │
-        │                                      ▼
-        ▼                              ┌───────────────┐
- ┌─────────────┐   選別・優先度付け     │ ローカルチャット │
- │ CommentSource│ ───────────────────► │   (ブラウザ)    │
- └─────────────┘                       └──────┬────────┘
-                                              ▼
-                                    ┌───────────────────┐
-                                    │   Orchestrator    │
-                                    │  発話の排他・順序  │
-                                    │  掛け合いの演出    │
-                                    └──┬─────┬─────┬────┘
-              話題・記憶・思考        │     │     │       生成
-        ┌────────────────────────────┘     │     └──────────────────┐
-        ▼                                  ▼                        ▼
- ┌─────────────┐  ┌──────────────┐  ┌────────────┐        ┌────────────────┐
- │ TopicPlanner│  │ MindStore /  │  │ Web検索・   │        │ LLM ハイブリッド │
- │ (Utility制) │  │ 記憶・MindLoop│  │ ニュースRSS │        │ ローカル⇔クラウド│
- └─────────────┘  └──────────────┘  └────────────┘        └───────┬────────┘
-                                                                  │ 発話文
-                                                                  ▼
-                                              ┌────────────────────────┐
-                                              │ TTS (Irodori / VOICEVOX)│
-                                              └───────┬────────────────┘
-                                                      │ 音声＋字幕＋モーション
-                                                      ▼
-                                    WebSocket ─► フロントエンド (アバター / 字幕)
-                                                      │
-                                                      ▼
-                                              OBS ブラウザソース / Unity
+システム構成の概念図です。
+
+```mermaid
+flowchart TB
+    subgraph Platforms["配信プラットフォーム"]
+        YT["YouTube Live"]
+        TW["Twitch / ツイキャス"]
+    end
+    subgraph System["AI VTuber System（Python / FastAPI）"]
+        CS["CommentSource<br/>コメント取得"]
+        ORC["Orchestrator<br/>発話の統括・掛け合い演出"]
+        subgraph Brain["話題・記憶・思考"]
+            TP["TopicPlanner<br/>話題選定"]
+            MIND["MindStore / MindLoop<br/>記憶・自律思考"]
+            WEB["Web検索 / ニュースRSS"]
+        end
+        ROUTER["LLM ハイブリッドルーター"]
+        TTS["TTS 連携"]
+        FE["フロントエンド<br/>アバター / 字幕"]
+        ARCH["StreamArchiver<br/>配信記録のエピソード化"]
+    end
+    subgraph Services["外部・ローカルサービス"]
+        LOCAL["ローカルLLM<br/>Ollama / LM Studio"]
+        CLOUD["クラウドLLM<br/>Gemini / Claude / OpenAI"]
+        TTSSRV["Irodori-TTS / VOICEVOX"]
+    end
+    OBS["OBS（ブラウザソース）"]
+    UI["ダッシュボード / ローカルチャット"]
+
+    YT --> CS
+    TW --> CS
+    CS --> ORC
+    UI --> ORC
+    ORC --> TP
+    ORC --> MIND
+    ORC --> WEB
+    ORC --> ROUTER
+    ROUTER --> LOCAL
+    ROUTER --> CLOUD
+    ORC --> TTS
+    TTS --> TTSSRV
+    TTS --> FE
+    FE --> OBS
+    ORC --> ARCH
+    ARCH --> MIND
 ```
 
 詳細は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) を参照してください。

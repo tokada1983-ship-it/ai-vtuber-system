@@ -9,6 +9,67 @@ AI VTuber System の内部構造と、発話が生成されてアバターが喋
 
 中核は `backend/orchestrator.py` の Orchestrator です。ただし Orchestrator 自身は「舞台」の側——コメントの取得と選別、誰が喋るかの演出、発話の排他、TTS の直列化——だけを受け持ち、キャラクター 1 体ぶんの LLM・TTS・記憶・会話ログは `backend/ensemble/` の CharacterAgent が保持します。出演が 1 体なら単独運用、複数体なら掛け合い運用として同じコードパスで動きます。
 
+### システム構成図
+
+```mermaid
+flowchart TB
+    subgraph Input["入力"]
+        CMT["配信コメント<br/>YouTube / Twitch / ツイキャス"]
+        MIC["マイク音声<br/>faster-whisper"]
+        LCHAT["ローカルチャット"]
+    end
+    subgraph Core["本体（FastAPI）"]
+        SRC["sources<br/>コメント取得"]
+        SEL["selection<br/>優先度スコア付け"]
+        ORC["orchestrator<br/>発話パイプライン統括"]
+        ENS["ensemble<br/>CharacterAgent / TurnDirector"]
+        subgraph Knowledge["知識・記憶・思考"]
+            TP["TopicPlanner"]
+            MEM["memory<br/>短期・長期記憶"]
+            MIND["MindStore / MindLoop / SleepCycle"]
+            KNW["knowledge<br/>ニュースRSS / Web検索"]
+        end
+        LLM["llm<br/>ハイブリッドルーター"]
+        SAFE["safety<br/>応答フィルタ"]
+        TTS["tts<br/>音声合成・ルーティング"]
+        AVA["avatar / WebSocket ハブ"]
+    end
+    subgraph Ext["外部サービス"]
+        LLOCAL["Ollama / LM Studio"]
+        LCLOUD["Gemini / Claude / OpenAI"]
+        IRO["Irodori-TTS / VOICEVOX"]
+    end
+    subgraph Output["出力"]
+        FE["フロントエンド<br/>アバター / 字幕 / ダッシュボード"]
+        OBS["OBS ブラウザソース"]
+        UNI["Unity（VRM）"]
+    end
+    DB[("キャラ別データ<br/>記憶DB / 配信アーカイブ")]
+
+    CMT --> SRC
+    SRC --> SEL
+    SEL --> ORC
+    MIC --> ORC
+    LCHAT --> ORC
+    ORC --> ENS
+    ENS --> TP
+    ENS --> MEM
+    ENS --> MIND
+    ORC --> KNW
+    ENS --> LLM
+    LLM --> LLOCAL
+    LLM --> LCLOUD
+    LLM --> SAFE
+    SAFE --> TTS
+    TTS --> IRO
+    TTS --> AVA
+    AVA --> FE
+    FE --> OBS
+    AVA --> UNI
+    MEM --- DB
+    MIND --- DB
+```
+
 ## 2. コンポーネント構成と責務
 
 | コンポーネント | 場所 | 責務 |
@@ -39,6 +100,19 @@ AI VTuber System の内部構造と、発話が生成されてアバターが喋
 - Ollama と Irodori-TTS サーバは、設定により本体から自動起動できます（`ollama.auto_start` / `tts.irodori_server.auto_start`）。
 
 ## 3. 発話生成フロー
+
+コメント応答の全体フローです（詳細は以下の各節）。
+
+```mermaid
+flowchart LR
+    A["コメント受信"] --> B["選別・優先度付け"]
+    B --> C["話者の決定"]
+    C --> D["階層プロンプト構築<br/>L0a〜L3"]
+    D --> E["LLM ストリーミング生成"]
+    E --> F["応答フィルタ<br/>反復ブロック・整形"]
+    F --> G["TTS 合成"]
+    G --> H["アバター・字幕へ配信"]
+```
 
 ### 3.1 コメント応答の流れ
 
