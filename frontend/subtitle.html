@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Subtitle Overlay</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: transparent; overflow: hidden; display: flex; align-items: flex-end; justify-content: center;
+    width: 100vw; height: 100vh; padding-bottom: 40px; }
+  #subtitle {
+    background: rgba(0,0,0,0.7); color: #fff;
+    padding: 10px 24px; border-radius: 24px;
+    font-size: 22px; font-family: 'Hiragino Sans', 'Yu Gothic', sans-serif;
+    max-width: 80vw; text-align: center; line-height: 1.5;
+    opacity: 0; transition: opacity 0.3s;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+  }
+  #subtitle.visible { opacity: 1; }
+  /* 掛け合い配信では誰のセリフか名札を出す（?names=0 で非表示） */
+  #subtitle .speaker { font-size: 15px; opacity: .8; margin-right: .6em; font-weight: bold; }
+</style>
+</head>
+<body>
+<div id="subtitle"></div>
+<script>
+  const el = document.getElementById('subtitle');
+  let timer = null;
+  const params = new URLSearchParams(location.search);
+  const ONLY = params.get('char') || '';          // 特定キャラの字幕だけ出したいとき
+  const SHOW_NAMES = params.get('names') !== '0';
+
+  function connect() {
+    const ws = new WebSocket(`ws://${location.host}/ws/subtitle`);
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'subtitle' && msg.text) {
+        if (ONLY && msg.character && msg.character !== ONLY) return;
+        el.textContent = '';
+        if (SHOW_NAMES && msg.speaker) {
+          const name = document.createElement('span');
+          name.className = 'speaker';
+          name.textContent = msg.speaker;
+          el.appendChild(name);
+        }
+        el.appendChild(document.createTextNode(msg.text));
+        el.classList.add('visible');
+        clearTimeout(timer);
+        // 表示時間は音声の長さに合わせる（日本語TTSは約5文字/秒＋余韻）
+        const ms = Math.min(14000, Math.max(2500, msg.text.length * 200 + 800));
+        timer = setTimeout(() => el.classList.remove('visible'), ms);
+      }
+    };
+    ws.onclose = () => setTimeout(connect, 3000);
+  }
+  connect();
+</script>
+</body>
+</html>

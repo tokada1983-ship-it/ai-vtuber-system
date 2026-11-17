@@ -1,0 +1,8 @@
+# アバター設定（avatar.yaml）— VRM を使う場合の設定
+# backend/memory/character_preset.py の AvatarPreset に対応します。
+model_path: models/default.vrm   # VRM ファイルのパス
+idle_motion: breathe             # 待機モーション名
+calibration:
+  armDownZ: 0.1
+  foreArmZ: 0.05
+  spineX: 0.0

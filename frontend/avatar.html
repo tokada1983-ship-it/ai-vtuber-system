@@ -1,0 +1,897 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>AI Vtuber Avatar</title>
+<link rel="icon" href="data:,">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: transparent; overflow: hidden; width: 100vw; height: 100vh; }
+  #canvas-container { width: 100%; height: 100%; }
+  canvas { display: block; }
+  #subtitle-overlay {
+    position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.65); color: #fff;
+    padding: 8px 20px; border-radius: 20px;
+    font-size: 20px; font-family: 'Hiragino Sans', 'Yu Gothic', sans-serif;
+    max-width: 80vw; text-align: center;
+    opacity: 0; transition: opacity 0.3s; pointer-events: none;
+  }
+  #subtitle-overlay.visible { opacity: 1; }
+  #status-indicator {
+    position: fixed; top: 10px; right: 10px; font-size: 11px;
+    color: rgba(255,255,255,0.4); font-family: monospace;
+  }
+</style>
+</head>
+<body>
+<div id="canvas-container"></div>
+<div id="subtitle-overlay"></div>
+<div id="status-indicator">connecting...</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ════════════════════════════════════════════════════════════════
+// シーン
+// ════════════════════════════════════════════════════════════════
+
+const container = document.getElementById('canvas-container');
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setClearColor(0x000000, 0);
+container.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(30, window.innerWidth / window.innerHeight, 0.1, 20);
+// 映し方：?view=full（既定・全身）/ upper（膝上）/ bust（胸から上）
+const VIEW = new URLSearchParams(location.search).get('view') || 'full';
+camera.position.set(0, 1.3, 3.5);
+camera.lookAt(0, 1.2, 0);
+
+// モデルの頭の高さに合わせてカメラを置く（背の低いモデルでも小さくなりすぎない）
+function frameCamera(vrm) {
+  if (VIEW === 'full') return;
+  const head = vrm.humanoid?.getNormalizedBoneNode?.('head');
+  if (!head) return;
+  const v = new THREE.Vector3();
+  head.getWorldPosition(v);
+  // 頭のてっぺん（髪・帽子・耳込み）は頭ボーンの約0.3m上。少し余白を足して画面に収める
+  const top = v.y + 0.34;
+  const span = VIEW === 'bust' ? 0.72 : 1.15;         // 画面の縦に入れる高さ(m)
+  const half = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  const dist = (span / 2) / half;
+  const aim = top - span / 2;
+  camera.position.set(0, aim + 0.03, dist);
+  camera.lookAt(0, aim, 0);
+}
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(1, 2, 2);
+scene.add(dirLight);
+
+window.addEventListener('resize', () => {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+// ?mute=1 : アバター画面では音を鳴らさず口だけ動かす
+const MUTED = new URLSearchParams(location.search).get('mute') === '1';
+// ── 掛け合い配信: この画面が担当するキャラ ──────────────────────
+// /avatar?char=<id> で指定（省略時はリーダー）。他のキャラの発話には反応しない
+const CHAR_PARAM = new URLSearchParams(location.search).get('char') || '';
+let MY_CHAR = CHAR_PARAM;
+function isMine(msg) {
+  if (!MY_CHAR) return true;
+  if (msg.type === 'config_update') return !msg.characters || msg.characters.includes(MY_CHAR);
+  return !msg.character || msg.character === MY_CHAR;
+}
+function avatarConfigUrl() {
+  return '/api/avatar_config' + (CHAR_PARAM ? '?char=' + encodeURIComponent(CHAR_PARAM) : '');
+}
+
+
+// ════════════════════════════════════════════════════════════════
+// VRM 読み込み
+// ════════════════════════════════════════════════════════════════
+
+let currentVrm = null;
+let calibration = { armDownZ: 1.15, foreArmZ: 0.05, spineX: 0.0 };
+
+async function loadCalibration() {
+  try {
+    const resp = await fetch('/api/avatar_calibration');
+    if (resp.ok) calibration = { ...calibration, ...(await resp.json()) };
+  } catch (e) { /* 既定値のまま */ }
+}
+
+// 視線の先（カメラ付近）。少しずつ動かして目線にゆらぎを出す
+const lookTarget = new THREE.Object3D();
+scene.add(lookTarget);
+
+async function loadVRM(url) {
+  try {
+    const { GLTFLoader } = await import('https://cdn.jsdelivr.net/npm/three@0.152.2/examples/jsm/loaders/GLTFLoader.js');
+    const { VRMLoaderPlugin, VRMUtils } = await import('https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@2.1.2/lib/three-vrm.module.min.js');
+    const loader = new GLTFLoader();
+    loader.register(parser => new VRMLoaderPlugin(parser));
+    const gltf = await new Promise((resolve, reject) => loader.load(url, resolve, undefined, reject));
+    VRMUtils.removeUnnecessaryJoints(gltf.scene);
+    const vrm = gltf.userData.vrm;
+    VRMUtils.rotateVRM0(vrm);
+    if (currentVrm) { scene.remove(currentVrm.scene); VRMUtils.deepDispose(currentVrm.scene); }
+    currentVrm = vrm;
+    scene.add(vrm.scene);
+    vrm.scene.traverse(o => { o.frustumCulled = false; });
+    if (vrm.lookAt) vrm.lookAt.target = lookTarget;
+    rig.bind(vrm);
+    vrm.scene.updateMatrixWorld(true);
+    frameCamera(vrm);
+    setStatus('VRM loaded');
+  } catch (e) {
+    console.warn('VRM load failed:', e);
+    setStatus('VRM load failed');
+    showFallbackAvatar();
+  }
+}
+
+function showFallbackAvatar() {
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.15, 32, 32), new THREE.MeshLambertMaterial({ color: 0xffd0a0 }));
+  head.position.set(0, 1.55, 0);
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.1, 0.4, 16), new THREE.MeshLambertMaterial({ color: 0x7c6ff7 }));
+  body.position.set(0, 1.25, 0);
+  scene.add(head, body);
+  setStatus('Fallback avatar');
+}
+
+// ════════════════════════════════════════════════════════════════
+// 小道具（補間・ノイズ）
+// ════════════════════════════════════════════════════════════════
+
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const smooth = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+const easeOutBack = t => { t = clamp(t, 0, 1); const c = 1.7; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); };
+const damp = (cur, target, k, dt) => cur + (target - cur) * (1 - Math.exp(-k * dt));
+const rand = (a, b) => a + Math.random() * (b - a);
+
+// 0→1→1→0 の包絡線（立ち上がりは少し行き過ぎて戻る＝弾む感じ）
+function envelope(t, a, s, d) {
+  if (t < a) return easeOutBack(t / a);
+  if (t < s) return 1;
+  return 1 - smooth((t - s) / Math.max(0.001, d - s));
+}
+
+// なめらかな1次元ノイズ（周期の違うsinの重ね合わせ。単調に見えない）
+function noise(t, seed) {
+  return Math.sin(t + seed) * 0.5 + Math.sin(t * 2.31 + seed * 1.7) * 0.3 + Math.sin(t * 4.13 + seed * 2.9) * 0.2;
+}
+
+// ════════════════════════════════════════════════════════════════
+// ポーズ表現
+//   胴体・頭 … オイラー角の足し算
+//   腕       … 胴体に対する方向ベクトル [外, 上, 前] で指定（左右は鏡写し）
+//   指       … 曲げ量（0=伸ばす 1=握る）
+// ════════════════════════════════════════════════════════════════
+
+const TORSO = ['hips', 'spine', 'chest', 'upperChest', 'neck', 'head',
+               'leftShoulder', 'rightShoulder', 'leftHand', 'rightHand'];
+const FINGERS = ['Thumb', 'Index', 'Middle', 'Ring', 'Little'];
+
+function newPose() {
+  const p = { e: {}, hipsY: 0, arm: {}, finger: {} };
+  for (const b of TORSO) p.e[b] = [0, 0, 0];
+  for (const s of ['L', 'R']) {
+    p.arm[s] = { upper: new THREE.Vector3(), fore: new THREE.Vector3(), twistU: 0, twistF: 0, w: 0 };
+    p.finger[s] = { Thumb: 0, Index: 0, Middle: 0, Ring: 0, Little: 0, w: 0 };
+  }
+  return p;
+}
+function addE(pose, bone, x, y, z, w = 1) {
+  const e = pose.e[bone]; e[0] += x * w; e[1] += y * w; e[2] += z * w;
+}
+// 左右対称に足す（y・z は鏡写しで符号反転）
+function addMirror(pose, base, x, y, z, w = 1) {
+  addE(pose, 'left' + base, x, y, z, w);
+  addE(pose, 'right' + base, x, -y, -z, w);
+}
+function addArm(pose, side, upper, fore, w, twistU = 0, twistF = 0) {
+  const a = pose.arm[side];
+  a.upper.addScaledVector(new THREE.Vector3(...upper).normalize(), w);
+  a.fore.addScaledVector(new THREE.Vector3(...fore).normalize(), w);
+  a.twistU += twistU * w; a.twistF += twistF * w; a.w += w;
+}
+function addFingers(pose, side, curls, w) {
+  const f = pose.finger[side];
+  for (const k of FINGERS) f[k] += (curls[k] ?? curls.all ?? 0) * w;
+  f.w += w;
+}
+// ジェスチャーが重み w ぶん待機ポーズの腕・指を置き換える
+function overrideArm(pose, side, upper, fore, w, twistU = 0, twistF = 0) {
+  if (w <= 0) return;
+  const a = pose.arm[side], keep = 1 - Math.min(w, 1);
+  a.upper.multiplyScalar(keep); a.fore.multiplyScalar(keep);
+  a.twistU *= keep; a.twistF *= keep; a.w *= keep;
+  addArm(pose, side, upper, fore, w, twistU, twistF);
+}
+function overrideFingers(pose, side, curls, w) {
+  if (w <= 0) return;
+  const f = pose.finger[side], keep = 1 - Math.min(w, 1);
+  for (const k of FINGERS) f[k] *= keep;
+  f.w *= keep;
+  addFingers(pose, side, curls, w);
+}
+
+// ════════════════════════════════════════════════════════════════
+// リグ：ポーズ → ボーンの回転（毎フレームなめらかに追従）
+// ════════════════════════════════════════════════════════════════
+
+const rig = {
+  vrm: null, bones: {}, hipsRest: null,
+  bind(vrm) {
+    this.vrm = vrm;
+    this.bones = {};
+    const names = [...TORSO, 'leftUpperArm', 'rightUpperArm', 'leftLowerArm', 'rightLowerArm'];
+    for (const s of ['left', 'right'])
+      for (const f of FINGERS)
+        for (const seg of (f === 'Thumb' ? ['Metacarpal', 'Proximal', 'Distal'] : ['Proximal', 'Intermediate', 'Distal']))
+          names.push(s + f + seg);
+    for (const n of names) {
+      const node = vrm.humanoid?.getNormalizedBoneNode?.(n);
+      if (node) this.bones[n] = node;
+    }
+    this.hipsRest = this.bones.hips ? this.bones.hips.position.clone() : null;
+  },
+};
+
+const _q = new THREE.Quaternion(), _q2 = new THREE.Quaternion(), _qT = new THREE.Quaternion();
+const _e = new THREE.Euler();
+const _v = new THREE.Vector3(), _v2 = new THREE.Vector3();
+const REST = { L: new THREE.Vector3(1, 0, 0), R: new THREE.Vector3(-1, 0, 0) };
+const SMOOTH = { torso: 10, head: 11, arm: 13, finger: 16 };
+
+function slerpTo(node, target, k, dt) {
+  node.quaternion.slerp(target, 1 - Math.exp(-k * dt));
+}
+function chainQuat(pose, names) {
+  const q = new THREE.Quaternion();
+  for (const n of names) {
+    if (!rig.bones[n]) continue;
+    const e = pose.e[n];
+    q.multiply(_q2.setFromEuler(_e.set(e[0], e[1], e[2], 'XYZ')));
+  }
+  return q;
+}
+
+function applyPose(pose, dt) {
+  if (!rig.vrm) return;
+  for (const n of TORSO) {
+    const node = rig.bones[n];
+    if (!node) continue;
+    const e = pose.e[n];
+    _qT.setFromEuler(_e.set(e[0], e[1], e[2], 'XYZ'));
+    slerpTo(node, _qT, (n === 'head' || n === 'neck') ? SMOOTH.head : SMOOTH.torso, dt);
+  }
+  if (rig.bones.hips && rig.hipsRest) {
+    rig.bones.hips.position.y = damp(rig.bones.hips.position.y, rig.hipsRest.y + pose.hipsY, 14, dt);
+  }
+
+  // 腕：胴体の回転を打ち消し、胴体基準の方向に向ける
+  const body = chainQuat(pose, ['hips', 'spine', 'chest', 'upperChest']);
+  for (const s of ['L', 'R']) {
+    const side = s === 'L' ? 'left' : 'right';
+    const a = pose.arm[s];
+    const upperN = rig.bones[side + 'UpperArm'], foreN = rig.bones[side + 'LowerArm'];
+    if (!upperN || !foreN || a.w <= 0) continue;
+    const sign = s === 'L' ? 1 : -1;
+    const sh = pose.e[side + 'Shoulder'];
+    const shoulder = body.clone().multiply(_q2.setFromEuler(_e.set(sh[0], sh[1], sh[2], 'XYZ')));
+    const toLocal = shoulder.clone().invert();
+
+    _v.copy(a.upper).divideScalar(a.w); _v.x *= sign;
+    _v.normalize().applyQuaternion(toLocal);
+    const qU = new THREE.Quaternion().setFromUnitVectors(REST[s], _v);
+    qU.multiply(_q.setFromAxisAngle(REST[s], (a.twistU / a.w) * sign));
+    slerpTo(upperN, qU, SMOOTH.arm, dt);
+
+    _v2.copy(a.fore).divideScalar(a.w); _v2.x *= sign;
+    _v2.normalize().applyQuaternion(toLocal).applyQuaternion(qU.clone().invert());
+    const qF = new THREE.Quaternion().setFromUnitVectors(REST[s], _v2);
+    qF.multiply(_q.setFromAxisAngle(REST[s], (a.twistF / a.w) * sign));
+    slerpTo(foreN, qF, SMOOTH.arm, dt);
+  }
+
+  // 指（左は z マイナスで握る、右はプラス）
+  for (const s of ['L', 'R']) {
+    const side = s === 'L' ? 'left' : 'right';
+    const f = pose.finger[s];
+    const w = f.w || 1;
+    const sign = s === 'L' ? -1 : 1;
+    for (const k of FINGERS) {
+      const c = clamp(f[k] / w, 0, 1.3);
+      if (k === 'Thumb') {
+        const segs = { Metacarpal: 0.25, Proximal: 0.45, Distal: 0.5 };
+        for (const seg in segs) {
+          const node = rig.bones[side + 'Thumb' + seg];
+          if (!node) continue;
+          _qT.setFromEuler(_e.set(0, -sign * c * segs[seg] * 0.9, sign * c * segs[seg] * 0.4, 'XYZ'));
+          slerpTo(node, _qT, SMOOTH.finger, dt);
+        }
+        continue;
+      }
+      const segs = { Proximal: 1.0, Intermediate: 1.25, Distal: 0.85 };
+      for (const seg in segs) {
+        const node = rig.bones[side + k + seg];
+        if (!node) continue;
+        _qT.setFromEuler(_e.set(0, 0, sign * c * segs[seg], 'XYZ'));
+        slerpTo(node, _qT, SMOOTH.finger, dt);
+      }
+    }
+  }
+}
+// ════════════════════════════════════════════════════════════════
+// 状態（感情・発話・まばたき・視線）
+// ════════════════════════════════════════════════════════════════
+
+const state = {
+  time: 0,
+  emotion: 'neutral',
+  emo: { happy: 0, sad: 0, angry: 0, surprised: 0, relaxed: 0 },
+  speaking: false,
+  voice: 0,
+  vowelTarget: { aa: 0, ih: 0, ou: 0, ee: 0, oh: 0 },
+  vowel: { aa: 0, ih: 0, ou: 0, ee: 0, oh: 0 },
+  blink: 0, nextBlink: 2, blinkPhase: -1, doubleBlink: false,
+  look: new THREE.Vector3(), lookGoal: new THREE.Vector3(), nextSaccade: 0.5,
+  lookAway: null, eyeClose: 0,
+  idleTimer: rand(7, 12),
+};
+
+// 表情の最大値（100% だと顔が崩れやすいので控えめに）
+const EMOTION_FACE = {
+  happy: { happy: 0.85 }, sad: { sad: 0.8 }, angry: { angry: 0.75 },
+  surprised: { surprised: 0.8 }, relaxed: { relaxed: 0.8 }, neutral: {},
+};
+
+function setEmotion(name) {
+  state.emotion = EMOTION_FACE[name] ? name : 'neutral';
+}
+
+function updateFace(dt) {
+  const target = EMOTION_FACE[state.emotion] || {};
+  for (const k in state.emo) state.emo[k] = damp(state.emo[k], target[k] || 0, 6, dt);
+
+  // まばたき：2〜6秒おき、ときどき2回続けて。閉じるのは速く開くのはゆっくり
+  state.nextBlink -= dt;
+  if (state.blinkPhase < 0 && state.nextBlink <= 0) {
+    state.blinkPhase = 0;
+    state.doubleBlink = Math.random() < 0.18;
+  }
+  if (state.blinkPhase >= 0) {
+    state.blinkPhase += dt;
+    const p = state.blinkPhase;
+    state.blink = p < 0.07 ? p / 0.07 : p < 0.1 ? 1 : 1 - smooth((p - 0.1) / 0.12);
+    if (p > 0.22) {
+      if (state.doubleBlink) { state.blinkPhase = 0; state.doubleBlink = false; }
+      else { state.blinkPhase = -1; state.blink = 0; state.nextBlink = rand(2.0, 6.0); }
+    }
+  }
+  for (const k in state.vowel) state.vowel[k] = damp(state.vowel[k], state.vowelTarget[k], 22, dt);
+
+  const em = currentVrm?.expressionManager;
+  if (!em) return;
+  const set = (k, v) => { try { em.setValue(k, clamp(v, 0, 1)); } catch { /* 無い表情は無視 */ } };
+  // 何もないときはほんのり微笑む（真顔は冷たく見えやすい）
+  const idleSmile = state.emotion === 'neutral' ? 0.22 : 0;
+  set('happy', Math.max(state.emo.happy, (state.gestureSmile || 0) * (1 - state.emo.sad - state.emo.angry)));
+  set('sad', state.emo.sad);
+  set('angry', state.emo.angry);
+  set('surprised', state.emo.surprised);
+  set('relaxed', Math.max(state.emo.relaxed, idleSmile));
+  // 笑顔（目を細める表情）や驚き顔のときは、まばたきを弱める
+  const blinkScale = 1 - Math.max(state.emo.happy, state.emo.surprised) * 0.85;
+  set('blink', Math.max(state.blink * blinkScale, state.eyeClose));
+  const mouthScale = 1 - state.emo.surprised * 0.3;
+  for (const k in state.vowel) set(k, state.vowel[k] * mouthScale);
+}
+
+function updateLook(dt) {
+  // カメラ付近を見ながら、ときどき目線を小さく動かす（サッカード）
+  state.nextSaccade -= dt;
+  if (state.nextSaccade <= 0) {
+    const big = Math.random() < 0.15 && !state.speaking;
+    state.lookGoal.set(rand(-1, 1) * (big ? 0.6 : 0.12), rand(-1, 1) * (big ? 0.3 : 0.07), 0);
+    state.nextSaccade = state.speaking ? rand(0.8, 2.0) : rand(0.6, 3.0);
+  }
+  const goal = state.lookAway || state.lookGoal;
+  state.look.x = damp(state.look.x, goal.x, 25, dt);
+  state.look.y = damp(state.look.y, goal.y, 25, dt);
+  lookTarget.position.set(camera.position.x + state.look.x, camera.position.y + state.look.y, camera.position.z);
+}
+
+// ════════════════════════════════════════════════════════════════
+// 待機ポーズ（呼吸・体重移動・頭のゆらぎ・感情ごとの姿勢）
+// ════════════════════════════════════════════════════════════════
+
+// 腕を下ろす量（ラジアン）。旧既定値 0.1 はTポーズになってしまうので無視する
+const armRest = () => (calibration.armDownZ >= 0.5 ? calibration.armDownZ : 1.15);
+
+function basePose(pose, t) {
+  const em = state.emo;
+  const energy = 1 + em.happy * 0.6 + em.surprised * 0.3 - em.sad * 0.4 - em.relaxed * 0.2;
+  const tempo = 1 + em.happy * 0.25 - em.sad * 0.3 - em.relaxed * 0.25;
+
+  // 呼吸（約4秒周期）。胸がふくらむと肩も少し上がる
+  const breath = Math.sin(t * 1.55 * tempo);
+  addE(pose, 'chest', -0.012 * breath + calibration.spineX, 0, 0);
+  addE(pose, 'upperChest', -0.01 * breath, 0, 0);
+  addMirror(pose, 'Shoulder', 0, 0, 0.025 * breath);
+  addE(pose, 'spine', calibration.spineX * 0.5, 0, 0);
+
+  // 体重移動（腰と胸を逆に傾けてゆるいS字に）
+  const sway = noise(t * 0.35 * tempo, 1.3);
+  addE(pose, 'hips', 0, sway * 0.04 * energy, sway * 0.035 * energy);
+  addE(pose, 'spine', 0, -sway * 0.02, -sway * 0.03 * energy);
+  addE(pose, 'chest', 0, -sway * 0.015, -sway * 0.02);
+  pose.hipsY += -Math.abs(sway) * 0.006;
+
+  // 頭のゆらぎ（目線を追うように少し遅れてついていく）
+  addE(pose, 'head', noise(t * 0.5, 4.1) * 0.035 - state.look.y * 0.25,
+       noise(t * 0.4, 7.7) * 0.06 + state.look.x * 0.35, noise(t * 0.33, 2.2) * 0.04);
+  addE(pose, 'neck', 0, noise(t * 0.4, 7.7) * 0.02, 0);
+
+  // 嬉しい：小首をかしげて小さく弾む
+  if (em.happy > 0.01) {
+    pose.hipsY += Math.max(0, Math.sin(t * 4.2)) * 0.012 * em.happy;
+    addE(pose, 'head', -0.04, 0, Math.sin(t * 0.9) * 0.11, em.happy);
+    addE(pose, 'chest', -0.03, 0, 0, em.happy);
+    addMirror(pose, 'Shoulder', 0, 0, 0.05, em.happy);
+  }
+  // 悲しい：うつむいて肩を落とす
+  if (em.sad > 0.01) {
+    addE(pose, 'head', 0.2, 0, 0.06, em.sad);
+    addE(pose, 'neck', 0.08, 0, 0, em.sad);
+    addE(pose, 'upperChest', 0.08, 0, 0, em.sad);
+    addMirror(pose, 'Shoulder', 0, 0.04, -0.06, em.sad);
+  }
+  // 怒り：前のめりでぷんぷん
+  if (em.angry > 0.01) {
+    addE(pose, 'spine', 0.06, 0, 0, em.angry);
+    addE(pose, 'head', -0.05, Math.sin(t * 7) * 0.02, 0, em.angry);
+    addMirror(pose, 'Shoulder', 0, 0, 0.07, em.angry);
+  }
+  // 驚き：のけぞる
+  if (em.surprised > 0.01) {
+    addE(pose, 'spine', -0.07, 0, 0, em.surprised);
+    addE(pose, 'head', -0.08, 0, 0, em.surprised);
+    addMirror(pose, 'Shoulder', 0, 0, 0.09, em.surprised);
+  }
+  // リラックス：ゆったり首をかしげる
+  if (em.relaxed > 0.01) addE(pose, 'head', 0.03, 0, 0.08, em.relaxed);
+
+  // 腕：手を体の前でふんわり組む（広がったスカートに手が埋まらず、かわいく見える）
+  // 呼吸と体重移動で少しだけ揺らす。armDownZ が大きいほど手の位置が下がる
+  const low = clamp((armRest() - 1.15) * 0.6, -0.2, 0.2);
+  for (const s of ['L', 'R']) {
+    const ph = s === 'L' ? 0 : 1.7;
+    const out = 0.32 + 0.02 * breath + noise(t * 0.3, 3 + ph) * 0.02 + em.angry * 0.1 + em.surprised * 0.08;
+    const fwd = 0.45 + noise(t * 0.25, 9 + ph) * 0.03 - em.sad * 0.05;
+    addArm(pose, s, [out, -0.85 - low, fwd], [-0.7, -0.25 - low + 0.02 * breath, 0.65 + calibration.foreArmZ], 1, 0, -1.2);
+    addFingers(pose, s, { Thumb: 0.3, Index: 0.3, Middle: 0.4, Ring: 0.5, Little: 0.55 }, 1);
+  }
+}
+
+let basePoseImpl = basePose;
+
+// 話しているときの身振り（声の強弱に合わせてうなずき、手も少し動く）
+function speakingPose(pose, t) {
+  const v = state.voice;
+  if (v < 0.01) return;
+  addE(pose, 'head', v * 0.07 + Math.sin(t * 5.3) * 0.02 * v, Math.sin(t * 1.1) * 0.06 * v,
+       Math.sin(t * 0.8 + 1) * 0.05 * v);
+  addE(pose, 'chest', v * 0.02, Math.sin(t * 1.3) * 0.03 * v, 0);
+  pose.hipsY += Math.max(0, Math.sin(t * 6.1)) * 0.004 * v * (1 + state.emo.happy);
+  const g = clamp(v * 1.4, 0, 0.35);
+  for (const s of ['L', 'R']) {
+    const lift = Math.max(0, Math.sin(t * 2.6 + (s === 'L' ? 0 : 2.1)));
+    overrideArm(pose, s, [0.25, -0.9, 0.45 + lift * 0.2], [0.15, -0.35 + lift * 0.3, 1], g, 0, -0.9);
+  }
+}
+// ════════════════════════════════════════════════════════════════
+// ジェスチャー（LLM の motion 指定で再生）
+//   run(pose, t, w) … t は開始からの秒数、w は立ち上がり/余韻の包絡線
+// ════════════════════════════════════════════════════════════════
+
+const FIST = { all: 1.15, Thumb: 0.8 };
+const OPEN = { all: 0.05, Thumb: 0.1 };
+const SOFT = { Thumb: 0.3, Index: 0.25, Middle: 0.35, Ring: 0.45, Little: 0.5 };
+const V = (x, y, z) => new THREE.Vector3(x, y, z);
+
+const GESTURES = {
+  // 手を振る：顔の横で手のひらを見せて、肘から先を振り子のように
+  wave: { dur: 2.4, attack: 0.35, hold: 1.9, smile: 0.6, run(p, t, w) {
+    const sw = Math.sin(t * Math.PI * 4.4);
+    overrideArm(p, 'R', [0.75, -0.2, 0.45], [-0.05 + sw * 0.3, 1, 0.3], w, 0, -1.9);
+    overrideFingers(p, 'R', OPEN, w);
+    addE(p, 'rightHand', 0, 0, sw * 0.2, w);
+    addE(p, 'head', -0.02, -0.06, 0.14, w);
+    addE(p, 'chest', 0, -0.06, 0.04, w);
+    p.hipsY += Math.max(0, sw) * 0.006 * w;
+  }},
+  // うなずき：2回、2回目は小さく
+  nod: { dur: 1.1, attack: 0.08, hold: 0.9, run(p, t, w) {
+    const n = Math.max(0, Math.sin(t * Math.PI * 3.6)) * (t < 0.55 ? 1 : 0.55);
+    addE(p, 'head', n * 0.26, 0, 0, w);
+    addE(p, 'neck', n * 0.08, 0, 0, w);
+    addE(p, 'chest', n * 0.03, 0, 0, w);
+  }},
+  // 小首をかしげる（はてな？）
+  tilt: { dur: 1.9, attack: 0.35, hold: 1.4, run(p, t, w) {
+    addE(p, 'head', -0.03, 0.08, 0.3, w);
+    addE(p, 'neck', 0, 0, 0.08, w);
+    addE(p, 'spine', 0, 0, -0.05, w);
+    addE(p, 'hips', 0, 0, 0.03, w);
+    state.lookAway = V(0.1, 0.12, 0);
+  }},
+  // ぴょんっ：沈む、跳ぶ、着地でつぶれる、戻る
+  jump: { dur: 1.1, attack: 0.05, hold: 0.95, smile: 0.7, run(p, t, w) {
+    let y = 0, crouch = 0;
+    if (t < 0.18) crouch = smooth(t / 0.18);
+    else if (t < 0.58) { const u = (t - 0.18) / 0.4; y = Math.sin(u * Math.PI) * 0.11; crouch = 1 - smooth(u * 3); }
+    else if (t < 0.75) crouch = Math.sin(((t - 0.58) / 0.17) * Math.PI) * 0.7;
+    p.hipsY += (y - crouch * 0.045) * w;
+    addE(p, 'spine', crouch * 0.12 - y * 0.5, 0, 0, w);
+    addE(p, 'head', -y * 0.8 - crouch * 0.05, 0, 0, w);
+    const up = y / 0.11;
+    for (const s of ['L', 'R']) overrideArm(p, s, [0.75, -0.6 + up * 0.9, 0.25], [0.5, 0.1 + up * 0.4, 0.4], w * 0.85, 0, -0.6);
+    overrideFingers(p, 'L', OPEN, w * up); overrideFingers(p, 'R', OPEN, w * up);
+  }},
+  // おじぎ：手を前で重ねて、目を伏せて丁寧に
+  bow: { dur: 2.2, attack: 0.5, hold: 1.4, run(p, t, w) {
+    addE(p, 'spine', 0.42, 0, 0, w);
+    addE(p, 'chest', 0.16, 0, 0, w);
+    addE(p, 'head', 0.12, 0, 0, w);
+    overrideArm(p, 'L', [0.32, -0.85, 0.42], [-0.65, -0.5, 0.65], w, 0, -1.0);
+    overrideArm(p, 'R', [0.32, -0.85, 0.42], [-0.62, -0.52, 0.65], w, 0, -1.0);
+    overrideFingers(p, 'L', SOFT, w); overrideFingers(p, 'R', SOFT, w);
+    state.eyeClose = Math.max(state.eyeClose, 0.6 * w);
+  }},
+  // いやいや：首を振る（だんだん小さく）
+  shake_head: { dur: 1.3, attack: 0.1, hold: 1.0, run(p, t, w) {
+    const a = Math.sin(t * Math.PI * 5.2) * (1 - t / 1.4);
+    addE(p, 'head', 0.04, a * 0.3, -a * 0.05, w);
+    addE(p, 'neck', 0, a * 0.1, 0, w);
+    addE(p, 'chest', 0, -a * 0.05, 0, w);
+    state.eyeClose = Math.max(state.eyeClose, 0.5 * w);
+  }},
+  // 考え中：人差し指をあごに当てて、上を見る
+  think: { dur: 3.6, attack: 0.45, hold: 3.0, run(p, t, w) {
+    overrideArm(p, 'R', [0.12, -0.8, 0.6], [-0.5, 0.85, 0.35], w, 0, -1.7);
+    overrideFingers(p, 'R', { Thumb: 0.6, Index: 0.1, Middle: 1.0, Ring: 1.1, Little: 1.15 }, w);
+    overrideArm(p, 'L', [0.3, -0.85, 0.45], [-0.8, 0.0, 0.6], w, 0, -1.2);
+    addE(p, 'head', -0.08, -0.12, 0.13 + Math.sin(t * 1.3) * 0.03, w);
+    addE(p, 'spine', 0, 0.05, 0, w);
+    state.lookAway = V(-0.5, 0.45, 0);
+  }},
+  // やったー！：ひじを曲げてこぶしを上げ、ぴょこぴょこ弾む
+  excited: { dur: 1.9, attack: 0.2, hold: 1.5, smile: 0.9, run(p, t, w) {
+    const b = Math.max(0, Math.sin(t * Math.PI * 4));
+    p.hipsY += b * 0.03 * w;
+    for (const s of ['L', 'R']) overrideArm(p, s, [0.85, 0.35 + b * 0.15, 0.3], [0.15, 1, 0.25], w, 0, -1.4);
+    overrideFingers(p, 'L', FIST, w); overrideFingers(p, 'R', FIST, w);
+    addE(p, 'head', -0.08 - b * 0.04, 0, Math.sin(t * Math.PI * 2) * 0.1, w);
+    addE(p, 'chest', -0.06, 0, 0, w);
+  }},
+  // 照れ：両手をあごの下で合わせ、うつむいて首をかしげ、目をそらす
+  shy: { dur: 2.4, attack: 0.4, hold: 1.9, smile: 0.3, run(p, t, w) {
+    const fid = Math.sin(t * 5.5) * 0.05;
+    const curl = { Thumb: 0.3, Index: 0.35, Middle: 0.45, Ring: 0.55, Little: 0.6 };
+    overrideArm(p, 'L', [0.18, -0.86, 0.5], [-0.5 + fid, 0.6, 0.55], w, 0, -1.8);
+    overrideArm(p, 'R', [0.18, -0.86, 0.5], [-0.5 - fid, 0.6, 0.55], w, 0, -1.8);
+    overrideFingers(p, 'L', curl, w); overrideFingers(p, 'R', curl, w);
+    addE(p, 'head', 0.14, 0.16, 0.18, w);
+    addE(p, 'chest', 0.05, 0.06, 0, w);
+    addE(p, 'hips', 0, Math.sin(t * 2.2) * 0.06, 0, w);
+    addMirror(p, 'Shoulder', 0, 0.03, 0.06, w);
+    state.lookAway = V(0.45, -0.3, 0);
+  }},
+  // びしっと指さし（少し横向きに出して、指先が見えるように）
+  point: { dur: 1.7, attack: 0.25, hold: 1.25, run(p, t, w) {
+    overrideArm(p, 'R', [0.6, 0.1, 0.8], [0.5, 0.15, 0.85], w, 0, -1.5);
+    overrideFingers(p, 'R', { Thumb: 0.7, Index: 0, Middle: 1.15, Ring: 1.2, Little: 1.2 }, w);
+    addE(p, 'head', -0.03, -0.1, -0.08, w);
+    addE(p, 'chest', 0, -0.15, 0, w);
+  }},
+  // 拍手：胸の前でぱちぱち
+  clap: { dur: 2.2, attack: 0.3, hold: 1.8, smile: 0.7, run(p, t, w) {
+    const c = (Math.sin(t * Math.PI * 7) + 1) / 2;
+    const open = 0.08 + c * 0.32;
+    overrideArm(p, 'L', [0.35, -0.55, 0.75], [-0.75 + open, 0.15, 0.6], w, 0, -1.6);
+    overrideArm(p, 'R', [0.35, -0.55, 0.75], [-0.75 + open, 0.15, 0.6], w, 0, -1.6);
+    overrideFingers(p, 'L', OPEN, w); overrideFingers(p, 'R', OPEN, w);
+    addE(p, 'head', -0.05 + c * 0.04, 0, Math.sin(t * 3) * 0.08, w);
+    p.hipsY += c * 0.006 * w;
+  }},
+  // のび〜：両手を頭の上で組んで、目を閉じてふぅ
+  stretch: { dur: 2.8, attack: 0.7, hold: 2.0, run(p, t, w) {
+    const r = Math.sin(clamp(t / 2.0, 0, 1) * Math.PI) * 0.1;
+    overrideArm(p, 'L', [0.25, 1, 0.08], [-0.6, 0.8, 0.05], w, 0, -0.4);
+    overrideArm(p, 'R', [0.25, 1, 0.08], [-0.6, 0.8, 0.05], w, 0, -0.4);
+    overrideFingers(p, 'L', SOFT, w); overrideFingers(p, 'R', SOFT, w);
+    addE(p, 'spine', -0.1 - r, 0, Math.sin(t * 1.5) * 0.06, w);
+    addE(p, 'chest', -0.06, 0, 0, w);
+    addE(p, 'head', -0.12, 0, 0, w);
+    state.eyeClose = Math.max(state.eyeClose, 0.85 * w);
+  }},
+  // 前のめり：興味しんしん、手は後ろで組む
+  lean_forward: { dur: 3.2, attack: 0.5, hold: 2.6, run(p, t, w) {
+    addE(p, 'spine', 0.2, 0, 0, w);
+    addE(p, 'chest', 0.06, 0, 0, w);
+    addE(p, 'head', -0.14, 0, Math.sin(t * 1.2) * 0.08, w);
+    overrideArm(p, 'L', [0.35, -0.9, -0.3], [-0.5, -0.7, -0.4], w, 0, 0.4);
+    overrideArm(p, 'R', [0.35, -0.9, -0.3], [-0.5, -0.7, -0.4], w, 0, 0.4);
+  }},
+  // ダンス：アイドルっぽく左右にステップ＋手を振る
+  dance: { dur: 4.2, attack: 0.3, hold: 3.8, smile: 0.8, run(p, t, w) {
+    const beat = t * Math.PI * 2 * 1.1;
+    const side = Math.sin(beat), bounce = Math.abs(Math.sin(beat));
+    p.hipsY += (bounce * 0.025 - 0.01) * w;
+    addE(p, 'hips', 0, side * 0.18, side * 0.08, w);
+    addE(p, 'spine', 0, -side * 0.08, -side * 0.07, w);
+    addE(p, 'head', -0.04, side * 0.1, -side * 0.15, w);
+    const l = Math.max(0, side), r = Math.max(0, -side);
+    overrideArm(p, 'L', [0.6, -0.4 + l * 1.0, 0.35], [0.1, 0.6 + l * 0.4, 0.5], w, 0, -0.8);
+    overrideArm(p, 'R', [0.6, -0.4 + r * 1.0, 0.35], [0.1, 0.6 + r * 0.4, 0.5], w, 0, -0.8);
+    overrideFingers(p, 'L', OPEN, w * l); overrideFingers(p, 'R', OPEN, w * r);
+  }},
+  // 待機中に自分からやる小さなしぐさ
+  look_around: { dur: 2.6, attack: 0.5, hold: 2.0, run(p, t, w) {
+    const dir = t < 1.2 ? 1 : -1;
+    addE(p, 'head', 0.02, dir * 0.22, dir * 0.05, w);
+    addE(p, 'chest', 0, dir * 0.05, 0, w);
+    state.lookAway = V(dir * 0.8, 0.1, 0);
+  }},
+  hum: { dur: 3.0, attack: 0.4, hold: 2.5, smile: 0.4, run(p, t, w) {
+    const s = Math.sin(t * Math.PI * 1.6);
+    addE(p, 'head', 0, 0, s * 0.14, w);
+    addE(p, 'hips', 0, 0, s * 0.04, w);
+    p.hipsY += Math.abs(s) * 0.008 * w;
+    state.eyeClose = Math.max(state.eyeClose, 0.35 * w);
+  }},
+};
+GESTURES.hands_behind = { dur: 6.0, attack: 0.7, hold: 5.2, run(p, t, w) {
+  overrideArm(p, 'L', [0.35, -0.9, -0.3], [-0.5, -0.7, -0.4], w, 0, 0.4);
+  overrideArm(p, 'R', [0.35, -0.9, -0.3], [-0.5, -0.7, -0.4], w, 0, 0.4);
+  addE(p, 'spine', -0.03, 0, 0, w);
+  addE(p, 'hips', 0, Math.sin(t * 1.4) * 0.05, 0, w);
+}};
+const IDLE_ACTIONS = ['look_around', 'tilt', 'hum', 'stretch', 'hands_behind', 'hands_behind'];
+
+// 再生中のジェスチャー。新しいものが来たら古いものは余韻を残してフェードアウトする
+let active = [];
+
+function triggerMotion(name) {
+  const g = GESTURES[name];
+  if (!g) return;
+  for (const a of active) a.releaseAt = Math.min(a.releaseAt, a.t + 0.25);
+  active.push({ name, g, t: 0, releaseAt: g.hold });
+  state.idleTimer = rand(9, 16);
+}
+
+function gesturePose(pose, dt) {
+  state.lookAway = null;
+  state.eyeClose = 0;
+  state.gestureSmile = 0;
+  for (const a of active) {
+    a.t += dt;
+    const cut = a.releaseAt < a.g.hold;
+    const end = cut ? a.releaseAt + 0.35 : a.g.dur;
+    const w = envelope(a.t, a.g.attack, Math.min(a.releaseAt, a.g.hold), end);
+    a.done = a.t >= end;
+    if (w > 0.001) {
+      a.g.run(pose, a.t, clamp(w, 0, 1.08));
+      state.gestureSmile = Math.max(state.gestureSmile, (a.g.smile || 0) * clamp(w, 0, 1));
+    }
+  }
+  active = active.filter(a => !a.done);
+}
+
+function idleBehaviour(dt) {
+  if (state.speaking || active.length) return;
+  state.idleTimer -= dt;
+  if (state.idleTimer <= 0) {
+    triggerMotion(IDLE_ACTIONS[Math.floor(Math.random() * IDLE_ACTIONS.length)]);
+    state.idleTimer = rand(10, 18);
+  }
+}
+// ════════════════════════════════════════════════════════════════
+// メインループ
+// ════════════════════════════════════════════════════════════════
+
+const clock = new THREE.Clock();
+let paused = false;   // デバッグ用（__avatar.step で1コマずつ進めるとき）
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  if (!paused) tick(dt);
+  renderer.render(scene, camera);
+}
+function tick(dt) {
+  state.time += dt;
+  if (currentVrm && rig.vrm) {
+    const pose = newPose();
+    basePoseImpl(pose, state.time);
+    speakingPose(pose, state.time);
+    idleBehaviour(dt);
+    gesturePose(pose, dt);
+    applyPose(pose, dt);
+    updateLook(dt);
+    updateFace(dt);
+    currentVrm.update(dt);
+  }
+}
+animate();
+
+// ════════════════════════════════════════════════════════════════
+// 音声とリップシンク
+// ════════════════════════════════════════════════════════════════
+
+let audioCtx = null;
+let lipTimer = null;
+
+// 声の大きさで口を開き、音の明るさ（スペクトル重心）で「あいうえお」を混ぜる
+function setVowels(level, centroid) {
+  const open = clamp(level, 0, 1), bright = clamp(centroid, 0, 1);
+  state.vowelTarget = {
+    aa: open * (0.75 - bright * 0.25), ih: open * bright * 0.45, ee: open * bright * 0.25,
+    ou: open * (1 - bright) * 0.35, oh: open * (1 - bright) * 0.25,
+  };
+}
+
+function stopLipsync() {
+  clearInterval(lipTimer);
+  lipTimer = null;
+  state.vowelTarget = { aa: 0, ih: 0, ou: 0, ee: 0, oh: 0 };
+  state.voice = 0;
+}
+
+async function playAudioLipsync(url) {
+  try {
+    if (!audioCtx) audioCtx = new AudioContext();
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+    const decoded = await audioCtx.decodeAudioData(await (await fetch(url)).arrayBuffer());
+    const source = audioCtx.createBufferSource();
+    source.buffer = decoded;
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.4;
+    source.connect(analyser);
+    if (!MUTED) analyser.connect(audioCtx.destination);
+    source.start();
+    const td = new Uint8Array(analyser.fftSize), fd = new Uint8Array(analyser.frequencyBinCount);
+    clearInterval(lipTimer);
+    lipTimer = setInterval(() => {
+      analyser.getByteTimeDomainData(td);
+      analyser.getByteFrequencyData(fd);
+      let sum = 0;
+      for (let i = 0; i < td.length; i++) { const v = (td[i] - 128) / 128; sum += v * v; }
+      const rms = Math.sqrt(sum / td.length);
+      let num = 0, den = 0;
+      for (let i = 2; i < 120; i++) { num += i * fd[i]; den += fd[i]; }
+      const level = clamp((rms - 0.015) * 6, 0, 1);
+      setVowels(level, den ? (num / den - 15) / 45 : 0.4);
+      state.voice = damp(state.voice, level, 8, 0.04);
+    }, 40);
+    source.onended = () => stopLipsync();
+  } catch (e) {
+    console.warn('Audio play error:', e);
+    simulateLipsync(20);
+  }
+}
+
+// 音声が無いとき：文字数ぶん、それっぽく口を動かす（1音およそ0.16秒）
+function simulateLipsync(textLen) {
+  const duration = Math.max(textLen * 0.12, 1.0) * 1000;
+  let elapsed = 0, c = 0.5;
+  clearInterval(lipTimer);
+  lipTimer = setInterval(() => {
+    elapsed += 40;
+    if (elapsed > duration) { stopLipsync(); return; }
+    if (elapsed % 160 < 40) c = Math.random();
+    setVowels(Math.sin(((elapsed % 160) / 160) * Math.PI) * rand(0.45, 0.85), c);
+    state.voice = damp(state.voice, 0.6, 8, 0.04);
+  }, 40);
+}
+
+// ════════════════════════════════════════════════════════════════
+// WebSocket
+// ════════════════════════════════════════════════════════════════
+
+const subtitle = document.getElementById('subtitle-overlay');
+let subtitleTimer = null;
+
+function connectWS() {
+  const ws = new WebSocket(`ws://${location.host}/ws/avatar`);
+  ws.onopen = () => setStatus('connected');
+  ws.onclose = () => { setStatus('disconnected'); setTimeout(connectWS, 3000); };
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (!isMine(msg)) return;
+    if (msg.type === 'config_update') {
+      if (msg.avatar_type && msg.avatar_type !== 'vrm' && location.pathname === '/avatar') { location.reload(); return; }
+      if (msg.calibration) calibration = { ...calibration, ...msg.calibration };
+      if (msg.model_path) {
+        const url = resolveVrmUrl(msg.model_path);
+        setStatus('Reloading: ' + url);
+        loadVRM(url).catch(() => showFallbackAvatar());
+      }
+    }
+    if (msg.type === 'calibration_update') calibration = { ...calibration, ...msg.calibration };
+    if (msg.type === 'test_motion') triggerMotion(msg.motion || 'wave');
+    if (msg.type === 'speech_start') {
+      setEmotion(msg.emotion || 'neutral');
+      state.speaking = true;
+      subtitle.textContent = msg.text || '';
+      subtitle.classList.add('visible');
+      clearTimeout(subtitleTimer);
+      if (msg.audio_url) playAudioLipsync(msg.audio_url);
+      else simulateLipsync(msg.text?.length || 0);
+    }
+    if (msg.type === 'motion') triggerMotion(msg.motion || 'idle');
+    if (msg.type === 'speech_end') {
+      state.speaking = false;
+      // 言い終わった瞬間に真顔へ戻ると冷たく見えるので、表情は少し残す
+      setTimeout(() => { if (!state.speaking) setEmotion('neutral'); }, 1200);
+      clearTimeout(subtitleTimer);
+      subtitleTimer = setTimeout(() => subtitle.classList.remove('visible'), 1500);
+    }
+  };
+}
+
+function setStatus(msg) { document.getElementById('status-indicator').textContent = msg; }
+
+function resolveVrmUrl(modelPath) {
+  if (!modelPath) return '/models/default.vrm';
+  if (modelPath.startsWith('http')) return modelPath;
+  const normalized = modelPath.replace(/\\/g, '/');
+  return normalized.startsWith('/') ? normalized : '/' + normalized;
+}
+
+async function initAvatar() {
+  try {
+    const data = await (await fetch(avatarConfigUrl())).json();
+    if (data.character) MY_CHAR = data.character;
+    const url = resolveVrmUrl(data.model_path);
+    setStatus('Loading: ' + url);
+    await loadVRM(url);
+  } catch (e) {
+    console.warn('[avatar] init failed, using fallback:', e);
+    showFallbackAvatar();
+  }
+}
+
+// デバッグ用：ブラウザのコンソールから __avatar.motion('wave') などで試せる
+window.__avatar = {
+  motion: triggerMotion,
+  emotion: setEmotion,
+  speak: (n = 30) => { state.speaking = true; simulateLipsync(n); setTimeout(() => { state.speaking = false; }, n * 120); },
+  gestures: () => Object.keys(GESTURES),
+  state, rig, camera, THREE,
+  G: GESTURES, h: { overrideArm, overrideFingers, addE, addMirror, addArm, addFingers, smooth, clamp, noise },
+  set basePose(fn) { basePoseImpl = fn; },
+  basePoseOrig: basePose,
+  // 実時間に関係なく sec 秒ぶん進めて描画する（見た目の確認用）
+  step(sec) { paused = true; for (let i = 0; i < Math.round(sec * 60); i++) tick(1 / 60); renderer.render(scene, camera); },
+  resume() { paused = false; },
+};
+
+loadCalibration().then(() => initAvatar());
+connectWS();
+</script>
+</body>
+</html>

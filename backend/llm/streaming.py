@@ -1,0 +1,316 @@
+"""SpeechStreamParser: LLMのトークンストリームから発話文を逐次取り出す
+
+LLMは `{"speech":"...","emotion":"happy","motion":"wave","skip":false}` を返すが、
+全文の生成完了を待ってからTTSに投げると、コメント受信から発話開始まで数秒かかる。
+
+このパーサはストリーム途中の断片から `speech` の値だけを逐次抽出し、
+文の切れ目（。！？）で確定した分をすぐ返す。呼び出し側はそれをTTSに流し込むことで、
+1文目を喋りながら2文目を合成できる。
+
+使い方:
+    parser = SpeechStreamParser()
+    async for delta in llm.generate_stream(...):
+        for sentence in parser.feed(delta):
+            await tts_queue.put(sentence)
+    for sentence in parser.flush():
+        await tts_queue.put(sentence)
+    response = parser.build_response()   # emotion/motion を含む最終LLMResponse
+"""
+from __future__ import annotations
+
+import re
+from datetime import datetime
+from pathlib import Path
+
+from backend.llm.parser import (contains_meta_leak,
+                                dedupe_repeated_sentences,
+                                parse_llm_output, strip_think_tags,
+                                truncate_at_meta_leak)
+from backend.logger import get_logger
+from backend.models import LLMResponse
+
+logger = get_logger(__name__)
+
+# 文末とみなす文字
+_SENTENCE_END = "。．！？!?…♪"
+# 文末が来ないまま長くなった場合に区切ってよい文字
+_SOFT_BREAK = "、，,・ 　"
+
+_SPEECH_KEY = re.compile(r'"speech"\s*:\s*"')
+
+_JSON_DEBRIS_TAIL = re.compile(r'["”\'}\]]+\s*$')
+
+# 発話として意味のある文字（これが1つも無い断片は喋らせない）
+_WORD_CHAR = re.compile(r"[0-9A-Za-zぁ-んァ-ヶ一-龠ー]")
+
+
+def _has_word_chars(text: str) -> bool:
+    return bool(_WORD_CHAR.search(text))
+
+
+def _normalized_len(text: str) -> int:
+    """記号・空白を除いた実質文字数（断片判定用。正規化は他所と同じ）"""
+    return len(re.sub(r"[\s、。，．！？!?'\"“”‘’]", "", text or ""))
+
+
+def _strip_json_debris(text: str) -> str:
+    """末尾が } や ] で終わる場合に限り、JSON 残骸（引用符・波括弧）を取り除く"""
+    if not re.search(r"[}\]]\s*$", text):
+        return text
+    return _JSON_DEBRIS_TAIL.sub("", text).rstrip()
+
+_ESCAPES = {
+    "n": "\n", "t": " ", "r": "", '"': '"', "\\": "\\", "/": "/",
+    "b": "", "f": "",
+}
+
+
+class SpeechStreamParser:
+    """
+    ストリームされた生テキストを食わせると、確定した発話文を順に返す。
+
+    Args:
+        min_chunk_chars: この文字数未満の断片は次の文とまとめる（短すぎる音声合成を防ぐ）
+        max_chunk_chars: 文末が来なくてもこの長さで区切る（喋り出しが遅れるのを防ぐ）
+    """
+
+    def __init__(self, min_chunk_chars: int = 8, max_chunk_chars: int = 60):
+        self._min = min_chunk_chars
+        self._max = max_chunk_chars
+        self._raw = ""       # 受信した生テキスト全体
+        self._value = ""     # speech値としてデコード済みの全文
+        self._consumed = 0   # _value のうち、既に文として払い出した文字数
+        self._closed = False  # speech値の閉じ引用符に到達したか
+        self._held_fragment: str | None = None  # 保留中の断片（唯一の文なら破棄）
+        self._emitted_count = 0  # 払い出した文の数
+
+    # ── 入力 ──────────────────────────────────────────────────
+
+    def feed(self, delta: str) -> list[str]:
+        """ストリーム断片を追加し、確定した文のリストを返す"""
+        if not delta:
+            return []
+        self._raw += delta
+        self._reparse()
+        return self._pop_sentences(final=False)
+
+    def flush(self) -> list[str]:
+        """ストリーム終了時に、残っている分をすべて吐き出す"""
+        self._reparse()
+        if not self._value:
+            # speechキーが見つからなかった場合、生テキストを発話として扱う
+            self._save_fallback_raw()
+            fallback = self._fallback_text()
+            if fallback:
+                self._value = fallback
+        out = self._pop_sentences(final=True)
+        rest = self._value[self._consumed:].strip()
+        if not self._closed:
+            # 閉じ引用符が来ないまま終わった生成では、末尾に JSON の残骸
+            # （"} や ”} など）が付くことがある。発話に混ぜないよう除く。
+            out = [s for s in (_strip_json_debris(s) for s in out) if s]
+            rest = _strip_json_debris(rest)
+        if rest and _has_word_chars(rest):
+            self._consumed = len(self._value)
+            self._accept(out, rest)
+        if self._held_fragment is not None:
+            # 後続の文が来なかった＝断片がこの応答の唯一の文だったので破棄する
+            logger.warning("Sole fragment discarded", text=self._held_fragment[:40])
+            self._held_fragment = None
+        return [s for s in out if s.strip()]
+
+    def _save_fallback_raw(self) -> None:
+        """フォールバック発動時の生出力を全文保存する（観測性の改善）。
+
+        通常ログの raw_preview / after_strip は先頭300字で切れるため、思考
+        ブロック等の全文が残らない。保存先は logs/fallback_raw/ で、直近
+        50件だけ残す。保存に失敗しても発話処理は止めない。
+        """
+        try:
+            dest_dir = Path(__file__).resolve().parents[2] / "logs" / "fallback_raw"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+            path = dest_dir / f"fallback-{stamp}.txt"
+            path.write_text(self._raw, encoding="utf-8")
+            logger.warning("Plain-text fallback activated; raw output saved",
+                           path=str(path), chars=len(self._raw))
+            saved = sorted(dest_dir.glob("fallback-*.txt"))
+            for old in saved[:-50]:
+                old.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    # ── 内部処理 ──────────────────────────────────────────────
+
+    def _reparse(self) -> None:
+        """生テキスト全体から speech 値を復元し直す（チャンク境界に依存しない）"""
+        if self._closed:
+            return
+        text = self._strip_think(self._raw)
+        m = _SPEECH_KEY.search(text)
+        if not m:
+            return
+        self._value, self._closed = self._decode_value(text, m.end())
+
+    @staticmethod
+    def _decode_value(text: str, start: int) -> tuple[str, bool]:
+        """
+        JSON文字列リテラルの中身を start から読み取る。
+        Returns: (デコード済み文字列, 閉じ引用符に到達したか)
+        """
+        buf: list[str] = []
+        i = start
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if ch == "\\":
+                if i + 1 >= n:
+                    break  # エスケープ対象がまだ届いていない
+                nxt = text[i + 1]
+                if nxt == "u":
+                    if i + 6 > n:
+                        break  # \uXXXX が未完
+                    try:
+                        buf.append(chr(int(text[i + 2:i + 6], 16)))
+                    except ValueError:
+                        pass
+                    i += 6
+                    continue
+                buf.append(_ESCAPES.get(nxt, nxt))
+                i += 2
+                continue
+            if ch == '"':
+                return "".join(buf), True
+            buf.append(ch)
+            i += 1
+        return "".join(buf), False
+
+    def _pop_sentences(self, final: bool) -> list[str]:
+        """未払い出し部分から、確定した文を切り出す"""
+        out: list[str] = []
+        while True:
+            pending = self._value[self._consumed:]
+            if not pending:
+                break
+            idx = self._find_break(pending, final)
+            if idx is None:
+                break
+            chunk = pending[:idx + 1]
+            remaining = len(pending) - len(chunk)
+            # 短すぎる断片は、続きが来る見込みがあるなら次とまとめる
+            if not final and not self._closed and remaining == 0 \
+                    and len(chunk.strip()) < self._min:
+                break
+            self._consumed += len(chunk)
+            stripped = chunk.strip()
+            if stripped and _has_word_chars(stripped):
+                self._accept(out, stripped)
+        return out
+
+    def _accept(self, out: list[str], sentence: str) -> None:
+        """確定した文を払い出しリストへ追加する。
+
+        ただし、正規化3字以下の断片が応答の最初の文で、まだ何も払い出して
+        いない場合は保留する。後続の文が来れば先に払い出すが、最後まで
+        来なければ flush() で破棄する（断片だけの応答を喋らせないための
+        対策。複数文の中にある短い相づちは通常どおり残す）。
+        """
+        if self._held_fragment is not None:
+            out.append(self._held_fragment)
+            self._emitted_count += 1
+            self._held_fragment = None
+        if self._emitted_count == 0 and _normalized_len(sentence) <= 3:
+            self._held_fragment = sentence
+            return
+        out.append(sentence)
+        self._emitted_count += 1
+
+    def _find_break(self, text: str, final: bool) -> int | None:
+        """区切ってよい位置（インデックス）を返す。無ければ None。"""
+        for i, ch in enumerate(text):
+            if ch in _SENTENCE_END:
+                return i
+        if len(text) >= self._max:
+            # 文末が来ないので、読点や空白で妥協して区切る
+            for i in range(len(text) - 1, self._min - 1, -1):
+                if text[i] in _SOFT_BREAK:
+                    return i
+            return len(text) - 1
+        return None
+
+    @staticmethod
+    def _strip_think(text: str) -> str:
+        """思考タグを除去する（<think> / <reasoning> / <thought> と Gemma の
+        channel 形式。閉じていない場合は以降を全部落とす）。実装は parser
+        側の strip_think_tags に一本化してある"""
+        return strip_think_tags(text)
+
+    def _fallback_text(self) -> str:
+        """JSONを返さないモデル向けのフォールバック：生テキストをそのまま発話にする
+
+        ただし擬似タグ形式（<emotion: ..> <motion: ..> <speech: ..>）の場合は
+        speech の中身だけを抜き、タグ断片そのものは絶対に発話にしない
+        （2026-11-14の劣化対策：タグ文字列がそのまま読み上げられた）。
+        """
+        text = self._strip_think(self._raw).strip()
+        text = re.sub(r"```(?:json)?", "", text).strip()
+        if not text or text.lstrip().startswith("{"):
+            return ""
+        m = re.search(r"<speech\s*:\s*", text, flags=re.IGNORECASE)
+        if m:
+            text = text[m.end():]
+        text = re.sub(r"<[^>]{0,80}>", "", text).strip().strip("'\"")
+        # 推論・ターン記号の漏れは混入位置で切り、同一文の繰り返しは打ち切る
+        text = truncate_at_meta_leak(text)
+        if not text:
+            return ""
+        text = dedupe_repeated_sentences(text)
+        if not _has_word_chars(text):
+            return ""
+        # 切断しきれなかった思考マーカー・ターン記号が残るものと、記号で
+        # 始まるものは発話として採用しない（そのターンは skip に倒す）
+        if contains_meta_leak(text) or text[:1] in ("<", "*", "#"):
+            return ""
+        return text
+
+    # ── 結果取得 ──────────────────────────────────────────────
+
+    @property
+    def raw(self) -> str:
+        return self._raw
+
+    @property
+    def speech(self) -> str:
+        return self._value.strip()
+
+    @property
+    def is_skip(self) -> bool:
+        """ストリーム途中でも skip:true が確定していれば True"""
+        return bool(re.search(r'"skip"\s*:\s*true', self._raw))
+
+    def peek(self, key: str) -> str:
+        """
+        ストリーム途中でも取れている文字列キーの値を返す（未到達なら空文字）。
+        emotion/motion を speech より前に置くことで、発話開始前に表情を確定できる。
+        """
+        m = re.search(rf'"{key}"\s*:\s*"([^"]*)"', self._strip_think(self._raw))
+        return m.group(1) if m else ""
+
+    def build_response(self) -> LLMResponse:
+        """
+        ストリーム全体から最終的なLLMResponseを作る。
+        emotion/motion はJSONから拾い、speechはストリームで組み立てた文字列を使う。
+        """
+        parsed = parse_llm_output(self._raw)
+        speech = self.speech or parsed.speech
+        # 発話テキストがある以上、既に喋り始めている可能性が高いのでskip扱いにはしない
+        if not speech:
+            return LLMResponse(speech="", skip=True, raw=parsed.raw)
+        return LLMResponse(
+            speech=speech,
+            emotion=parsed.emotion,
+            motion=parsed.motion,
+            target_comment_id=parsed.target_comment_id,
+            skip=False,
+            raw=parsed.raw,
+        )

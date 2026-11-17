@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>AI Vtuber - Video Avatar</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: transparent; overflow: hidden;
+    font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+  }
+  /* 透過WebMを2枚重ね、切り替え時にクロスフェードして継ぎ目を消す */
+  .stage { position: relative; width: 100%; height: 100%; }
+  .stage video {
+    position: absolute; inset: 0; margin: auto;
+    height: 100%; width: 100%;
+    object-fit: contain;
+    opacity: 0; transition: opacity 0.25s linear;
+  }
+  .stage video.active { opacity: 1; }
+  #status-indicator {
+    position: absolute; left: 8px; bottom: 6px;
+    color: rgba(255,255,255,0.55); font-size: 11px;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.6);
+    pointer-events: none; user-select: none;
+  }
+  #notice {
+    position: absolute; inset: 0; display: none;
+    align-items: center; justify-content: center;
+    color: #fff; font-size: 15px; text-align: center;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.8); padding: 1em;
+  }
+</style>
+</head>
+<body>
+<div class="stage">
+  <video id="vA" muted playsinline preload="auto"></video>
+  <video id="vB" muted playsinline preload="auto"></video>
+</div>
+<div id="notice"></div>
+<div id="status-indicator">video avatar</div>
+<audio id="voice"></audio>
+
+<script>
+'use strict';
+// ────────────────────────────────────────────────────────────────
+// 動画アバター: 透過WebMのモーション動画を再生する画面
+//   待機モーション … カタログの idle を順番にループ再生（クロスフェード）
+//   アクションモーション … 発話に合わせて1回だけ再生し、終わったら待機へ戻る
+//     （チャンネル動画と同じ「アクションは1回だけ、残りは待機」の流儀）
+// ────────────────────────────────────────────────────────────────
+
+const MUTED = new URLSearchParams(location.search).get('mute') === '1';
+const CHAR_PARAM = new URLSearchParams(location.search).get('char') || '';
+let MY_CHAR = CHAR_PARAM;
+
+let cfg = { idle: [], motion_map: {}, emotion_map: {} };
+let idleIndex = 0;
+let mode = 'idle';            // 'idle' | 'action'
+let pendingAction = null;     // アクション再生中に来た次のアクション（最新1つだけ保持）
+let lastEmotion = 'neutral';
+
+const els = [document.getElementById('vA'), document.getElementById('vB')];
+let front = 0;                // 表示中レイヤーの index
+const voice = document.getElementById('voice');
+
+function setStatus(msg) { document.getElementById('status-indicator').textContent = msg; }
+function showNotice(msg) {
+  const n = document.getElementById('notice');
+  n.textContent = msg || '';
+  n.style.display = msg ? 'flex' : 'none';
+}
+function isMine(msg) {
+  if (!MY_CHAR) return true;
+  if (msg.type === 'config_update') return !msg.characters || msg.characters.includes(MY_CHAR);
+  return !msg.character || msg.character === MY_CHAR;
+}
+function avatarConfigUrl() {
+  return '/api/avatar_config' + (CHAR_PARAM ? '?char=' + encodeURIComponent(CHAR_PARAM) : '');
+}
+function pick(list) { return list[Math.floor(Math.random() * list.length)]; }
+
+// ── 再生ステートマシン ──────────────────────────────────────────
+function swapTo(url, { loop = false } = {}) {
+  const cur = els[front];
+  const nxt = els[1 - front];
+  nxt.loop = loop;
+  nxt.src = url;
+  nxt.currentTime = 0;
+  const p = nxt.play();
+  if (p) p.catch(() => {});
+  nxt.classList.add('active');
+  cur.classList.remove('active');
+  // 裏になった方は少し遅らせて止める（クロスフェードの残像を残さない）
+  setTimeout(() => { try { cur.pause(); } catch (e) {} }, 300);
+  front = 1 - front;
+  els[front].onended = onClipEnded;
+}
+
+function playIdle() {
+  if (!cfg.idle.length) { showNotice('待機モーションがありません（カタログを確認してください）'); return; }
+  mode = 'idle';
+  const url = cfg.idle[idleIndex % cfg.idle.length];
+  idleIndex += 1;
+  swapTo(url, { loop: false });   // 終了イベントで次の待機へ回すため loop は使わない
+}
+
+function playAction(urls) {
+  if (!urls || !urls.length) return;
+  if (mode === 'action') { pendingAction = urls; return; }
+  mode = 'action';
+  swapTo(pick(urls), { loop: false });
+}
+
+function onClipEnded() {
+  if (mode === 'action') {
+    if (pendingAction) {
+      const next = pendingAction; pendingAction = null;
+      mode = 'idle';               // playAction が再度 action にする
+      playAction(next);
+      return;
+    }
+    playIdle();
+    return;
+  }
+  playIdle();                      // 待機は次のバリエーションへ
+}
+
+// ── モーション解決 ──────────────────────────────────────────────
+function handleMotion(motion, emotion) {
+  const name = motion || 'idle';
+  if (name === 'none') return;
+  if (name !== 'idle' && cfg.motion_map[name]) { playAction(cfg.motion_map[name]); return; }
+  // motion が idle/未対応でも、感情に合う動きがあればそちらを出す
+  const emo = emotion || lastEmotion;
+  if (emo && emo !== 'neutral' && cfg.emotion_map[emo]) playAction(cfg.emotion_map[emo]);
+}
+
+// ── 音声（バックエンド側で鳴らしているときは ?mute=1） ─────────
+function playAudio(url) {
+  if (MUTED || !url) return;
+  voice.src = url;
+  voice.play().catch(() => {});
+}
+
+// ── WebSocket ───────────────────────────────────────────────────
+function connectWS() {
+  const ws = new WebSocket(`ws://${location.host}/ws/avatar`);
+  ws.onopen = () => setStatus('connected');
+  ws.onclose = () => { setStatus('disconnected'); setTimeout(connectWS, 3000); };
+  ws.onmessage = (e) => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch (err) { return; }
+    if (!isMine(msg)) return;
+
+    if (msg.type === 'config_update') {
+      if (msg.avatar_type && msg.avatar_type !== 'video' && location.pathname === '/avatar') {
+        location.reload();
+        return;
+      }
+      if (msg.video) { applyVideoConfig(msg.video); }
+    }
+    if (msg.type === 'test_motion') handleMotion(msg.motion || 'wave', 'happy');
+    if (msg.type === 'speech_start') {
+      lastEmotion = msg.emotion || 'neutral';
+      if (msg.audio_url) playAudio(msg.audio_url);
+    }
+    if (msg.type === 'motion') handleMotion(msg.motion || 'idle', lastEmotion);
+    if (msg.type === 'speech_end') { lastEmotion = 'neutral'; }
+  };
+}
+
+function applyVideoConfig(video) {
+  cfg = {
+    idle: video.idle || [],
+    motion_map: video.motion_map || {},
+    emotion_map: video.emotion_map || {},
+  };
+  if (!video.catalog_ok) {
+    showNotice('動画カタログが見つかりません: ' + (video.catalog_path || '(未設定)'));
+    return;
+  }
+  showNotice('');
+  if (mode === 'idle' && !els[front].src) playIdle();
+}
+
+// ── 起動 ────────────────────────────────────────────────────────
+(async function init() {
+  try {
+    const data = await (await fetch(avatarConfigUrl())).json();
+    if (data.character) MY_CHAR = data.character;
+    setStatus('video avatar: ' + (data.character_name || MY_CHAR || ''));
+    applyVideoConfig(data.video || {});
+    if (cfg.idle.length) playIdle();
+  } catch (e) {
+    showNotice('アバター設定の取得に失敗しました');
+  }
+  connectWS();
+})();
+</script>
+</body>
+</html>

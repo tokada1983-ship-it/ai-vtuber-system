@@ -1,0 +1,12 @@
+# 人格QLoRAの学習用（配信だけなら不要）
+#   py -3.10 -m pip install -r requirements-train.txt
+#
+# torch は CUDA版を先に入れておくこと（RTX 50xx は cu128 以降）:
+#   py -3.10 -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+transformers>=4.46
+peft>=0.13
+accelerate>=1.0
+# 4bit量子化（QLoRA）。RTX 50xx（Blackwell）は 0.46 以降が必要。
+# 動かない環境では学習が自動で通常のLoRA（bf16）に切り替わる
+bitsandbytes>=0.46
+safetensors>=0.4

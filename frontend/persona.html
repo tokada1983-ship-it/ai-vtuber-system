@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>人格QLoRA</title>
+<style>
+  :root {
+    --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3e;
+    --accent: #7c6ff7; --accent2: #4fc3f7;
+    --green: #4caf50; --red: #f44336; --yellow: #ffca28;
+    --text: #e0e0e0; --muted: #8b93a1;
+    --font: 'Segoe UI','Hiragino Sans',sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; }
+  header { padding: 12px 20px; background: var(--surface); border-bottom: 1px solid var(--border);
+           display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 18px; color: var(--accent); flex: 1; }
+  header a { color: var(--accent2); text-decoration: none; font-size: 13px; }
+  main { max-width: 980px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+  .card h2 { font-size: 13px; color: var(--muted); letter-spacing: .04em; margin-bottom: 10px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 8px; margin-bottom: 8px; }
+  label { font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 3px; }
+  label.inline { flex-direction: row; align-items: center; gap: 6px; color: var(--text); font-size: 13px; }
+  input[type=text], input[type=number], select {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); padding: 7px 10px; font-size: 13px; min-width: 0; width: 100%;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  button { padding: 7px 14px; border-radius: 6px; border: none; cursor: pointer;
+           font-size: 13px; font-weight: 600; white-space: nowrap; }
+  button:hover { opacity: .85; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-danger { background: var(--red); color: #fff; }
+  .btn-ghost { background: var(--border); color: var(--text); }
+  .badge { display: inline-block; padding: 2px 9px; border-radius: 10px; font-size: 12px; font-weight: 700; }
+  .on { background: var(--green); color: #fff; } .off { background: var(--border); color: var(--muted); }
+  .warn { color: var(--yellow); font-size: 12px; } .err { color: var(--red); font-size: 12px; }
+  .muted { color: var(--muted); font-size: 12px; line-height: 1.6; }
+  .kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; }
+  .kv div { background: var(--bg); border-radius: 6px; padding: 7px 10px; font-size: 12px; }
+  .kv b { display: block; color: var(--accent2); font-size: 14px; margin-top: 2px; word-break: break-all; }
+  .bar { height: 10px; background: var(--bg); border-radius: 5px; overflow: hidden; margin: 6px 0; }
+  .bar > div { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent2)); transition: width .3s; }
+  pre.log { background: var(--bg); border-radius: 6px; padding: 8px; font-size: 11px; max-height: 180px;
+            overflow: auto; white-space: pre-wrap; color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .sample { background: var(--bg); border-radius: 6px; padding: 6px 8px; margin-top: 4px; font-size: 12px; }
+  .sample .in { color: var(--muted); } .sample .out { color: var(--text); }
+  .steps { display: flex; gap: 6px; font-size: 12px; color: var(--muted); margin-bottom: 4px; flex-wrap: wrap; }
+  .steps span { background: var(--bg); padding: 3px 8px; border-radius: 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🧬 人格QLoRA — キャラの口調をモデルに焼き込む</h1>
+  <a href="/" >← ダッシュボード</a>
+</header>
+<main>
+
+<div class="card">
+  <h2>現在の状態</h2>
+  <div class="row">
+    <span>キャラクター: <b id="st-char">-</b></span>
+    <span id="st-badge" class="badge off">未使用</span>
+    <span class="muted">応答LLM: <span id="st-llm">-</span></span>
+    <span class="muted">プロンプト: <span id="st-mode">-</span></span>
+    <span style="flex:1"></span>
+    <button class="btn-ghost" id="btn-deactivate">通常のLLMに戻す</button>
+  </div>
+  <div class="steps"><span>① データセット作成</span><span>→ ② 学習</span><span>→ ③ Ollamaへ登録</span><span>→ ④ 使う</span></div>
+  <p class="muted">
+    人格モデルを使っている間は、長いキャラ設定をプロンプトから省く（slim）ので毎回の入力が約半分になり、応答開始が速くなります。
+    専用モデルが応答しないときは、自動で通常のLLM（全文プロンプト）に戻ります。
+  </p>
+</div>
+
+<div class="card">
+  <h2>学習環境</h2>
+  <div class="row">
+    <button class="btn-ghost" id="btn-env">環境をチェック</button>
+    <span class="muted" id="env-summary">未チェック</span>
+  </div>
+  <div class="kv" id="env-kv"></div>
+  <p class="warn" id="env-warn"></p>
+</div>
+
+<div class="card">
+  <h2>① データセット作成</h2>
+  <div class="grid">
+    <label>今のLLMに作らせる会話例の数
+      <input type="number" id="ds-synthetic" min="0" max="3000" step="50"></label>
+    <label>先生役のモデル（空なら普段のLLM）
+      <input type="text" id="ds-teacher" placeholder="例: qwen_qwen3.6-35b-a3b"></label>
+    <label class="inline"><input type="checkbox" id="ds-history"> ローカルチャットの実会話も使う</label>
+  </div>
+  <p class="muted">キャラ設定のセリフ例＋実会話＋「全文のキャラ設定を渡したLLM」の応答を教材にします。
+    合成には今の primary LLM（LM Studio 等）を使うので、起動しておいてください。目安: 200件で数分。</p>
+  <div class="row" style="margin-top:8px">
+    <button class="btn-primary" id="btn-dataset">データセットを作る</button>
+    <span class="muted" id="ds-meta">まだありません</span>
+  </div>
+</div>
+
+<div class="card">
+  <h2>② 学習（QLoRA）</h2>
+  <div class="grid">
+    <label>ベースモデル（Hugging Face ID またはローカルパス）<input type="text" id="tr-base_model"></label>
+    <label>エポック<input type="number" id="tr-epochs" step="0.5" min="0.5"></label>
+    <label>学習率<input type="text" id="tr-learning_rate"></label>
+    <label>LoRA r<input type="number" id="tr-lora_r" min="4" step="4"></label>
+    <label>LoRA alpha<input type="number" id="tr-lora_alpha" min="4" step="4"></label>
+    <label>最大トークン長<input type="number" id="tr-max_seq_len" step="128"></label>
+    <label>勾配蓄積<input type="number" id="tr-grad_accum" min="1"></label>
+    <label>量子化
+      <select id="tr-quant"><option value="auto">auto（4bitが使えれば4bit）</option>
+        <option value="4bit">4bit（QLoRA）</option><option value="none">なし（LoRA / bf16）</option></select></label>
+    <label class="inline"><input type="checkbox" id="tr-merge" checked> 統合モデルも書き出す（Ollama登録に必要）</label>
+  </div>
+  <p class="warn">学習中はVRAMをほぼ使い切ります。LM Studio などでモデルを読み込んでいる場合はアンロードしてください。
+    初回はベースモデルのダウンロード（7Bで約15GB）が発生します。</p>
+  <div class="row" style="margin-top:8px">
+    <button class="btn-ghost" id="btn-save">この値を既定にする</button>
+    <button class="btn-primary" id="btn-train">学習を開始</button>
+    <button class="btn-danger" id="btn-cancel">中止</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>進捗</h2>
+  <div class="row"><b id="job-title">待機中</b><span class="muted" id="job-detail"></span></div>
+  <div class="bar"><div id="job-bar"></div></div>
+  <pre class="log" id="job-log"></pre>
+</div>
+
+<div class="card">
+  <h2>③④ 学習済みアダプタ</h2>
+  <div class="grid">
+    <label>登録方式
+      <select id="rg-mode"><option value="gguf">gguf（GGUFに変換して登録・推奨）</option>
+        <option value="merged">merged（safetensorsを直接取り込む・Qwen2は不可）</option>
+        <option value="adapter">adapter（既存のOllamaモデルに重ねる）</option></select></label>
+    <label>adapter方式のFROM（Ollama上のベース）<input type="text" id="rg-base" placeholder="例: qwen2.5:7b-instruct"></label>
+    <label>形式・量子化<select id="rg-quant"><option value="q8_0">q8_0（gguf・推奨）</option>
+      <option value="f16">f16（gguf）</option><option value="bf16">bf16（gguf）</option>
+      <option value="int4">int4（merged）</option><option value="int8">int8（merged）</option></select></label>
+  </div>
+  <table>
+    <thead><tr><th>学習</th><th>状態</th><th>loss</th><th>Ollamaモデル</th><th>試し出力</th><th></th></tr></thead>
+    <tbody id="runs"></tbody>
+  </table>
+  <p class="muted" id="runs-empty">まだ学習結果はありません</p>
+</div>
+
+<div class="card">
+  <h2>手動で指定する（他の環境で作ったモデルを使う）</h2>
+  <div class="grid">
+    <label>モデル名<input type="text" id="mn-model" placeholder="例: Character1-persona"></label>
+    <label>LLMバックエンド<select id="mn-backend"></select></label>
+    <label>プロンプト
+      <select id="mn-mode"><option value="slim">slim（キャラ設定を省略）</option><option value="full">full（従来どおり全文）</option></select></label>
+  </div>
+  <button class="btn-primary" id="btn-manual">このモデルを使う</button>
+</div>
+
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const TRAIN_KEYS = ['base_model', 'epochs', 'learning_rate', 'lora_r', 'lora_alpha', 'max_seq_len', 'grad_accum'];
+let STATE = null;
+
+async function api(path, body) {
+  const opt = body === undefined ? {} : {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)};
+  const res = await fetch(path, opt);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || res.statusText);
+  return data;
+}
+function act(fn) {
+  return async () => { try { await fn(); } catch (e) { alert(e.message); } finally { refresh(); } };
+}
+function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function fmtTime(sec) { if (!sec && sec !== 0) return ''; const m = Math.floor(sec / 60); return m ? `${m}分${sec % 60}秒` : `${sec}秒`; }
+
+function renderStatus(s) {
+  STATE = s;
+  const c = s.config;
+  $('st-char').textContent = s.character;
+  $('st-badge').textContent = s.active ? `使用中: ${c.runtime_model}` : (c.enabled ? '有効（フォールバック中）' : '未使用');
+  $('st-badge').className = 'badge ' + (s.active ? 'on' : 'off');
+  $('st-llm').textContent = s.llm_backend;
+  $('st-mode').textContent = s.active ? c.prompt_mode : 'full';
+
+  if (!document.activeElement || !document.activeElement.id.startsWith('tr-')) {
+    TRAIN_KEYS.forEach(k => { $('tr-' + k).value = c[k]; });
+  }
+  if (document.activeElement?.id !== 'ds-synthetic') $('ds-synthetic').value = c.synthetic_samples;
+  $('ds-history').checked = c.include_chat_history;
+  if (document.activeElement?.id !== 'ds-teacher') $('ds-teacher').value = c.teacher_model || '';
+
+  const d = s.dataset;
+  $('ds-meta').textContent = d ? `${d.total}件（学習${d.train} / 評価${d.eval}）` +
+      ` 内訳: ${Object.entries(d.by_source || {}).map(([k, v]) => `${k}=${v}`).join(', ')}` +
+      (d.rejected ? ` / 不採用${d.rejected}` : '') : 'まだありません';
+
+  const sel = $('mn-backend');
+  if (!sel.options.length) {
+    ['ollama', 'lmstudio', 'llamacpp', 'openai_compat', 'vllm'].forEach(b => sel.add(new Option(b, b)));
+    sel.value = c.backend;
+  }
+  if (s.environment) renderEnv(s.environment);
+  renderRuns(s.runs, c);
+  renderJob(s.job);
+  const busy = s.job.status === 'running';
+  ['btn-dataset', 'btn-train'].forEach(id => $(id).disabled = busy);
+  $('btn-cancel').disabled = !(busy && s.job.kind === 'train');
+  $('btn-deactivate').disabled = !c.enabled;
+}
+
+function renderEnv(e) {
+  const items = [['GPU', e.gpu || (e.cuda ? 'CUDA' : 'なし')], ['VRAM', e.vram_gb ? e.vram_gb + ' GB' : '-'],
+    ['torch', e.torch || '未導入'], ['transformers', e.transformers || '未導入'],
+    ['peft', e.peft || '未導入'], ['bitsandbytes', (e.bitsandbytes || '未導入') + (e.bnb_4bit_ok ? ' ✓4bit' : ' ✗4bit')]];
+  $('env-kv').innerHTML = items.map(([k, v]) => `<div>${k}<b>${esc(v)}</b></div>`).join('');
+  $('env-summary').textContent = e.ready ? '学習できます' : '足りないものがあります';
+  const warn = [];
+  if (!e.peft || !e.transformers) warn.push('pip install -r requirements-train.txt で学習用パッケージを入れてください。');
+  if (e.cuda && !e.bnb_4bit_ok) warn.push('4bit量子化が使えないため通常のLoRA（bf16）で学習します。7B以上を学習するなら bitsandbytes を 0.46 以降に更新してください。');
+  if (!e.cuda) warn.push('CUDA対応GPUが見つかりません。');
+  $('env-warn').textContent = warn.join(' ');
+}
+
+function renderJob(j) {
+  const names = {dataset: 'データセット作成', train: '学習', register: 'Ollamaへ登録'};
+  const statusJa = {running: '実行中', done: '完了', failed: '失敗', cancelled: '中止', idle: '待機中'};
+  $('job-title').textContent = j.kind ? `${names[j.kind] || j.kind}: ${statusJa[j.status] || j.status}` : '待機中';
+  const parts = [];
+  if (j.stage) parts.push(j.stage);
+  if (j.total_steps) parts.push(`${j.step || 0} / ${j.total_steps}`);
+  if (j.loss !== undefined) parts.push(`loss ${j.loss}`);
+  if (j.eval_loss) parts.push(`eval ${j.eval_loss}`);
+  if (j.eta_sec) parts.push(`残り ${fmtTime(j.eta_sec)}`);
+  if (j.error) parts.push('エラー: ' + j.error);
+  $('job-detail').textContent = parts.join(' ・ ');
+  const pct = j.total_steps ? Math.min(100, 100 * (j.step || 0) / j.total_steps) : (j.status === 'done' ? 100 : 0);
+  $('job-bar').style.width = pct + '%';
+  if (j.log) { const el = $('job-log'); el.textContent = j.log.join('\n'); el.scrollTop = el.scrollHeight; }
+}
+
+function renderRuns(runs, cfg) {
+  $('runs-empty').style.display = runs.length ? 'none' : '';
+  $('runs').innerHTML = runs.map(r => {
+    const using = cfg.enabled && cfg.runtime_model && cfg.runtime_model === r.runtime_model;
+    const samples = (r.samples || []).map(s =>
+      `<div class="sample"><div class="in">${esc(s.input)}</div><div class="out">→ ${esc(s.output)}</div></div>`).join('');
+    const btns = [];
+    if (r.has_adapter) btns.push(`<button class="btn-ghost" data-reg="${esc(r.run)}">Ollamaへ登録</button>`);
+    if (r.runtime_model) btns.push(using ? '<span class="badge on">使用中</span>'
+      : `<button class="btn-primary" data-use="${esc(r.run)}">使う</button>`);
+    return `<tr><td>${esc(r.run)}<div class="muted">${esc(r.base_model)}<br>${esc(r.quantization || '')} / ${r.examples ?? '-'}件</div></td>
+      <td>${esc(r.status)}${r.error ? `<div class="err">${esc(r.error)}</div>` : ''}</td>
+      <td>${r.final_loss ?? '-'}<div class="muted">eval ${r.eval_loss ?? '-'}</div></td>
+      <td>${esc(r.runtime_model || '未登録')}</td><td>${samples}</td><td>${btns.join(' ')}</td></tr>`;
+  }).join('');
+  document.querySelectorAll('[data-reg]').forEach(b => b.onclick = act(async () => {
+    const name = prompt('Ollamaでのモデル名（空欄なら自動）', '') ?? null;
+    if (name === null) return;
+    await api('/api/persona/register', {run: b.dataset.reg, model_name: name.trim(),
+      mode: $('rg-mode').value, ollama_base: $('rg-base').value.trim(), quantize: $('rg-quant').value});
+  }));
+  document.querySelectorAll('[data-use]').forEach(b => b.onclick = act(() =>
+    api('/api/persona/activate', {run: b.dataset.use})));
+}
+
+function trainValues() {
+  const v = {};
+  TRAIN_KEYS.forEach(k => { const raw = $('tr-' + k).value.trim(); if (raw !== '') v[k] = k === 'base_model' ? raw : Number(raw); });
+  return v;
+}
+
+async function refresh() {
+  try { renderStatus(await api('/api/persona')); } catch (e) { console.warn(e); }
+}
+
+$('btn-env').onclick = act(async () => { $('env-summary').textContent = '確認中…'; renderEnv(await api('/api/persona/environment', {})); });
+$('btn-dataset').onclick = act(async () => {
+  await api('/api/persona/settings', {synthetic_samples: Number($('ds-synthetic').value || 0),
+                                      include_chat_history: $('ds-history').checked,
+                                      teacher_model: $('ds-teacher').value.trim()});
+  await api('/api/persona/dataset', {synthetic_samples: Number($('ds-synthetic').value || 0)});
+});
+$('btn-save').onclick = act(() => api('/api/persona/settings', trainValues()));
+$('btn-train').onclick = act(() => api('/api/persona/train',
+  {...trainValues(), quantization: $('tr-quant').value, merge: $('tr-merge').checked}));
+$('btn-cancel').onclick = act(() => api('/api/persona/cancel', {}));
+$('btn-deactivate').onclick = act(() => api('/api/persona/deactivate', {}));
+$('btn-manual').onclick = act(() => api('/api/persona/activate', {
+  runtime_model: $('mn-model').value.trim(), backend: $('mn-backend').value, prompt_mode: $('mn-mode').value}));
+
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws/dashboard`);
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'persona_job') {
+      renderJob(msg);
+      if (msg.status !== 'running') refresh();
+    }
+  };
+  ws.onclose = () => setTimeout(connect, 3000);
+}
+refresh();
+connect();
+setInterval(() => { if (STATE?.job?.status === 'running') refresh(); }, 5000);
+</script>
+</body>
+</html>

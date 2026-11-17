@@ -1,0 +1,11 @@
+# バッチファイルは CRLF でないと cmd.exe が goto / call :label を
+# 正しく解釈できず、ラベルが見つからないまま素通りする。
+# チェックアウト時に必ず CRLF になるよう固定する。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Unity のシリアライズ資産は改行を触らせない
+*.unity   -text
+*.asset   -text
+*.prefab  -text
+*.meta    -text

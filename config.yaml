@@ -1,0 +1,385 @@
+youtube:
+  video_id: ''
+  primary_source: pytchat
+  youtube_api:
+    api_key_env: YOUTUBE_API_KEY
+    polling_interval_ms: 5000
+twitcasting:
+  access_token_env: TWITCASTING_ACCESS_TOKEN
+  access_token: ''
+  user_id: ''
+  polling_interval_ms: 2000
+twitch:
+  token_env: TWITCH_OAUTH_TOKEN
+  token: ''
+  nick: ''
+  channel: ''
+llm:
+  primary: lmstudio
+  fallback: ollama
+  backends:
+    lmstudio:
+      base_url: http://localhost:1234/v1
+      model: prism-ml/bonsai-27b
+      temperature: 0.8
+      max_tokens: 1600
+      api_key_env: ''
+      extra_payload: {frequency_penalty: 0.4, presence_penalty: 0.2}
+    ollama:
+      base_url: http://localhost:11434
+      model: llama3.1:8b
+      temperature: 0.8
+      max_tokens: 500
+      api_key_env: ''
+      extra_payload: {think: false, format: json}
+    claude:
+      base_url: ''
+      model: claude-sonnet-4-20250514
+      temperature: 0.8
+      max_tokens: 500
+      api_key_env: ''
+      extra_payload: {}
+    openai:
+      base_url: ''
+      model: gpt-4o-mini
+      temperature: 0.8
+      max_tokens: 500
+      api_key_env: ''
+      extra_payload: {}
+    gemini:
+      base_url: https://generativelanguage.googleapis.com/v1beta/openai
+      model: gemini-3.5-flash-lite
+      temperature: 0.8
+      max_tokens: 300
+      api_key_env: GEMINI_API_KEY
+      extra_payload: {}
+  hybrid:
+    enabled: true
+    idle_backend: ''
+    fast_backend: gemini
+tts:
+  primary: irodori
+  timeout_sec: 30.0
+  backends:
+    voicevox:
+      base_url: http://localhost:50021
+      speaker_id: 3
+      speed: 1.1
+      pitch: 0.0
+      model: irodori-tts
+      voice: default
+      use_emotion_voice: false
+      emotion_voice_prefix: ''
+      response_format: wav
+      api_key: not-used
+    irodori:
+      base_url: http://localhost:8088/v1
+      speaker_id: 3
+      speed: 1.1
+      pitch: 0.0
+      model: irodori-tts
+      voice: default
+      use_emotion_voice: false
+      emotion_voice_prefix: ''
+      response_format: wav
+      api_key: not-used
+  irodori_server:
+    auto_start: true
+    dir: Irodori-TTS/Irodori-TTS-Server
+    command: ''
+    startup_timeout_sec: 300.0
+    stop_on_exit: true
+    env:
+      HF_HUB_CACHE: hf-cache
+characters:
+  # ── 出演キャラクター ──────────────────────────────────────────
+  # 1体分が1エントリ。2体以上並べると掛け合い配信になります。
+  # 性格・口調などの設定本文はここではなく、各キャラの character.yaml
+  # に書きます（prompt_file が空のときの既定の読み先は
+  # backend/llm/prompts/characters/<name>/character.yaml で、
+  # 同梱の characters/Character1/ が記入例になっています）。
+  # 声・アバター・LLM はキャラごとに上書きでき、書かなければ
+  # 全体設定（tts / avatar / llm セクション）を使います。
+  - name: Character1
+    id: Character1
+    enabled: true
+    prompt_file: ''
+    stream_theme: ''
+    data_dir: backend/llm/prompts
+    aliases:
+      - Character1ちゃん
+    voice:
+      backend: ''          # 空なら tts.primary を使う
+      voice: Character1        # TTS の話者名（Irodori-TTS の登録ボイス名など）
+      speaker_id: null     # VOICEVOX の話者ID
+      speed: null
+      pitch: null
+    llm:
+      backend: ''          # 空なら llm.primary / fallback を使う
+      model: ''            # キャラ専用モデル（人格QLoRAの登録名など）を使うときだけ指定
+    # 生成が反復ブロック等で詰まったときにそのまま喋る繋ぎ台詞。
+    # 話題に依存しない汎用文だけを置く（事実の主張・数値は入れない）
+    fallback_lines:
+      - ちょっと一息つきましょうか。のんびりいきましょう。
+      - 皆さんは最近、どんなことで笑いましたか？そういう話、大好きです。
+      - そうだ、皆さんの今日のごはんは何でしたか？食べ物の話になると止まらなくて。
+    avatar:
+      type: video
+      vrm:
+        model_path: models/default.vrm
+        idle_motion: breathe
+      live2d:
+        model_path: ''
+        scale: 0.9
+        position_x: 0.5
+        position_y: 0.5
+        idle_motion_group: Idle
+        lipsync_gain: 1.2
+        mouth_param: ''
+        expression_map: {}
+        motion_map: {}
+      video:
+        catalog_path: models/motions/Character1/catalog.json
+      world:
+        enabled: false
+        model_path: models/studio_world.glb
+        spawn_point:
+          - 0.0
+          - 0.0
+          - 0.0
+ensemble:
+  responder: balance
+  banter_probability: 0.5
+  idle_banter_probability: 0.85
+  max_banter_turns: 2
+  turn_gap_sec: 0.4
+  yield_to_comments: true
+avatar:
+  type: vrm
+  vrm:
+    model_path: models/default.vrm
+    idle_motion: breathe
+  live2d:
+    model_path: ''
+    scale: 0.9
+    position_x: 0.5
+    position_y: 0.5
+    idle_motion_group: Idle
+    lipsync_gain: 1.2
+    mouth_param: ''
+    expression_map: {}
+    motion_map: {}
+  video:
+    catalog_path: ''
+  world:
+    enabled: false
+    model_path: models/studio_world.glb
+    spawn_point:
+    - 0.0
+    - 0.0
+    - 0.0
+audio_output:
+  device: null
+orchestrator:
+  idle_threshold_sec: 30
+  response_history_turns: 20
+  consolidation_trigger_turns: 50
+  comment_dedupe_window_sec: 60
+  max_comment_length: 200
+  max_queue_size: 50
+  comment_ttl_sec: 120
+  streaming_tts: true
+  prefetch_idle: true
+  stream_min_chunk_chars: 8
+  stream_max_chunk_chars: 60
+  max_memory_entries: 300
+  memory_half_life_days: 30.0
+  memory_top_k: 3
+  memory_min_score: 0.25
+  idle_core_memory_chars: 1200
+  idle_episodic_entries: 8
+  enable_viewer_profiles: true
+  enable_reflection: true
+  max_diary_entries: 5
+  enable_persona_validation: true
+safety:
+  enabled: true
+  ng_words: []
+knowledge:
+  enabled: true
+  blocked_domains: []
+  search:
+    provider: auto
+    api_key_env: GOOGLE_SEARCH_API_KEY
+    cse_id_env: GOOGLE_CSE_ID
+    brave_api_key_env: BRAVE_SEARCH_API_KEY
+    max_results: 3
+    timeout_sec: 8.0
+    cache_ttl_sec: 900
+    language: ja
+    region: JP
+    min_request_interval_sec: 3.0
+    cooldown_base_sec: 60
+    cooldown_max_sec: 900
+  news:
+    enabled: true
+    feeds:
+    - https://news.google.com/rss?hl=ja&gl=JP&ceid=JP:ja
+    - https://www3.nhk.or.jp/rss/news/cat0.xml
+    refresh_interval_sec: 900
+    max_items: 30
+    max_age_hours: 24.0
+    keywords: []
+    retry_base_sec: 120
+  autonomous_topic:
+    enabled: true
+    weights:
+      memory: 1.6
+      news: 2.0
+      curiosity: 1.0
+    min_web_interval_sec: 120
+    max_documents: 3
+    remember: true
+  answer_with_search:
+    enabled: true
+    trigger_words:
+    - 調べて
+    - 検索して
+    - ググって
+    - 最新
+    - ニュース
+    - って何
+    - とは
+    - 教えて
+    max_results: 3
+    min_interval_sec: 20
+    fact_categories:
+    - 株価
+    - 終値
+    - 始値
+    - 高値
+    - 安値
+    - 日経平均
+    - 為替
+    - 円相場
+    - 金利
+    - 天気
+    - 気温
+    - 降水確率
+    - 価格
+    - 値段
+    - 発売日
+    - 発売
+    - 開催
+    - 結果
+    - 順位
+    - スコア
+    - 得点
+    - 営業時間
+    - 住所
+    - 電話番号
+    - 人口
+    - 視聴率
+    - 売上
+    - 時価総額
+    - 配当
+    - 送料
+    - 在庫
+    question_words:
+    - いくら
+    - 何円
+    - 何位
+    - 何人
+    - 何時
+    - 何分
+    - 何日
+    - 何年
+    - 何月
+    - 何％
+    - 何パーセント
+    - いつ
+    - どこ
+    - 誰
+    - どれ
+    date_words:
+    - 昨日
+    - 今日
+    - 明日
+    - 明後日
+    - 今週
+    - 先週
+    - 来週
+    - 今月
+    - 先月
+    - 今年
+    - 去年
+    - 現在
+    opinion_markers:
+    - どう思う
+    - 感想
+    - 好き
+    - 派？
+    - 派か
+    - おすすめ
+    - 推し
+    - 応援
+    answer_retry_delays_sec:
+    - 30
+    - 120
+    - 300
+    pending_ttl_sec: 600
+local_chat:
+  user_name: マスター
+  priority: 10.0
+  idle_talk: true
+  autostart: true
+  greeting: ''
+  persist_history: true
+  history_max_entries: 1000
+  restore_context_turns: 8
+  consolidate_every_turns: 6
+stt:
+  enabled: true
+  backend: faster_whisper
+  model: small
+  device: auto
+  compute_type: ''
+  language: ja
+  speaker_name: マスター
+  priority: 9.0
+  min_duration_ms: 400
+  warmup_on_start: true
+persona:
+  enabled: false
+  adapter: ''
+  backend: lmstudio
+  runtime_model: your-persona-model
+  prompt_mode: slim
+  fallback_to_base: true
+  base_model: "<YOUR_PATH>/your-base-model"
+  output_dir: models/persona
+  epochs: 3.0
+  learning_rate: 0.0002
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  max_seq_len: 1024
+  batch_size: 1
+  grad_accum: 8
+  llama_cpp_dir: tools/llama.cpp
+  gguf_outtype: q8_0
+  synthetic_samples: 200
+  teacher_backend: lmstudio
+  teacher_model: bartowski/qwen_qwen3.6-35b-a3b-gguf/qwen_qwen3.6-35b-a3b-q4_0.gguf
+  include_chat_history: true
+ollama:
+  auto_start: true
+  preload_on_start: true
+  executable: ''
+  keep_alive: 30m
+  auto_pull: false
+  startup_timeout_sec: 30.0
+  stop_on_exit: true
+server:
+  host: 127.0.0.1
+  port: 9000

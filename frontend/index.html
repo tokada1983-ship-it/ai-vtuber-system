@@ -1,0 +1,2815 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Vtuber Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3e;
+    --accent: #7c6ff7; --accent2: #4fc3f7;
+    --green: #4caf50; --red: #f44336; --yellow: #ffca28;
+    --text: #e0e0e0; --muted: #6b7280;
+    --font: 'Segoe UI','Hiragino Sans',sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; }
+
+  header {
+    padding: 12px 20px; background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px;
+  }
+  header h1 { font-size: 18px; color: var(--accent); flex: 1; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); flex-shrink: 0; }
+  .dot.alive { background: var(--green); }
+
+  .layout { display: block; margin-right: 300px; }
+  .main { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .side {
+    width: 300px;
+    background: var(--surface); border-left: 1px solid var(--border);
+    padding: 16px; overflow-y: auto;
+    position: fixed; top: 49px; right: 0;
+    height: calc(100vh - 49px);
+    box-sizing: border-box;
+    z-index: 10;
+  }
+  #log-list { display: flex; flex-direction: column; gap: 4px; }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+  .card h2 { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 10px; }
+
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  input[type=text], input[type=number], select {
+    flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); padding: 7px 10px; font-size: 13px; min-width: 0;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  select option { background: var(--surface); }
+  button {
+    padding: 7px 14px; border-radius: 6px; border: none; cursor: pointer;
+    font-size: 13px; font-weight: 600; transition: opacity .15s; white-space: nowrap;
+  }
+  button:hover { opacity: .82; }
+  .btn-primary  { background: var(--accent); color: #fff; }
+  .btn-danger   { background: var(--red); color: #fff; }
+  .btn-ghost    { background: var(--border); color: var(--text); }
+  .btn-icon     { background: none; border: 1px solid var(--border); color: var(--muted); padding: 6px 10px; }
+
+  .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .res-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+  .res-head { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
+  .res-head b { color: var(--text); font-size: 13px; }
+  .res-bar { height: 7px; background: var(--bg); border-radius: 4px; overflow: hidden; margin: 4px 0 2px; }
+  .res-bar > div { height: 100%; width: 0; background: var(--green); transition: width .4s, background .4s; }
+  .res-sub { font-size: 11px; color: var(--muted); }
+  .vram-stack { display: flex; height: 22px; border-radius: 6px; overflow: hidden; margin-top: 4px;
+                background: var(--bg); border: 1px solid var(--border); }
+  .vram-stack > div { height: 100%; min-width: 2px; transition: width .5s; position: relative;
+                      border-right: 1px solid rgba(0,0,0,.35); font-size: 10px; color: #fff; overflow: hidden;
+                      white-space: nowrap; text-overflow: ellipsis; padding: 0 4px; line-height: 22px; }
+  .vram-legend { display: grid; grid-template-columns: 1fr auto auto; gap: 3px 10px; margin-top: 8px; font-size: 12px; }
+  .vram-legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+  .vram-legend .svc { color: var(--muted); font-size: 11px; margin-left: 4px; }
+  .vram-legend .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .vram-legend .pct { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 38px; }
+  .res-legend { display: flex; gap: 10px; font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .res-legend span::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 2px;
+                             background: var(--c); margin-right: 4px; }
+  .stat { background: var(--bg); border-radius: 6px; padding: 10px 12px; }
+  .stat-label { font-size: 11px; color: var(--muted); }
+  .stat-value { font-size: 14px; font-weight: 600; margin-top: 2px; color: var(--accent2); }
+
+  .speech-box {
+    background: var(--bg); border-left: 3px solid var(--accent);
+    padding: 10px 12px; border-radius: 0 6px 6px 0; min-height: 38px; font-size: 15px;
+  }
+  .emotion-badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; font-weight: 700; background: var(--accent); color: #fff; margin-left: 8px;
+  }
+
+  #comment-list { display: flex; flex-direction: column; gap: 6px; max-height: 360px; overflow-y: auto; }
+  .comment-item {
+    background: var(--bg); border-radius: 6px; padding: 7px 10px;
+    border-left: 3px solid var(--border); animation: fadeIn .2s ease;
+  }
+  .comment-item.superchat { border-left-color: var(--yellow); }
+  .comment-item.member    { border-left-color: var(--green); }
+  .comment-author { font-size: 11px; color: var(--accent); font-weight: 600; }
+  .comment-text   { margin-top: 2px; }
+
+  .log-item { font-size: 12px; padding: 3px 0; border-bottom: 1px solid var(--border); color: var(--muted); }
+  .log-item.warn  { color: var(--yellow); }
+  .log-item.error { color: var(--red); }
+  .log-item.info  { color: var(--text); }
+
+  .links { display: flex; gap: 8px; flex-wrap: wrap; }
+  .link-btn {
+    padding: 6px 12px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--accent2); font-size: 12px; text-decoration: none;
+  }
+
+  /* ── 設定モーダル ── */
+  .modal-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,.7); z-index: 100;
+    justify-content: center; align-items: flex-start; padding-top: 40px;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    width: min(720px, 96vw); max-height: 90vh; overflow-y: auto;
+    box-shadow: 0 20px 60px rgba(0,0,0,.5);
+  }
+  .modal-header {
+    padding: 16px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0;
+    background: var(--surface); z-index: 1;
+  }
+  .modal-header h2 { font-size: 16px; color: var(--accent); }
+  .modal-body { padding: 20px; display: flex; flex-direction: column; gap: 20px; }
+
+  .setting-section { display: flex; flex-direction: column; gap: 10px; }
+  .setting-section h3 {
+    font-size: 12px; color: var(--muted); text-transform: uppercase;
+    letter-spacing: .06em; padding-bottom: 6px; border-bottom: 1px solid var(--border);
+  }
+  .setting-row {
+    display: grid; grid-template-columns: 140px 1fr auto; gap: 8px; align-items: center;
+  }
+  .setting-label { font-size: 13px; color: var(--muted); }
+  .setting-row input, .setting-row select { max-width: 100%; }
+
+  .tab-bar {
+    display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin-bottom: 16px;
+    overflow-x: auto; overflow-y: hidden; scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+    -webkit-overflow-scrolling: touch; white-space: nowrap;
+    padding-bottom: 1px;
+  }
+  .tab-bar::-webkit-scrollbar { height: 4px; }
+  .tab-bar::-webkit-scrollbar-track { background: transparent; }
+  .tab-bar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  .tab {
+    padding: 7px 12px; border-radius: 6px 6px 0 0; cursor: pointer;
+    font-size: 12px; color: var(--muted); border: none; background: none;
+    flex-shrink: 0; white-space: nowrap;
+  }
+  .tab:hover { color: var(--text); background: rgba(255,255,255,0.04); }
+  .tab.active { color: var(--accent); border-bottom: 2px solid var(--accent); }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: flex; flex-direction: column; gap: 14px; }
+
+  .save-btn-row { display: flex; justify-content: flex-end; gap: 8px; padding-top: 8px; }
+
+  @keyframes fadeIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="dot" id="status-dot"></div>
+  <h1>🎭 AI Vtuber Dashboard</h1>
+  <span id="uptime" style="color:var(--muted);font-size:12px"></span>
+  <button class="btn-icon" onclick="openSettings()" title="設定">⚙️ 設定</button>
+</header>
+
+<div class="layout">
+  <div class="main">
+
+    <!-- コントロール -->
+    <div class="card">
+      <h2>配信コントロール</h2>
+      <div class="row">
+        <div style="flex:1;display:flex;flex-direction:column;gap:4px;min-width:0">
+          <label id="video-id-label" style="font-size:11px;color:var(--muted)">YouTube Video ID</label>
+          <input type="text" id="video-id-input" placeholder="例: xxxxxxxxxxx">
+          <div id="video-id-hint" style="font-size:11px;color:var(--muted)"></div>
+        </div>
+        <button class="btn-primary" onclick="startStream()">▶ 開始</button>
+        <button class="btn-ghost" onclick="startLocalChat()" title="配信サイトにつながず1対1でチャットする">🗨️ ローカルチャット</button>
+        <button class="btn-ghost"   onclick="startMock()" title="Mockモードで起動（テスト用）">🎭 Mock</button>
+        <button class="btn-danger"  onclick="stopStream()">■ 停止</button>
+      </div>
+    </div>
+
+    <!-- 音声対話（マイク） -->
+    <div class="card">
+      <h2>音声で話しかける</h2>
+      <div class="row" style="gap:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn-primary" id="mic-btn" onclick="toggleMic()">🎤 マイクON</button>
+        <div style="flex:1;min-width:120px">
+          <div style="height:8px;background:#222;border-radius:4px;overflow:hidden">
+            <div id="mic-level" style="height:100%;width:0%;background:var(--accent2);transition:width .05s"></div>
+          </div>
+        </div>
+        <label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:4px;cursor:pointer"
+               title="ONにすると、AIが喋っている間はマイクを止めて自分の声の回り込みを防ぎます">
+          <input type="checkbox" id="mic-halfduplex" checked> 発話中は停止
+        </label>
+        <label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:4px;cursor:pointer"
+               title="1文目を喋りながら2文目を合成します。応答が始まるまでの待ち時間が短くなります">
+          <input type="checkbox" id="opt-streaming" checked
+            onchange="wsSend('set_orchestrator', {streaming_tts: this.checked})"> 逐次発話
+        </label>
+      </div>
+      <div id="mic-status" style="font-size:11px;color:var(--muted);margin-top:6px">マイクOFF</div>
+      <div id="mic-transcript" class="speech-box" style="margin-top:6px;display:none"></div>
+    </div>
+
+    <!-- 診断 -->
+    <div class="card">
+      <h2>ローカルサービス診断
+        <button class="btn-ghost" style="float:right;font-size:11px;padding:2px 8px"
+          onclick="runDiagnose()">🔍 再スキャン</button>
+      </h2>
+      <div id="diagnose-issues" style="margin-bottom:8px"></div>
+      <div id="diagnose-providers" style="display:flex;flex-direction:column;gap:4px"></div>
+    </div>
+
+    <!-- BGM -->
+    <div class="card">
+      <h2>BGM</h2>
+      <!-- プレイリスト読み込み -->
+      <div class="row" style="margin-bottom:8px">
+        <input type="text" id="bgm-source" placeholder="bgm（フォルダ名 or M3Uパス）" value="bgm">
+        <button class="btn-ghost" onclick="bgmLoad()">📂 読み込み</button>
+      </div>
+      <!-- 現在の曲 -->
+      <div id="bgm-now" style="font-size:13px;color:var(--accent2);margin-bottom:8px;min-height:20px">—</div>
+      <!-- コントロール -->
+      <div class="row" style="gap:6px;flex-wrap:wrap;margin-bottom:8px">
+        <button class="btn-ghost" onclick="bgmCmd('bgm_prev')" title="前の曲">⏮</button>
+        <button class="btn-primary" id="bgm-play-btn" onclick="bgmPlayPause()">▶ 再生</button>
+        <button class="btn-ghost" onclick="bgmCmd('bgm_next')" title="次の曲">⏭</button>
+        <button class="btn-danger" onclick="bgmCmd('bgm_stop')" title="停止">■</button>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)">
+          🔊
+          <input type="range" id="bgm-volume" min="0" max="100" value="50" style="width:80px"
+            oninput="bgmVolume(this.value)">
+          <span id="bgm-vol-label">50%</span>
+        </label>
+        <label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:4px;cursor:pointer">
+          <input type="checkbox" id="bgm-shuffle" onchange="bgmShuffle(this.checked)"> シャッフル
+        </label>
+      </div>
+      <!-- プレイリスト -->
+      <div id="bgm-playlist" style="max-height:180px;overflow-y:auto;display:none"></div>
+    </div>
+
+    <!-- 配信テーマ -->
+    <div class="card">
+      <h2>配信テーマ</h2>
+      <div class="row">
+        <input type="text" id="stream-theme-input"
+          placeholder="例: ゲーム実況、雑談、プログラミング（空欄でフリー）"
+          onkeydown="if(event.key==='Enter')setStreamTheme()">
+        <button class="btn-primary" onclick="setStreamTheme()">設定</button>
+        <button class="btn-ghost"   onclick="clearStreamTheme()">クリア</button>
+      </div>
+      <div id="stream-theme-status" style="font-size:11px;color:var(--muted);margin-top:4px"></div>
+    </div>
+
+
+
+    <!-- 自律トーク・ニュース -->
+    <div class="card">
+      <h2>自律トーク・ニュース
+        <button class="btn-ghost" style="float:right;font-size:11px;padding:2px 8px"
+                onclick="refreshNews()">🔄 ニュース更新</button>
+      </h2>
+      <div id="knowledge-status" style="font-size:11px;color:var(--muted);margin-bottom:8px">—</div>
+
+      <div class="row" style="flex-wrap:wrap;gap:10px;margin-bottom:8px">
+        <label style="font-size:12px;display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="kn-topic-enabled" onchange="saveKnowledge()"> 自分から話題を振る
+        </label>
+        <label style="font-size:12px;display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="kn-news-enabled" onchange="saveKnowledge()"> ニュースを仕入れる
+        </label>
+        <label style="font-size:12px;display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="kn-answer-enabled" onchange="saveKnowledge()"> 聞かれたら検索して答える
+        </label>
+        <label style="font-size:12px;display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="kn-remember" onchange="saveKnowledge()"> 話したネタを記憶する
+        </label>
+      </div>
+
+      <div class="row" style="flex-wrap:wrap;gap:6px;margin-bottom:8px;font-size:11px;color:var(--muted)">
+        <span>話題の割合</span>
+        <label>記憶 <input type="number" id="kn-w-memory" min="0" max="10" step="0.5"
+                          style="width:56px" onchange="saveKnowledge()"></label>
+        <label>ニュース <input type="number" id="kn-w-news" min="0" max="10" step="0.5"
+                            style="width:56px" onchange="saveKnowledge()"></label>
+        <label>検索 <input type="number" id="kn-w-curiosity" min="0" max="10" step="0.5"
+                         style="width:56px" onchange="saveKnowledge()"></label>
+        <label>Webネタ間隔(秒) <input type="number" id="kn-interval" min="0" max="3600" step="30"
+                                  style="width:70px" onchange="saveKnowledge()"></label>
+      </div>
+
+      <div class="row" style="margin-bottom:8px">
+        <input type="text" id="kn-query" placeholder="調べて話してほしいこと（例: 猫 最新研究）"
+               onkeydown="if(event.key==='Enter')talkAbout()">
+        <button class="btn-primary" onclick="talkAbout()">検索して話す</button>
+      </div>
+      <div class="row" style="margin-bottom:8px">
+        <button class="btn-ghost" onclick="forceTopic('')">🎲 いま話題を振る</button>
+        <button class="btn-ghost" onclick="forceTopic('news')">📰 ニュースの話題</button>
+        <button class="btn-ghost" onclick="forceTopic('memory')">🧠 記憶の話題</button>
+      </div>
+
+      <div id="knowledge-result" style="font-size:12px;color:var(--accent2);margin-bottom:6px"></div>
+      <div id="news-list" style="max-height:200px;overflow-y:auto;font-size:12px"></div>
+    </div>
+
+    <!-- テストコメント入力 -->
+    <div class="card">
+      <h2>テストコメント入力</h2>
+      <div class="row" style="flex-wrap:wrap;gap:6px">
+        <input type="text" id="inject-author" placeholder="名前（視聴者名）" style="width:120px;flex:none">
+        <input type="text" id="inject-message" placeholder="コメント内容を入力..." style="flex:1;min-width:200px"
+          onkeydown="if(event.key==='Enter')injectComment()">
+        <button class="btn-primary" onclick="injectComment()">💬 送信</button>
+      </div>
+      <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
+        <label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:4px;cursor:pointer">
+          <input type="checkbox" id="inject-superchat"> スパチャ
+        </label>
+        <input type="number" id="inject-amount" placeholder="金額" min="100" step="100"
+          style="width:80px;font-size:12px;padding:4px 8px;display:none">
+        <label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:4px;cursor:pointer">
+          <input type="checkbox" id="inject-member"> メンバー
+        </label>
+        <label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:4px;cursor:pointer">
+          <input type="checkbox" id="inject-mod"> モデレーター
+        </label>
+      </div>
+    </div>
+
+    <!-- ステータス -->
+    <div class="card">
+      <h2>システム状態</h2>
+      <div class="status-grid">
+        <div class="stat"><div class="stat-label">コメントソース</div><div class="stat-value" id="st-source">—</div></div>
+        <div class="stat"><div class="stat-label">LLMバックエンド</div><div class="stat-value" id="st-llm">—</div></div>
+        <div class="stat"><div class="stat-label">TTSバックエンド</div><div class="stat-value" id="st-tts">—</div></div>
+        <div class="stat"><div class="stat-label">コメントキュー</div><div class="stat-value" id="st-queue">0</div></div>
+      </div>
+    </div>
+
+
+    <!-- 出演キャラクター（掛け合い） -->
+    <div class="card" id="cast-card">
+      <h2>出演キャラクター <span id="cast-mode" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
+      <div id="cast-list"></div>
+      <div id="cast-ensemble" style="display:none;margin-top:10px;font-size:12px;color:var(--muted)">
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+          <label>返事の担当
+            <select id="ens-responder" onchange="saveEnsemble()" style="font-size:12px;padding:2px 6px">
+              <option value="balance">呼ばれた方 → 交互</option>
+              <option value="lead">呼ばれた方 → リーダー</option>
+            </select></label>
+          <label>コメント後に相方が反応 <input type="number" id="ens-banter" min="0" max="1" step="0.05"
+            style="width:60px;font-size:12px;padding:2px 6px" onchange="saveEnsemble()"></label>
+          <label>話題振り後 <input type="number" id="ens-idle-banter" min="0" max="1" step="0.05"
+            style="width:60px;font-size:12px;padding:2px 6px" onchange="saveEnsemble()"></label>
+          <label>最大往復 <input type="number" id="ens-max" min="0" max="6" step="1"
+            style="width:50px;font-size:12px;padding:2px 6px" onchange="saveEnsemble()"></label>
+          <button class="btn-ghost" style="font-size:12px;padding:4px 10px" onclick="forceBanter()">掛け合いを始める</button>
+        </div>
+        <div style="margin-top:6px">OBSにはキャラごとに <code>/avatar?char=&lt;id&gt;</code> をブラウザソースとして貼ります。
+          音声をバックエンドで鳴らしているときは <code>&amp;mute=1</code> を付けてください。</div>
+      </div>
+    </div>
+
+    <!-- リソース -->
+    <div class="card">
+      <h2>リソースモニター <span style="font-weight:400;text-transform:none;letter-spacing:0" id="res-gpu-name"></span></h2>
+      <div class="res-grid">
+        <div class="res-item"><div class="res-head"><span>CPU</span><b id="res-cpu">—</b></div>
+          <div class="res-bar"><div id="res-cpu-bar"></div></div><div class="res-sub" id="res-cpu-sub"></div></div>
+        <div class="res-item"><div class="res-head"><span>メモリ</span><b id="res-ram">—</b></div>
+          <div class="res-bar"><div id="res-ram-bar"></div></div><div class="res-sub" id="res-ram-sub"></div></div>
+        <div class="res-item"><div class="res-head"><span>VRAM</span><b id="res-vram">—</b></div>
+          <div class="res-bar"><div id="res-vram-bar"></div></div><div class="res-sub" id="res-vram-sub"></div></div>
+        <div class="res-item"><div class="res-head"><span>GPU</span><b id="res-gpu">—</b></div>
+          <div class="res-bar"><div id="res-gpu-bar"></div></div><div class="res-sub" id="res-gpu-sub"></div></div>
+      </div>
+      <canvas id="res-chart" height="70" style="width:100%;margin-top:10px;background:var(--bg);border-radius:6px"></canvas>
+      <div class="res-legend"><span style="--c:#4fc3f7">CPU</span><span style="--c:#4caf50">メモリ</span><span style="--c:#7c6ff7">VRAM</span><span style="--c:#ffca28">GPU</span><span style="margin-left:auto">直近5分</span></div>
+      <div style="margin-top:12px;font-size:12px;color:var(--muted);display:flex;justify-content:space-between">
+        <span>VRAMの内訳</span><span id="res-vram-free"></span></div>
+      <div class="vram-stack" id="res-vram-stack"></div>
+      <div class="vram-legend" id="res-vram-legend"></div>
+      <div id="res-users" style="margin-top:8px;font-size:12px;color:var(--muted)"></div>
+      <div id="res-warn" style="margin-top:6px;font-size:12px;color:var(--yellow)"></div>
+    </div>
+
+    <!-- 発話 -->
+    <div class="card">
+      <h2>最新コメント</h2>
+      <div class="speech-box" id="last-comment">—</div>
+    </div>
+    <div class="card">
+      <h2>AIの発話 <span class="emotion-badge" id="emotion-badge">neutral</span></h2>
+      <div class="speech-box" id="last-speech">—</div>
+    </div>
+
+    <!-- コメント一覧 -->
+    <div class="card">
+      <h2>コメント一覧</h2>
+      <div id="comment-list"></div>
+    </div>
+
+    <!-- リンク -->
+    <div class="card">
+      <h2>関連ページ</h2>
+      <div class="links">
+        <a href="/avatar"   target="_blank" class="link-btn">🎭 アバター (OBS用)</a>
+        <a href="/subtitle" target="_blank" class="link-btn">💬 字幕オーバーレイ</a>
+        <a href="/chat"     target="_blank" class="link-btn">🗨️ ローカルチャット (1対1テスト)</a>
+        <a href="/persona"  target="_blank" class="link-btn">🧬 人格QLoRA（口調を学習）</a>
+      </div>
+    </div>
+
+  </div><!-- /main -->
+
+  <div class="side">
+    <!-- ミニアバター表示 -->
+    <div style="position:relative;width:100%;aspect-ratio:3/4;background:#000;border-radius:8px;overflow:hidden;margin-bottom:10px">
+      <iframe id="side-avatar" src="/avatar"
+        style="width:100%;height:100%;border:none;display:block"
+        allow="autoplay"
+        title="アバタープレビュー"></iframe>
+      <div style="position:absolute;top:4px;right:4px;display:flex;gap:4px">
+        <a href="/avatar" target="_blank"
+          style="font-size:10px;background:rgba(0,0,0,0.5);color:var(--muted);padding:2px 6px;border-radius:4px;text-decoration:none"
+          title="OBS用画面を開く">↗</a>
+      </div>
+    </div>
+    <h2 style="font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px">システムログ</h2>
+    <div id="log-list"></div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════
+     設定モーダル
+══════════════════════════════════════════════════ -->
+<div class="modal-overlay" id="settings-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <h2>⚙️ 設定</h2>
+      <button class="btn-icon" onclick="closeSettings()">✕</button>
+    </div>
+
+    <!-- プリセットバー -->
+    <div style="padding:12px 20px;background:var(--bg);border-bottom:1px solid var(--border);display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <span style="font-size:12px;color:var(--muted);white-space:nowrap">🎭 キャラクター:</span>
+      <select id="preset-select" style="flex:1;min-width:120px;max-width:200px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:5px 8px;font-size:13px">
+        <option value="">— 選択 —</option>
+      </select>
+      <button class="btn-primary" style="font-size:12px;padding:5px 12px" onclick="loadPreset()">📂 読み込み</button>
+      <button class="btn-ghost"   style="font-size:12px;padding:5px 12px" onclick="openSavePresetDialog()">💾 保存</button>
+      <button class="btn-danger"  style="font-size:12px;padding:5px 10px" onclick="deletePreset()" title="選択したプリセットを削除">🗑</button>
+    </div>
+
+    <!-- 新規保存ダイアログ（インライン） -->
+    <div id="save-preset-dialog" style="display:none;padding:10px 20px;background:var(--surface);border-bottom:1px solid var(--border)">
+      <div style="display:flex;gap:8px;align-items:center">
+        <span style="font-size:12px;color:var(--muted);white-space:nowrap">保存名:</span>
+        <input type="text" id="preset-name-input" placeholder="キャラクター名" style="flex:1">
+        <button class="btn-primary" style="font-size:12px;padding:5px 12px" onclick="savePreset()">保存</button>
+        <button class="btn-ghost"   style="font-size:12px;padding:5px 10px" onclick="closeSavePresetDialog()">✕</button>
+      </div>
+    </div>
+
+    <div class="modal-body">
+
+      <!-- タブ -->
+      <div class="tab-bar">
+        <button class="tab active" onclick="switchTab('tab-llm',this)">LLM</button>
+        <button class="tab" onclick="switchTab('tab-tts',this)">TTS</button>
+        <button class="tab" onclick="switchTab('tab-source',this)">ソース</button>
+        <button class="tab" onclick="switchTab('tab-orch',this)">動作</button>
+        <button class="tab" onclick="switchTab('tab-memory',this)">長期記憶</button>
+        <button class="tab" onclick="switchTab('tab-avatar',this)">アバター</button>
+        <button class="tab" onclick="switchTab('tab-character',this)">キャラ</button>
+        <button class="tab" onclick="switchTab('tab-stm',this)">短期記憶</button>
+        <button class="tab" onclick="switchTab('tab-persona',this)">人格QLoRA</button>
+      </div>
+
+      <!-- ── LLMタブ ── -->
+      <div class="tab-panel active" id="tab-llm">
+        <div class="setting-section">
+          <h3>バックエンド選択</h3>
+          <div class="setting-row">
+            <span class="setting-label">Primary</span>
+            <select id="llm-primary">
+              <option value="lmstudio">LM Studio</option>
+              <option value="ollama">Ollama</option>
+              <option value="claude">Claude API</option>
+              <option value="openai">OpenAI API</option>
+            </select>
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">Fallback</span>
+            <select id="llm-fallback">
+              <option value="ollama">Ollama</option>
+              <option value="lmstudio">LM Studio</option>
+              <option value="claude">Claude API</option>
+              <option value="openai">OpenAI API</option>
+              <option value="">なし</option>
+            </select>
+            <span></span>
+          </div>
+          <div class="save-btn-row">
+            <button class="btn-primary" onclick="saveLLMSwitch()">切り替え適用</button>
+          </div>
+        </div>
+
+        <div class="setting-section">
+          <h3>LM Studio パラメータ</h3>
+          <div class="setting-row">
+            <span class="setting-label">Base URL</span>
+            <input type="text" id="lms-url" placeholder="http://localhost:1234/v1">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">Model</span>
+            <input type="text" id="lms-model" placeholder="auto">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">Temperature</span>
+            <input type="number" id="lms-temp" step="0.05" min="0" max="2">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">Max Tokens</span>
+            <input type="number" id="lms-maxtok" step="50" min="50" max="2000">
+            <span></span>
+          </div>
+          <div class="save-btn-row">
+            <button class="btn-ghost" onclick="saveLLMBackend('lmstudio')">LM Studio 保存</button>
+          </div>
+        </div>
+
+        <div class="setting-section">
+          <h3>Ollama パラメータ</h3>
+          <div class="setting-row">
+            <span class="setting-label">Base URL</span>
+            <input type="text" id="ollama-url" placeholder="http://localhost:11434">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">Model</span>
+            <input type="text" id="ollama-model" placeholder="llama3.1:8b">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">Temperature</span>
+            <input type="number" id="ollama-temp" step="0.05" min="0" max="2">
+            <span></span>
+          </div>
+          <div class="save-btn-row">
+            <button class="btn-ghost" onclick="saveLLMBackend('ollama')">Ollama 保存</button>
+          </div>
+        </div>
+      </div><!-- /tab-llm -->
+
+      <!-- ── TTSタブ ── -->
+      <div class="tab-panel" id="tab-tts">
+        <div class="setting-section">
+          <h3>TTSバックエンド</h3>
+          <div class="setting-row">
+            <span class="setting-label">Primary</span>
+            <select id="tts-primary">
+              <option value="voicevox">VOICEVOX</option>
+              <option value="irodori">IrodoriTTS</option>
+            </select>
+            <span></span>
+          </div>
+        </div>
+        <div class="setting-section">
+          <h3>VOICEVOX パラメータ</h3>
+          <div class="setting-row">
+            <span class="setting-label">Base URL</span>
+            <input type="text" id="vv-url" placeholder="http://localhost:50021">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">話者ID</span>
+            <input type="number" id="vv-speaker" min="0" max="999">
+            <span style="font-size:11px;color:var(--muted)">0=四国めたん 1=ずんだもん 3=春日部つむぎ…</span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">話速</span>
+            <input type="number" id="vv-speed" step="0.05" min="0.5" max="2.0">
+            <span></span>
+          </div>
+          <div class="save-btn-row">
+            <button class="btn-primary" onclick="saveTTS()">TTS 保存・適用</button>
+          </div>
+        </div>
+
+        <div class="setting-section">
+          <h3>IrodoriTTS パラメータ</h3>
+          <div class="setting-row">
+            <span class="setting-label">Base URL</span>
+            <input type="text" id="irodori-url" placeholder="http://localhost:8088/v1">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">Voice</span>
+            <input type="text" id="irodori-voice" placeholder="default">
+            <span style="font-size:11px;color:var(--muted)">voices/フォルダのファイル名（拡張子なし）</span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">感情別Voice</span>
+            <select id="irodori-emotion-voice">
+              <option value="false">無効</option>
+              <option value="true">有効（prefix-{emotion}で切り替え）</option>
+            </select>
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">Voice Prefix</span>
+            <input type="text" id="irodori-prefix" placeholder="Character2">
+            <span style="font-size:11px;color:var(--muted)">例: Character2 → Character2-happy.wav</span>
+          </div>
+          <div class="save-btn-row">
+            <button class="btn-ghost" onclick="saveIrodoriTTS()">IrodoriTTS 保存</button>
+          </div>
+        </div>
+
+        <div class="setting-section">
+          <h3>オーディオ出力デバイス</h3>
+          <div class="setting-row">
+            <span class="setting-label">デバイス</span>
+            <select id="audio-device"><option value="">デフォルト</option></select>
+            <button class="btn-ghost" onclick="loadDevices()">更新</button>
+          </div>
+          <div class="save-btn-row">
+            <button class="btn-primary" onclick="saveAudio()">デバイス適用</button>
+          </div>
+        </div>
+      </div><!-- /tab-tts -->
+
+      <!-- ── コメントソースタブ ── -->
+      <div class="tab-panel" id="tab-source">
+        <div class="setting-section">
+          <h3>プラットフォーム選択（次回start時から反映）</h3>
+          <div class="setting-row">
+            <span class="setting-label">Primary</span>
+            <select id="src-primary" onchange="onSourceChange(this.value)">
+              <option value="pytchat">YouTube (pytchat)</option>
+              <option value="youtube_api">YouTube (Data API v3)</option>
+              <option value="twitcasting">ツイキャス</option>
+              <option value="twitch">Twitch</option>
+              <option value="local">ローカルチャット（1対1テスト）</option>
+            </select>
+            <span></span>
+          </div>
+          <div class="save-btn-row">
+            <button class="btn-primary" onclick="saveSource()">保存・適用</button>
+          </div>
+        </div>
+
+        <!-- YouTube設定 -->
+        <div class="setting-section" id="src-youtube-section">
+          <h3>YouTube 設定</h3>
+          <div style="font-size:12px;color:var(--muted);line-height:1.6;padding:8px;background:var(--bg);border-radius:6px">
+            <b>pytchat</b>: APIキー不要・即起動。非公式のためYouTube変更で壊れる可能性あり。<br>
+            <b>YouTube Data API v3</b>: 公式・安定。APIキーとクォータ（1万units/日）が必要。
+          </div>
+        </div>
+
+        <!-- ツイキャス設定 -->
+        <div class="setting-section" id="src-twitcasting-section" style="display:none">
+          <h3>ツイキャス 設定</h3>
+          <div class="setting-row">
+            <span class="setting-label">アクセストークン</span>
+            <input type="password" id="tc-token" placeholder="Bearer Token">
+            <span style="font-size:11px;color:var(--muted)">環境変数 TWITCASTING_ACCESS_TOKEN でも設定可</span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">ユーザーID</span>
+            <input type="text" id="tc-user-id" placeholder="your_screen_name">
+            <span style="font-size:11px;color:var(--muted)">@なしのスクリーンID</span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">ポーリング間隔(ms)</span>
+            <input type="number" id="tc-interval" value="2000" min="1000" max="10000" step="500">
+            <span></span>
+          </div>
+          <div style="font-size:12px;color:var(--muted);line-height:1.6;padding:8px;background:var(--bg);border-radius:6px;margin-top:4px">
+            トークン取得: <a href="https://apiv2.twitcasting.tv/oauth2/authorize?client_id=YOUR_CLIENT_ID&response_type=token" target="_blank" style="color:var(--accent2)">ツイキャス OAuth</a><br>
+            アプリ登録: <a href="https://twitcasting.tv/developer.php" target="_blank" style="color:var(--accent2)">developer.php</a>
+          </div>
+          <div class="save-btn-row">
+            <button class="btn-primary" onclick="saveTwitcasting()">ツイキャス設定保存</button>
+          </div>
+        </div>
+
+        <!-- Twitch設定 -->
+        <div class="setting-section" id="src-twitch-section" style="display:none">
+          <h3>Twitch 設定</h3>
+          <div class="setting-row">
+            <span class="setting-label">OAuth Token</span>
+            <input type="password" id="tw-token" placeholder="oauth:xxxxxxxxxx">
+            <span style="font-size:11px;color:var(--muted)">環境変数 TWITCH_OAUTH_TOKEN でも設定可</span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">Bot アカウント名</span>
+            <input type="text" id="tw-nick" placeholder="your_account (小文字)">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">チャンネル名</span>
+            <input type="text" id="tw-channel" placeholder="channel_name (小文字)">
+            <span style="font-size:11px;color:var(--muted)">@なし・小文字</span>
+          </div>
+          <div style="font-size:12px;color:var(--muted);line-height:1.6;padding:8px;background:var(--bg);border-radius:6px;margin-top:4px">
+            トークン取得: <a href="https://twitchtokengenerator.com/" target="_blank" style="color:var(--accent2)">Twitch Token Generator</a><br>
+            スコープ: <code>chat:read</code> が必要
+          </div>
+          <div class="save-btn-row">
+            <button class="btn-primary" onclick="saveTwitch()">Twitch設定保存</button>
+          </div>
+        </div>
+      </div><!-- /tab-source -->
+
+      <!-- ── 動作調整タブ ── -->
+      <div class="tab-panel" id="tab-orch">
+        <div class="setting-section">
+          <h3>Orchestrator パラメータ</h3>
+          <div class="setting-row">
+            <span class="setting-label">独り言閾値（秒）</span>
+            <input type="number" id="orch-idle" min="5" max="300">
+            <span style="font-size:11px;color:var(--muted)">この秒数コメントなしで独り言</span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">履歴ターン数</span>
+            <input type="number" id="orch-history" min="1" max="20">
+            <span style="font-size:11px;color:var(--muted)">LLMに渡す過去会話数</span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">連投抑制（秒）</span>
+            <input type="number" id="orch-dedupe" min="0" max="600">
+            <span style="font-size:11px;color:var(--muted)">同一ユーザーの間引き時間</span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">整理トリガー（ターン）</span>
+            <input type="number" id="orch-consolidation-trigger" min="0" max="500" step="10">
+            <span style="font-size:11px;color:var(--muted)">Nターンごとに長期記憶整理（0=無効）</span>
+          </div>
+          <div class="save-btn-row">
+            <button class="btn-primary" onclick="saveOrchestrator()">保存・即時反映</button>
+          </div>
+        </div>
+      </div><!-- /tab-orch -->
+
+      <!-- ── 長期記憶タブ ── -->
+      <div class="tab-panel" id="tab-memory">
+        <div class="setting-section">
+          <h3>短期記憶 → エピソード記憶 整理</h3>
+          <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:8px">
+            会話をLLMが分析し、覚えておくべき事実をエピソード記憶に追加します。<br>
+            配信停止時にも自動実行されます。
+          </div>
+          <div class="row" style="gap:8px;flex-wrap:wrap">
+            <div style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted)">
+              定期実行:
+              <select id="consolidation-interval" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:5px 8px;font-size:13px" onchange="setConsolidationInterval()">
+                <option value="0">無効</option>
+                <option value="10">10分ごと</option>
+                <option value="20">20分ごと</option>
+                <option value="30">30分ごと</option>
+                <option value="60">60分ごと</option>
+              </select>
+            </div>
+            <button class="btn-primary" onclick="runConsolidation()" id="consolidate-btn">
+              🧠 今すぐ整理・追記
+            </button>
+          </div>
+          <div id="consolidation-result" style="margin-top:8px;font-size:12px;color:var(--muted);display:none"></div>
+        </div>
+
+        <!-- エピソード記憶（自動で貯まる記憶） -->
+        <div class="setting-section">
+          <h3>エピソード記憶
+            <button class="btn-ghost" style="float:right;font-size:11px;padding:2px 8px"
+              onclick="loadEpisodicMemory()">🔄 更新</button>
+          </h3>
+          <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:8px">
+            配信中に自動で貯まる記憶です。上限を超えると、参照されない古い記憶から順に忘れます。<br>
+            📌 を押すとその記憶は忘却の対象外になります。
+          </div>
+          <div id="episodic-stats" style="font-size:12px;color:var(--accent2);margin-bottom:8px">—</div>
+          <div class="row" style="gap:6px;margin-bottom:8px">
+            <input type="text" id="episodic-new" placeholder="覚えさせたいことを入力..."
+              style="flex:1" onkeydown="if(event.key==='Enter')addEpisodicMemory()">
+            <button class="btn-primary" onclick="addEpisodicMemory()">＋ 追加</button>
+          </div>
+          <div id="episodic-list" style="max-height:340px;overflow-y:auto"></div>
+        </div>
+
+        <div class="setting-section">
+          <h3>コア記憶（人が書く設定）</h3>
+          <div style="font-size:12px;color:var(--muted);margin-bottom:8px" id="memory-path">読込中...</div>
+          <textarea id="memory-content"
+            style="width:100%;height:320px;background:var(--bg);border:1px solid var(--border);
+                   border-radius:6px;color:var(--text);padding:10px;font-size:13px;
+                   font-family:'Hiragino Sans',sans-serif;line-height:1.6;resize:vertical;"
+            placeholder="# キャラクター名の長期記憶&#10;&#10;## 自分のこと&#10;- ..."></textarea>
+          <div style="font-size:11px;color:var(--muted);margin-top:4px">
+            Markdownで自由に記述。自動整理はここに書き込まないので、手で書いた設定が荒らされません。<br>
+            ファイルは <code>backend/llm/prompts/characters/{キャラ名}/memory.md</code> に保存されます。
+          </div>
+          <div class="save-btn-row">
+            <button class="btn-ghost" onclick="reloadMemory()">🔄 再読込</button>
+            <button class="btn-primary" onclick="saveMemory()">💾 保存・即時反映</button>
+          </div>
+        </div>
+
+        <div class="setting-section">
+          <h3>RAG 検索テスト</h3>
+          <div id="rag-status" style="font-size:12px;color:var(--muted);margin-bottom:8px">読込中...</div>
+          <div class="row" style="gap:8px">
+            <input type="text" id="rag-query" placeholder="検索ワード（例: ゲーム、怖いもの）" style="flex:1">
+            <button class="btn-primary" style="padding:7px 14px;font-size:13px" onclick="ragSearch()">🔍 検索</button>
+          </div>
+          <div id="rag-results" style="margin-top:10px;display:flex;flex-direction:column;gap:6px"></div>
+        </div>
+      </div><!-- /tab-memory -->
+
+      <!-- ── アバタータブ ── -->
+      <div class="tab-panel" id="tab-avatar">
+        <div class="setting-section">
+          <h3>アバタータイプ</h3>
+          <div class="setting-row">
+            <span class="setting-label">タイプ</span>
+            <select id="avatar-type" onchange="updateAvatarTypeUI()">
+              <option value="vrm">VRM (three-vrm)</option>
+              <option value="live2d">Live2D (Cubism 4)</option>
+            </select>
+            <span style="font-size:11px;color:var(--muted)">保存すると /avatar の描画方式が切り替わります</span>
+          </div>
+        </div>
+        <div class="setting-section avatar-live2d-only" style="display:none">
+          <h3>Live2D 設定</h3>
+          <div style="font-size:12px;color:var(--muted);margin-bottom:8px;line-height:1.7">
+            モデル一式（*.model3.json とテクスチャ・motions フォルダ）を
+            <code style="background:var(--bg);padding:1px 5px;border-radius:4px">models/live2d/&lt;名前&gt;/</code>
+            に置くと、下のリストに出てきます。
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">モデル</span>
+            <select id="l2d-model-select" onchange="onLive2DModelPick()"></select>
+            <span style="font-size:11px;color:var(--muted)">
+              <button class="btn-ghost" style="padding:3px 8px;font-size:11px"
+                      onclick="loadLive2DModels()">🔄 再検索</button>
+            </span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">モデルパス</span>
+            <input type="text" id="l2d-path" placeholder="models/live2d/hiyori/hiyori.model3.json">
+            <span style="font-size:11px;color:var(--muted)">空なら自動検出</span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">大きさ（画面高さ比）</span>
+            <input type="number" id="l2d-scale" step="0.05" min="0.1" max="3" value="0.9">
+            <span style="font-size:11px;color:var(--muted)">1.0で画面いっぱい</span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">位置X（0=左 1=右）</span>
+            <input type="number" id="l2d-posx" step="0.05" min="-1" max="2" value="0.5">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">位置Y（0=上 1=下）</span>
+            <input type="number" id="l2d-posy" step="0.05" min="-1" max="2" value="0.5">
+            <span style="font-size:11px;color:var(--muted)">バストアップなら1.0前後</span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">口の開き倍率</span>
+            <input type="number" id="l2d-lipgain" step="0.1" min="0.1" max="5" value="1.2">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">アイドルモーション群</span>
+            <input type="text" id="l2d-idlegroup" placeholder="Idle">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">口パラメータID</span>
+            <input type="text" id="l2d-mouthparam" placeholder="空なら自動 (ParamMouthOpenY)">
+            <span></span>
+          </div>
+          <div style="font-size:12px;color:var(--muted);margin:10px 0 4px">
+            感情 → 表情名 の対応（1行1件・<code>happy: exp_01</code> の形式）
+          </div>
+          <textarea id="l2d-expmap" rows="4"
+            style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--border);
+                   border-radius:6px;padding:8px;font-family:monospace;font-size:12px"
+            placeholder="happy: exp_smile"></textarea>
+          <div style="font-size:12px;color:var(--muted);margin:10px 0 4px">
+            モーション → モーショングループ の対応（<code>wave: TapBody:1</code> のように番号指定も可）
+          </div>
+          <textarea id="l2d-motionmap" rows="4"
+            style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--border);
+                   border-radius:6px;padding:8px;font-family:monospace;font-size:12px"
+            placeholder="wave: TapBody"></textarea>
+          <div id="l2d-model-info" style="font-size:11px;color:var(--muted);margin-top:8px;line-height:1.7"></div>
+          <div class="save-btn-row">
+            <button class="btn-primary" onclick="saveAvatar()">💾 保存・即時反映</button>
+            <button class="btn-ghost" onclick="reloadAvatarPage()">🔄 強制リロード</button>
+          </div>
+        </div>
+
+        <div class="setting-section avatar-vrm-only">
+          <h3>VRM 設定</h3>
+          <div class="setting-row">
+            <span class="setting-label">モデルパス</span>
+            <input type="text" id="vrm-path" placeholder="models/default.vrm">
+            <span style="font-size:11px;color:var(--muted)">models/フォルダ以下のパス</span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">アイドルモーション</span>
+            <input type="text" id="vrm-idle" placeholder="breathe">
+            <span></span>
+          </div>
+          <div class="save-btn-row">
+            <button class="btn-primary" onclick="saveAvatar()">💾 保存・即時反映</button>
+            <button class="btn-ghost" onclick="reloadAvatarPage()">🔄 強制リロード</button>
+          </div>
+        </div>
+
+        <div class="setting-section avatar-vrm-only">
+          <h3>ボーンキャリブレーション</h3>
+          <div style="font-size:12px;color:var(--muted);margin-bottom:8px">
+            モデルによって腕の向きが変わる場合はここで調整してください。<br>
+            値を変えると即時反映されます。プラス→腕が内側へ、マイナス→外側へ。
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">腕の下ろし量 (armDownZ)</span>
+            <input type="number" id="calib-armDownZ" step="0.05" min="0.5" max="1.5" value="1.15">
+            <span style="font-size:11px;color:var(--muted)">推奨: 0.05〜0.2</span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">前腕の調整 (foreArmZ)</span>
+            <input type="number" id="calib-foreArmZ" step="0.05" min="-0.5" max="0.5" value="0.05">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">背骨の傾き (spineX)</span>
+            <input type="number" id="calib-spineX" step="0.01" min="-0.3" max="0.3" value="0.0">
+            <span style="font-size:11px;color:var(--muted)">プラス→前傾</span>
+          </div>
+          <div class="save-btn-row">
+            <button class="btn-primary" onclick="saveCalibration()">⚡ 即時反映</button>
+          </div>
+        </div>
+
+        <div class="setting-section">
+          <h3>モーションテスト</h3>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px" id="motion-test-btns"></div>
+          <div style="font-size:11px;color:var(--muted)">ボタンを押すとアバター画面でモーションを確認できます</div>
+        </div>
+
+        <div class="setting-section">
+          <h3>アバター画面</h3>
+          <div style="font-size:12px;color:var(--muted);line-height:1.8">
+            OBSのBrowser Sourceに以下のURLを追加してください：<br>
+            <code style="background:var(--bg);padding:2px 6px;border-radius:4px">http://127.0.0.1:9000/avatar</code><br><br>
+            推奨設定: 幅 1920 / 高さ 1080 / FPS 60 / 背景色透明<br>
+            <code style="background:var(--bg);padding:2px 6px;border-radius:4px">?mute=1</code>
+            を付けると、アバター画面では音を鳴らさず口だけ動かします（音の二重再生を避けたいとき）
+          </div>
+          <div class="save-btn-row" style="margin-top:8px">
+            <a href="/avatar" target="_blank" class="link-btn" style="padding:7px 14px;background:var(--accent);color:#fff;border-radius:6px;text-decoration:none;font-size:13px;font-weight:600">🎭 アバター画面を開く</a>
+          </div>
+        </div>
+      </div><!-- /tab-avatar -->
+
+      <!-- ── キャラクタータブ ── -->
+      <div class="tab-panel" id="tab-character">
+        <div class="setting-section">
+          <h3>キャラクター基本情報</h3>
+          <div class="setting-row">
+            <span class="setting-label">名前</span>
+            <input type="text" id="char-name" placeholder="Character1">
+            <span></span>
+          </div>
+          <div class="setting-row" style="align-items:flex-start">
+            <span class="setting-label" style="padding-top:8px">キャラクター説明</span>
+            <textarea id="char-description"
+              style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:6px;
+                     color:var(--text);padding:8px;font-size:13px;resize:vertical;min-height:80px;
+                     font-family:inherit;line-height:1.6"
+              placeholder="あなたはAIVtuberの「〇〇」です..."></textarea>
+            <span></span>
+          </div>
+        </div>
+        <div class="setting-section">
+          <h3>口調・性格</h3>
+          <div style="font-size:11px;color:var(--muted);margin-bottom:6px">箇条書きで記述（- から始める）</div>
+          <textarea id="char-personality"
+            style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;
+                   color:var(--text);padding:10px;font-size:13px;resize:vertical;min-height:120px;
+                   font-family:inherit;line-height:1.7"
+            placeholder="- 語尾に「ね」「よ」をよく使う&#10;- テンションが高い&#10;- ゲームが好き"></textarea>
+        </div>
+        <div class="setting-section">
+          <h3>ルール・制約</h3>
+          <div style="font-size:11px;color:var(--muted);margin-bottom:6px">NGワード・行動制限など</div>
+          <textarea id="char-rules"
+            style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;
+                   color:var(--text);padding:10px;font-size:13px;resize:vertical;min-height:100px;
+                   font-family:inherit;line-height:1.7"
+            placeholder="- ネガティブな発言はしない&#10;- 個人情報を答えない"></textarea>
+          <div style="font-size:11px;color:var(--muted);margin-top:6px" id="char-file-path"></div>
+          <div class="save-btn-row">
+            <button class="btn-ghost" onclick="loadCharacter()">🔄 再読込</button>
+            <button class="btn-primary" onclick="saveCharacter()">💾 保存・即時反映</button>
+          </div>
+        </div>
+      </div><!-- /tab-character -->
+
+      <!-- ── 短期記憶タブ ── -->
+      <div class="tab-panel" id="tab-stm">
+        <div class="setting-section">
+          <h3>現在の会話履歴（短期記憶）</h3>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px">
+            <div style="display:flex;flex-direction:column;gap:2px">
+              <span style="font-size:12px;color:var(--muted)" id="stm-info">読込中...</span>
+              <div style="display:flex;gap:4px;align-items:center">
+                <div id="stm-progress-bar" style="height:4px;width:160px;background:var(--border);border-radius:2px">
+                  <div id="stm-progress-fill" style="height:4px;width:0%;background:var(--accent);border-radius:2px;transition:width 0.3s"></div>
+                </div>
+                <span style="font-size:11px;color:var(--muted)" id="stm-trigger-info"></span>
+              </div>
+            </div>
+            <div style="display:flex;gap:6px">
+              <button class="btn-ghost" style="font-size:12px;padding:5px 10px" onclick="loadSTM()">🔄 更新</button>
+              <button class="btn-danger" style="font-size:12px;padding:5px 10px" onclick="clearSTM()">🗑 クリア</button>
+            </div>
+          </div>
+          <div id="stm-list" style="display:flex;flex-direction:column;gap:6px;max-height:420px;overflow-y:auto"></div>
+        </div>
+      </div><!-- /tab-stm -->
+
+      <!-- ── 人格QLoRAタブ ── -->
+      <div class="tab-panel" id="tab-persona">
+        <div class="setting-section">
+          <h3>使用中のモデル</h3>
+          <div class="setting-row">
+            <span class="setting-label">状態</span>
+            <span><span id="pq-badge" class="emotion-badge" style="margin-left:0">読込中</span>
+              <span style="font-size:12px;color:var(--muted);margin-left:8px" id="pq-detail"></span></span>
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">人格モデル</span>
+            <select id="pq-model"><option value="">— 学習済みモデルを選択 —</option></select>
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">手動で指定</span>
+            <input type="text" id="pq-model-manual" placeholder="Ollama等のモデル名（上で選ぶなら空のまま）">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">実行バックエンド</span>
+            <select id="pq-backend">
+              <option value="ollama">Ollama</option>
+              <option value="lmstudio">LM Studio</option>
+              <option value="llamacpp">llama.cpp server</option>
+              <option value="openai_compat">OpenAI互換</option>
+            </select>
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">プロンプト</span>
+            <select id="pq-prompt">
+              <option value="slim">slim（キャラ設定を省略・速い）</option>
+              <option value="full">full（従来どおり全文）</option>
+            </select>
+            <span></span>
+          </div>
+          <div style="font-size:11px;color:var(--muted)">
+            人格モデルが応答しないときは、通常のLLM（LLMタブのPrimary）と全文プロンプトに自動で戻ります。
+          </div>
+          <div class="save-btn-row">
+            <button class="btn-ghost" onclick="deactivatePersona()">通常のLLMに戻す</button>
+            <button class="btn-primary" onclick="activatePersona()">このモデルを使う</button>
+          </div>
+        </div>
+
+        <div class="setting-section">
+          <h3>学習の既定値</h3>
+          <div class="setting-row">
+            <span class="setting-label">ベースモデル</span>
+            <input type="text" id="pq-base_model" placeholder="<YOUR_PATH>/your-base-model">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">先生役のモデル</span>
+            <input type="text" id="pq-teacher_model" placeholder="空なら普段のLLM">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">会話例の数</span>
+            <input type="number" id="pq-synthetic_samples" min="0" step="50">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">エポック</span>
+            <input type="number" id="pq-epochs" min="0.5" step="0.5">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">学習率</span>
+            <input type="text" id="pq-learning_rate">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">LoRA r / alpha</span>
+            <span style="display:flex;gap:6px"><input type="number" id="pq-lora_r" min="4" step="4">
+              <input type="number" id="pq-lora_alpha" min="4" step="4"></span>
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">実会話も使う</span>
+            <input type="checkbox" id="pq-include_chat_history" style="justify-self:start">
+            <span></span>
+          </div>
+          <div class="save-btn-row">
+            <a href="/persona" target="_blank" class="btn-ghost"
+               style="text-decoration:none;padding:7px 14px;border-radius:6px;font-size:13px;font-weight:600">🧬 データ作成・学習の画面を開く</a>
+            <button class="btn-primary" onclick="savePersonaDefaults()">既定値を保存</button>
+          </div>
+        </div>
+
+        <div class="setting-section">
+          <h3>Ollama（人格モデルの実行環境）</h3>
+          <div class="setting-row">
+            <span class="setting-label">状態</span>
+            <span style="font-size:12px" id="ol-status">読込中</span>
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">自動起動</span>
+            <input type="checkbox" id="ol-auto_start" style="justify-self:start">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">起動時にモデルを読み込む</span>
+            <input type="checkbox" id="ol-preload_on_start" style="justify-self:start">
+            <span></span>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">VRAMに残す時間</span>
+            <input type="text" id="ol-keep_alive" placeholder="30m（-1で無期限）">
+            <span></span>
+          </div>
+          <div class="save-btn-row">
+            <button class="btn-primary" onclick="saveOllamaSettings()">Ollama設定を保存</button>
+          </div>
+        </div>
+      </div><!-- /tab-persona -->
+
+    </div><!-- /modal-body -->
+  </div><!-- /modal -->
+</div><!-- /modal-overlay -->
+
+<script>
+// ── WebSocket ────────────────────────────────────────────────
+let ws = null;
+const pendingRequests = {};  // requestId -> {resolve, reject}
+let reqCounter = 0;
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws/dashboard`);
+  ws.onopen = () => {
+    document.getElementById('status-dot').classList.add('alive');
+    addLog('info', 'WebSocket接続');
+    // 接続したら設定を取得
+    wsRequest('get_config').then(cfg => {
+      if (cfg) {
+        applyConfig(cfg);
+        updateVideoIdUI(cfg.youtube?.primary_source || 'pytchat');
+      }
+    });
+    wsRequest('get_devices').then(d => { if (d) populateDevices(d.devices); });
+    wsRequest('get_memory').then(m => { if (m) applyMemory(m); });
+    loadKnowledge();
+  };
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'status')       updateStatus(msg);
+    else if (msg.type === 'new_comment') addComment(msg);
+    else if (msg.type === 'log')     addLog(msg.level, msg.message);
+    else if (msg.type === 'config_updated') addLog('info', '設定を更新しました');
+    else if (msg.type === 'bgm_status') updateBGMStatus(msg);
+    else if (msg.type === 'news') renderNews(msg.items || [], msg.count);
+    else if (msg.type === 'system_stats') renderSystem(msg);
+    else if (msg.type === 'search_result') renderSearchResult(msg);
+    // レスポンス待ちのリクエストに返す
+    if (msg.request_id && pendingRequests[msg.request_id]) {
+      pendingRequests[msg.request_id].resolve(msg);
+      delete pendingRequests[msg.request_id];
+    }
+  };
+  ws.onclose = () => {
+    document.getElementById('status-dot').classList.remove('alive');
+    setTimeout(connect, 3000);
+  };
+  ws.onerror = () => ws.close();
+}
+
+// レスポンスを待てるWebSocket送信
+function wsRequest(cmd, data = {}, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    if (!ws || ws.readyState !== 1) { resolve(null); return; }
+    const request_id = `req_${++reqCounter}`;
+    pendingRequests[request_id] = { resolve, reject };
+    ws.send(JSON.stringify({ cmd, request_id, ...data }));
+    setTimeout(() => {
+      if (pendingRequests[request_id]) {
+        delete pendingRequests[request_id];
+        resolve(null); // タイムアウトはnullで返す（エラーにしない）
+      }
+    }, timeoutMs);
+  });
+}
+
+// 応答不要の送信
+function wsSend(cmd, data = {}) {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ cmd, ...data }));
+  }
+}
+
+// ── 音声入力（マイク → VAD → サーバでWhisper） ────────────────
+// ブラウザ側で発話区間だけを切り出して送ることで、常時送信の無駄をなくす。
+const MIC = {
+  ws: null, ctx: null, stream: null, node: null, src: null,
+  on: false,
+  speaking: false,
+  chunks: [],          // 発話中に貯めるFloat32フレーム
+  silenceMs: 0,
+  speechMs: 0,
+  noiseFloor: 0.005,   // 環境ノイズの推定値（EMAで自動追従）
+  aiSpeaking: false,   // AIが喋っている間は取り込まない（回り込み防止）
+};
+const MIC_SAMPLE_RATE   = 16000;
+const MIC_HANGOVER_MS   = 700;   // 無音がこれだけ続いたら発話終了とみなす
+const MIC_MIN_SPEECH_MS = 300;   // これ未満は物音として捨てる
+const MIC_MAX_SPEECH_MS = 15000; // 長すぎる発話は途中で区切る
+
+async function toggleMic() {
+  if (MIC.on) { stopMic(); } else { await startMic(); }
+}
+
+async function startMic() {
+  try {
+    MIC.stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+  } catch (e) {
+    addLog('error', `マイクを開けません: ${e.message}`);
+    setText('mic-status', 'マイクの許可が必要です');
+    return;
+  }
+
+  MIC.ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: MIC_SAMPLE_RATE });
+  MIC.src = MIC.ctx.createMediaStreamSource(MIC.stream);
+  MIC.node = MIC.ctx.createScriptProcessor(4096, 1, 1);
+  MIC.node.onaudioprocess = onMicFrame;
+  MIC.src.connect(MIC.node);
+  // 出力には繋がない（自分の声をスピーカーに戻さない）が、
+  // ScriptProcessorはdestinationに繋がないと発火しないブラウザがあるため無音Gain経由で接続する
+  const mute = MIC.ctx.createGain();
+  mute.gain.value = 0;
+  MIC.node.connect(mute);
+  mute.connect(MIC.ctx.destination);
+
+  connectVoiceWs();
+  MIC.on = true;
+  document.getElementById('mic-btn').textContent = '🎤 マイクOFF';
+  document.getElementById('mic-btn').className = 'btn-danger';
+  setText('mic-status', '待機中（話しかけてください）');
+  addLog('info', '音声入力を開始しました');
+}
+
+function stopMic() {
+  MIC.on = false;
+  MIC.speaking = false;
+  MIC.chunks = [];
+  try { MIC.node && (MIC.node.onaudioprocess = null, MIC.node.disconnect()); } catch (e) {}
+  try { MIC.src && MIC.src.disconnect(); } catch (e) {}
+  try { MIC.stream && MIC.stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  try { MIC.ctx && MIC.ctx.close(); } catch (e) {}
+  try { MIC.ws && MIC.ws.close(); } catch (e) {}
+  MIC.node = MIC.src = MIC.stream = MIC.ctx = MIC.ws = null;
+  document.getElementById('mic-btn').textContent = '🎤 マイクON';
+  document.getElementById('mic-btn').className = 'btn-primary';
+  document.getElementById('mic-level').style.width = '0%';
+  setText('mic-status', 'マイクOFF');
+}
+
+function connectVoiceWs() {
+  MIC.ws = new WebSocket(`ws://${location.host}/ws/voice`);
+  MIC.ws.binaryType = 'arraybuffer';
+  MIC.ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'transcript') {
+      const box = document.getElementById('mic-transcript');
+      box.style.display = 'block';
+      box.textContent = msg.text;
+      setText('mic-status', `認識 ${msg.latency_ms}ms / 音声 ${msg.duration_ms}ms`);
+    } else if (msg.type === 'transcript_empty') {
+      setText('mic-status', `聞き取れませんでした（${msg.reason || ''}）`);
+    }
+  };
+  MIC.ws.onclose = () => { if (MIC.on) setText('mic-status', '接続が切れました'); };
+}
+
+function onMicFrame(ev) {
+  if (!MIC.on) return;
+  const input = ev.inputBuffer.getChannelData(0);
+  const frameMs = (input.length / MIC_SAMPLE_RATE) * 1000;
+
+  // RMSで音量を測る
+  let sum = 0;
+  for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
+  const rms = Math.sqrt(sum / input.length);
+  document.getElementById('mic-level').style.width = `${Math.min(100, rms * 400)}%`;
+
+  // AIの発話中は取り込まない（スピーカーの音を拾って自己応答するのを防ぐ）
+  const halfDuplex = document.getElementById('mic-halfduplex').checked;
+  if (halfDuplex && MIC.aiSpeaking) {
+    if (MIC.speaking) { MIC.speaking = false; MIC.chunks = []; }
+    return;
+  }
+
+  // 環境ノイズを追従推定し、その3倍を発話判定のしきい値にする
+  const threshold = Math.max(0.008, MIC.noiseFloor * 3);
+  const isVoice = rms > threshold;
+  if (!MIC.speaking && !isVoice) {
+    MIC.noiseFloor = MIC.noiseFloor * 0.95 + rms * 0.05;
+  }
+
+  if (isVoice) {
+    if (!MIC.speaking) {
+      MIC.speaking = true;
+      MIC.speechMs = 0;
+      MIC.chunks = [];
+      setText('mic-status', '聞いています…');
+    }
+    MIC.silenceMs = 0;
+  } else if (MIC.speaking) {
+    MIC.silenceMs += frameMs;
+  }
+
+  if (MIC.speaking) {
+    MIC.chunks.push(new Float32Array(input));
+    MIC.speechMs += frameMs;
+    if (MIC.silenceMs >= MIC_HANGOVER_MS || MIC.speechMs >= MIC_MAX_SPEECH_MS) {
+      flushUtterance();
+    }
+  }
+}
+
+function flushUtterance() {
+  const chunks = MIC.chunks;
+  const spokenMs = MIC.speechMs - MIC.silenceMs;
+  MIC.speaking = false;
+  MIC.chunks = [];
+  MIC.speechMs = 0;
+  MIC.silenceMs = 0;
+
+  if (spokenMs < MIC_MIN_SPEECH_MS || !chunks.length) {
+    setText('mic-status', '待機中（話しかけてください）');
+    return;
+  }
+  if (!MIC.ws || MIC.ws.readyState !== 1) return;
+
+  // Float32 → PCM16LE
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const pcm = new Int16Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    for (let i = 0; i < c.length; i++) {
+      const s = Math.max(-1, Math.min(1, c[i]));
+      pcm[off++] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+  }
+  MIC.ws.send(pcm.buffer);
+  setText('mic-status', '認識中…');
+}
+
+// ── ローカルサービス診断 ──────────────────────────────────────
+async function runDiagnose() {
+  const issuesEl = document.getElementById('diagnose-issues');
+  const provsEl  = document.getElementById('diagnose-providers');
+  issuesEl.innerHTML = '<div style="font-size:12px;color:var(--muted)">スキャン中…</div>';
+  provsEl.innerHTML = '';
+  let d;
+  try {
+    d = await (await fetch('/api/diagnose')).json();
+  } catch (e) {
+    issuesEl.innerHTML = `<div style="font-size:12px;color:var(--danger)">診断に失敗: ${esc(e.message)}</div>`;
+    return;
+  }
+
+  issuesEl.innerHTML = d.issues.length
+    ? d.issues.map(i => `
+        <div style="font-size:12px;padding:6px 8px;border-radius:6px;margin-bottom:4px;
+                    background:${i.severity === 'error' ? 'rgba(255,80,80,.12)' : 'rgba(255,190,80,.12)'};
+                    border-left:3px solid ${i.severity === 'error' ? 'var(--danger)' : 'var(--accent2)'}">
+          <div><b>${esc(i.target)}</b> — ${esc(i.message)}</div>
+          ${i.hint ? `<div style="color:var(--muted);margin-top:2px">${esc(i.hint)}</div>` : ''}
+        </div>`).join('')
+    : '<div style="font-size:12px;color:var(--accent2)">✓ 設定に問題は見つかりませんでした</div>';
+
+  const rows = d.providers.map(p => `
+    <div style="display:flex;align-items:center;gap:8px;font-size:12px">
+      <span style="width:10px;height:10px;border-radius:50%;flex:none;
+                   background:${p.running ? 'var(--accent2)' : '#555'}"></span>
+      <span style="width:100px;flex:none">${esc(p.label)}</span>
+      <span style="color:var(--muted);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+        ${p.running ? (p.items.length ? esc(p.items.slice(0, 3).join(', ')) + (p.items.length > 3 ? ` 他${p.items.length - 3}件` : '') : esc(p.detail || '応答あり')) : esc(p.detail || '未起動')}
+      </span>
+    </div>`).join('');
+  const stt = d.stt || {};
+  provsEl.innerHTML = rows + `
+    <div style="display:flex;align-items:center;gap:8px;font-size:12px">
+      <span style="width:10px;height:10px;border-radius:50%;flex:none;
+                   background:${stt.enabled ? 'var(--accent2)' : '#555'}"></span>
+      <span style="width:100px;flex:none">音声認識</span>
+      <span style="color:var(--muted);flex:1">${stt.enabled ? esc(stt.name) + (stt.ready ? '（ロード済）' : '（未ロード）') : '無効'}</span>
+    </div>`;
+}
+
+// ── ステータス更新 ────────────────────────────────────────────
+// ── 出演キャラクター（掛け合い） ─────────────────────────────
+let castLoaded = false;
+function renderCast(list, speakingId) {
+  const box = document.getElementById('cast-list');
+  if (!box || !Array.isArray(list)) return;
+  const many = list.length > 1;
+  document.getElementById('cast-mode').textContent = many ? `${list.length}人で掛け合い中` : '1人';
+  document.getElementById('cast-ensemble').style.display = many ? 'block' : 'none';
+  box.innerHTML = list.map(c => {
+    const speaking = c.speaking || c.id === speakingId;
+    const url = `${location.origin}/avatar?char=${encodeURIComponent(c.id)}`;
+    return `<div style="display:flex;gap:10px;align-items:flex-start;padding:6px 0;border-bottom:1px solid var(--border)">
+      <span style="width:8px;height:8px;border-radius:50%;margin-top:6px;flex:none;background:${speaking ? 'var(--accent2)' : 'var(--border)'}"></span>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:13px"><b>${esc(c.name)}</b>${c.is_lead ? ' <span style="font-size:11px;color:var(--muted)">リーダー</span>' : ''}
+          <span class="emotion-badge" style="background:${emotionColor(c.emotion)}">${esc(c.emotion || 'neutral')}</span></div>
+        <div style="font-size:11px;color:var(--muted)">LLM: ${esc(c.llm_model || c.llm_backend || '—')} / 声: ${esc(c.voice || c.tts_backend || '既定')}
+          / 発話 ${c.speak_count || 0} 回 / 記憶 ${c.episodic_count || 0} 件</div>
+        <div style="font-size:12px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(c.last_speech || '—')}</div>
+        ${many ? `<div style="font-size:11px;color:var(--muted);margin-top:2px">OBS: <code>${esc(url)}</code></div>` : ''}
+      </div></div>`;
+  }).join('');
+}
+
+async function loadCast() {
+  try {
+    const d = await (await fetch('/api/characters')).json();
+    renderCast(d.cast || []);
+    const e = d.ensemble || {};
+    document.getElementById('ens-responder').value = e.responder || 'balance';
+    document.getElementById('ens-banter').value = e.banter_probability ?? 0.5;
+    document.getElementById('ens-idle-banter').value = e.idle_banter_probability ?? 0.85;
+    document.getElementById('ens-max').value = e.max_banter_turns ?? 2;
+    castLoaded = true;
+  } catch (e) { /* 起動直後は無視 */ }
+}
+
+async function saveEnsemble() {
+  const body = {
+    responder: document.getElementById('ens-responder').value,
+    banter_probability: parseFloat(document.getElementById('ens-banter').value),
+    idle_banter_probability: parseFloat(document.getElementById('ens-idle-banter').value),
+    max_banter_turns: parseInt(document.getElementById('ens-max').value, 10),
+  };
+  const r = await fetch('/api/ensemble', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                           body: JSON.stringify(body) });
+  addLog(r.ok ? 'info' : 'warn', r.ok ? '掛け合いの設定を保存しました' : '掛け合いの設定を保存できませんでした');
+}
+
+async function forceBanter() {
+  const d = await (await fetch('/api/ensemble/banter', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                                          body: '{}' })).json();
+  if (!d.ok) addLog('warn', d.error || '掛け合いを始められませんでした');
+}
+
+function updateStatus(s) {
+  MIC.aiSpeaking = !!s.is_speaking;
+  setText('st-source', s.comment_source || '—');
+  setText('st-llm',    s.llm_backend    || '—');
+  setText('st-tts',    s.tts_backend    || '—');
+  setText('st-queue',  s.queue_size ?? 0);
+  setText('last-comment', s.last_comment || '—');
+  setText('last-speech',  s.last_speech  || '—');
+  const badge = document.getElementById('emotion-badge');
+  badge.textContent = s.current_emotion || 'neutral';
+  badge.style.background = emotionColor(s.current_emotion);
+  setText('uptime', s.uptime_sec ? `稼働: ${fmtUptime(s.uptime_sec)}` : '');
+  if (s.characters) renderCast(s.characters, s.speaking_character);
+  if (!castLoaded) loadCast();
+}
+
+// ── コメント一覧 ────────────────────────────────────────────
+function addComment(c) {
+  const list = document.getElementById('comment-list');
+  const d = document.createElement('div');
+  d.className = 'comment-item' + (c.is_superchat ? ' superchat' : c.is_member ? ' member' : '');
+  d.innerHTML = `<div class="comment-author">${esc(c.author)}</div><div class="comment-text">${esc(c.message)}</div>`;
+  list.prepend(d);
+  while (list.children.length > 60) list.removeChild(list.lastChild);
+}
+
+// ── ログ ────────────────────────────────────────────────────
+function addLog(level, msg) {
+  const list = document.getElementById('log-list');
+  const d = document.createElement('div');
+  d.className = `log-item ${level || 'info'}`;
+  const t = new Date().toLocaleTimeString('ja-JP', { hour12: false });
+  d.textContent = `[${t}] ${msg}`;
+  list.prepend(d);
+  while (list.children.length > 120) list.removeChild(list.lastChild);
+}
+
+// ── コントロール ────────────────────────────────────────────
+// ── BGM ──────────────────────────────────────────────────────
+function updateBGMStatus(info) {
+  if (!info) return;
+  const now = document.getElementById('bgm-now');
+  const btn = document.getElementById('bgm-play-btn');
+  if (now) {
+    if (info.is_playing && info.name) {
+      now.textContent = '♪ ' + info.name + (info.total ? ' (' + (info.index+1) + '/' + info.total + ')' : '');
+      now.style.color = 'var(--accent2)';
+    } else {
+      now.textContent = info.name ? '⏸ ' + info.name : '—';
+      now.style.color = 'var(--muted)';
+    }
+  }
+  if (btn) btn.textContent = info.is_playing ? '⏸ 停止' : '▶ 再生';
+
+  // プレイリスト表示
+  if (info.playlist && info.playlist.length > 0) {
+    const pl = document.getElementById('bgm-playlist');
+    if (pl) {
+      pl.style.display = 'block';
+      pl.innerHTML = '';
+      info.playlist.forEach(function(t) {
+        const d = document.createElement('div');
+        d.style.cssText = 'padding:4px 8px;font-size:12px;cursor:pointer;border-radius:4px;'
+          + (t.index === info.index ? 'background:rgba(124,111,247,0.2);color:var(--accent2)' : 'color:var(--muted)');
+        d.textContent = (t.index === info.index ? '♪ ' : '') + (t.index+1) + '. ' + t.name;
+        d.onclick = function() { wsSend('bgm_play_at', { index: t.index }); };
+        pl.appendChild(d);
+      });
+      // 現在の曲にスクロール
+      const cur = pl.children[info.index];
+      if (cur) cur.scrollIntoView({ block: 'nearest' });
+    }
+  }
+}
+
+async function bgmLoad() {
+  const source = document.getElementById('bgm-source').value.trim() || 'bgm';
+  const data = await wsRequest('bgm_load', { source: source });
+  if (data) updateBGMStatus(data);
+}
+
+function bgmCmd(cmd) {
+  wsSend(cmd, {});
+}
+
+function bgmPlayPause() {
+  const btn = document.getElementById('bgm-play-btn');
+  const isPlaying = btn && btn.textContent.includes('停止');
+  wsSend(isPlaying ? 'bgm_pause' : 'bgm_play', {});
+}
+
+function bgmVolume(val) {
+  const label = document.getElementById('bgm-vol-label');
+  if (label) label.textContent = val + '%';
+  wsSend('bgm_volume', { volume: parseInt(val) / 100 });
+}
+
+function bgmShuffle(checked) {
+  wsSend('bgm_shuffle', { shuffle: checked });
+}
+
+function updateThemeStatus(theme) {
+  const el = document.getElementById('stream-theme-status');
+  if (!el) return;
+  el.textContent = theme ? '現在のテーマ: 「' + theme + '」' : 'テーマなし（フリー配信）';
+  el.style.color = theme ? 'var(--accent2)' : 'var(--muted)';
+}
+
+function setStreamTheme() {
+  const theme = document.getElementById('stream-theme-input').value.trim();
+  wsSend('set_stream_theme', { theme });
+  updateThemeStatus(theme);
+  addLog('info', theme ? '配信テーマ設定: ' + theme : '配信テーマをクリア');
+}
+
+function clearStreamTheme() {
+  setVal('stream-theme-input', '');
+  wsSend('set_stream_theme', { theme: '' });
+  updateThemeStatus('');
+  addLog('info', '配信テーマをクリア');
+}
+
+// ── 自律トーク・ニュース ────────────────────────────────────
+
+let knowledgeState = null;
+
+async function loadKnowledge() {
+  try {
+    const st = await (await fetch('/api/knowledge')).json();
+    applyKnowledge(st);
+  } catch (e) {
+    console.warn('knowledge load failed', e);
+  }
+  try {
+    const news = await (await fetch('/api/knowledge/news')).json();
+    renderNews(news.items || []);
+  } catch (e) { /* ニュース未取得でもUIは動かす */ }
+}
+
+function applyKnowledge(st) {
+  if (!st || !st.config) return;
+  const c = st.config;
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v; };
+  const num = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+  set('kn-topic-enabled',  c.autonomous_topic.enabled);
+  set('kn-news-enabled',   c.news.enabled);
+  set('kn-answer-enabled', c.answer_with_search.enabled);
+  set('kn-remember',       c.autonomous_topic.remember);
+  num('kn-w-memory',    c.autonomous_topic.weights.memory    ?? 3);
+  num('kn-w-news',      c.autonomous_topic.weights.news      ?? 2);
+  num('kn-w-curiosity', c.autonomous_topic.weights.curiosity ?? 1);
+  num('kn-interval',    c.autonomous_topic.min_web_interval_sec ?? 120);
+
+  knowledgeState = st;
+  renderKnowledgeStatus(st.news ? st.news.count : 0);
+}
+
+// 状態行は「検索の使える経路」と「ニュース在庫数」を出す。
+// 在庫数は後からニュースが届いても更新できるよう、件数だけ差し替えられる形にする。
+function renderKnowledgeStatus(newsCount) {
+  const el = document.getElementById('knowledge-status');
+  if (!el) return;
+  const st = knowledgeState;
+  if (!st) { el.textContent = '—'; return; }
+  const providers = (st.search && st.search.available) ? st.search.available.join(' → ') : 'なし';
+  const keyed = st.search && st.search.google_cse_configured ? 'Google APIキーあり'
+              : st.search && st.search.brave_configured ? 'Brave APIキーあり'
+              : 'APIキーなし（キー不要の検索を使用）';
+  el.textContent = `検索: ${providers} / ${keyed} / ニュース在庫: ${newsCount}件`;
+}
+
+function saveKnowledge() {
+  const val = (id, def) => {
+    const el = document.getElementById(id);
+    const n = el ? parseFloat(el.value) : NaN;
+    return isNaN(n) ? def : n;
+  };
+  const chk = (id) => { const el = document.getElementById(id); return el ? el.checked : false; };
+  const body = {
+    news: { enabled: chk('kn-news-enabled') },
+    autonomous_topic: {
+      enabled:  chk('kn-topic-enabled'),
+      remember: chk('kn-remember'),
+      min_web_interval_sec: val('kn-interval', 120),
+      weights: {
+        memory:    val('kn-w-memory', 3),
+        news:      val('kn-w-news', 2),
+        curiosity: val('kn-w-curiosity', 1),
+      },
+    },
+    answer_with_search: { enabled: chk('kn-answer-enabled') },
+  };
+  wsSend('set_knowledge', body);
+}
+
+function forceTopic(kind) {
+  wsSend('force_topic', { kind: kind || '' });
+  addLog('info', kind ? `話題を要求: ${kind}` : '話題を要求: おまかせ');
+}
+
+function talkAbout() {
+  const input = document.getElementById('kn-query');
+  const query = input.value.trim();
+  if (!query) return;
+  wsSend('force_topic', { query });
+  addLog('info', '検索して話す: ' + query);
+  input.value = '';
+}
+
+function refreshNews() {
+  wsSend('refresh_news', {});
+  addLog('info', 'ニュースを取得中...');
+}
+
+function renderNews(items, totalCount) {
+  const list = document.getElementById('news-list');
+  if (!list) return;
+  list.textContent = '';
+  if (!items.length) {
+    const d = document.createElement('div');
+    d.style.color = 'var(--muted)';
+    d.textContent = 'ニュース未取得（「🔄 ニュース更新」で取得）';
+    list.appendChild(d);
+    renderKnowledgeStatus(0);
+    return;
+  }
+  renderKnowledgeStatus(totalCount == null ? items.length : totalCount);
+  items.slice(0, 12).forEach(item => {
+    const row = document.createElement('div');
+    row.style.cssText = 'padding:4px 0;border-bottom:1px solid var(--border)';
+    const title = document.createElement('div');
+    title.textContent = item.title || '';   // 外部テキストなのでtextContentで入れる
+    const meta = document.createElement('div');
+    meta.style.cssText = 'font-size:11px;color:var(--muted)';
+    meta.textContent = item.site || '';
+    row.appendChild(title);
+    row.appendChild(meta);
+    list.appendChild(row);
+  });
+}
+
+function renderSearchResult(msg) {
+  const el = document.getElementById('knowledge-result');
+  if (!el) return;
+  const n = (msg.items || []).length;
+  el.textContent = n
+    ? `検索「${msg.query}」: ${n}件ヒット（${(msg.items[0].site || '')}ほか）`
+    : `検索「${msg.query}」: 結果なし`;
+}
+
+function injectComment() {
+  const message = document.getElementById('inject-message').value.trim();
+  if (!message) return;
+  const author     = document.getElementById('inject-author').value.trim() || 'テスト';
+  const isSuperchat = document.getElementById('inject-superchat').checked;
+  const isMember   = document.getElementById('inject-member').checked;
+  const isMod      = document.getElementById('inject-mod').checked;
+  const amount     = parseInt(document.getElementById('inject-amount').value) || 0;
+
+  wsSend('inject_comment', {
+    message,
+    author,
+    is_superchat: isSuperchat,
+    amount:       isSuperchat ? amount : 0,
+    is_member:    isMember,
+    is_moderator: isMod,
+  });
+
+  addLog('info', '[テスト注入] ' + author + ': ' + message);
+  document.getElementById('inject-message').value = '';
+}
+
+// スパチャチェック時に金額欄を表示
+document.addEventListener('DOMContentLoaded', function() {
+  const scCheck = document.getElementById('inject-superchat');
+  const amountEl = document.getElementById('inject-amount');
+  if (scCheck && amountEl) {
+    scCheck.addEventListener('change', function() {
+      amountEl.style.display = this.checked ? 'block' : 'none';
+    });
+  }
+  loadCast();
+});
+
+function startMock() {
+  wsSend('start', { video_id: 'mock' });
+  addLog('info', 'Mockモードで開始');
+}
+
+// YouTube の配信URLから動画ID（11文字）を取り出す。YouTube 以外の入力はそのまま返す
+function extractYouTubeId(text) {
+  const t = (text || '').trim();
+  if (!t.includes('youtu')) return t;
+  const id = '([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])';
+  for (const re of [new RegExp('[?&]v=' + id), new RegExp('youtu\\.be/' + id),
+                    new RegExp('youtube\\.com/(?:live|shorts|embed|v)/' + id),
+                    new RegExp('studio\\.youtube\\.com/video/' + id)]) {
+    const m = t.match(re);
+    if (m) return m[1];
+  }
+  return t;
+}
+
+function startStream() {
+  const input = document.getElementById('video-id-input');
+  const raw = input.value.trim();
+  const vid = extractYouTubeId(raw);
+  if (vid !== raw) {
+    input.value = vid;
+    addLog('info', `URLから動画ID「${vid}」を取り出しました`);
+  }
+  if (!vid) {
+    addLog('warn', 'Video IDを入力してください。テスト用には「🎭 Mock」ボタンを使ってください。');
+    document.getElementById('video-id-input').style.borderColor = 'var(--red)';
+    setTimeout(() => { document.getElementById('video-id-input').style.borderColor = ''; }, 2000);
+    return;
+  }
+  wsSend('start', { video_id: vid });
+  addLog('info', '開始: ' + vid);
+}
+function stopStream() {
+  wsSend('stop');
+  addLog('info', '停止');
+}
+
+// ── 設定モーダル ─────────────────────────────────────────────
+async function openSettings() {
+  document.getElementById('settings-modal').classList.add('open');
+  initMotionTestButtons();
+
+  wsRequest('get_config').then(cfg => {
+    if (cfg) { applyConfig(cfg); updateVideoIdUI(cfg.youtube?.primary_source || 'pytchat'); }
+  }).catch(() => {});
+  wsRequest('get_devices').then(d => { if (d) populateDevices(d.devices); }).catch(() => {});
+  wsRequest('get_memory').then(m => { if (m) applyMemory(m); }).catch(() => {});
+  loadCalibrationSettings().catch(() => {});
+  loadLive2DModels().catch(() => {});
+  loadCharacter().catch(() => {});
+  loadSTM().catch(() => {});
+  refreshPresetList().catch(() => {});
+  loadRAGStatus().catch(() => {});
+}
+function closeSettings() {
+  document.getElementById('settings-modal').classList.remove('open');
+}
+document.getElementById('settings-modal').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) closeSettings();
+});
+
+// ── リソースモニター ─────────────────────────────────────
+const RES_HISTORY = [];
+const RES_COLORS = { cpu: '#4fc3f7', ram: '#4caf50', vram: '#7c6ff7', gpu: '#ffca28' };
+
+function resBar(id, pct) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const p = Math.max(0, Math.min(100, pct || 0));
+  el.style.width = p + '%';
+  el.style.background = p >= 90 ? 'var(--red)' : p >= 75 ? 'var(--yellow)' : 'var(--green)';
+}
+
+function renderSystem(s) {
+  const t = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  t('res-cpu', `${s.cpu.toFixed(0)}%`);
+  t('res-cpu-sub', `${s.cpu_count}スレッド ・ このアプリ ${s.app_cpu}%`);
+  resBar('res-cpu-bar', s.cpu);
+  t('res-ram', `${s.ram_percent.toFixed(0)}%`);
+  t('res-ram-sub', `${s.ram_used_gb} / ${s.ram_total_gb} GB ・ このアプリ ${s.app_ram_gb} GB`);
+  resBar('res-ram-bar', s.ram_percent);
+  const g = (s.gpus || [])[0];
+  if (g) {
+    t('res-gpu-name', '— ' + g.name);
+    t('res-vram', `${(g.vram_percent ?? 0).toFixed(0)}%`);
+    t('res-vram-sub', `${g.vram_used_gb} / ${g.vram_total_gb} GB`);
+    resBar('res-vram-bar', g.vram_percent);
+    t('res-gpu', `${(g.util ?? 0).toFixed(0)}%`);
+    t('res-gpu-sub', `${g.temp ?? '-'}℃ ・ ${g.power_w != null ? g.power_w.toFixed(0) + 'W' : '-'}`);
+    resBar('res-gpu-bar', g.util);
+  } else {
+    t('res-vram', 'N/A'); t('res-gpu', 'N/A'); t('res-gpu-sub', 'NVIDIA GPU が見つかりません');
+  }
+  renderVramBreakdown(s.vram_breakdown || [], g);
+  const users = s.vram_breakdown && s.vram_breakdown.length ? [] : (s.vram_users || []);
+  document.getElementById('res-users').innerHTML = (s.vram_breakdown && s.vram_breakdown.length) ? '' : users.length
+    ? 'VRAMを使っているもの: ' + users.map(u =>
+        `<span style="color:var(--text)">${u.service}</span> ${u.model}${u.vram_gb != null ? ` (${u.vram_gb} GB)` : ''}`).join(' ／ ')
+    : 'VRAMを使っているモデルはありません';
+  document.getElementById('res-warn').textContent = (s.warnings || []).map(w => '⚠ ' + w).join('  ');
+
+  if (s.history) { RES_HISTORY.length = 0; RES_HISTORY.push(...s.history); }
+  else RES_HISTORY.push({ cpu: s.cpu, ram: s.ram_percent, vram: g?.vram_percent, gpu: g?.util });
+  while (RES_HISTORY.length > 150) RES_HISTORY.shift();
+  drawResChart();
+}
+
+// AIモデルは目立つ色、アプリは落ち着いた色、Windows は灰色
+const VRAM_AI_COLORS = ['#7c6ff7', '#4fc3f7', '#f06292', '#ffb74d', '#81c784', '#ba68c8', '#4db6ac', '#e57373'];
+const VRAM_APP_COLORS = ['#5c6b8a', '#6d7a96', '#4f5d78', '#7b88a3', '#56627c', '#687591'];
+const vramColorOf = {};
+function vramColor(item, idx) {
+  if (item.kind === 'system') return '#3a3f4f';
+  if (vramColorOf[item.key]) return vramColorOf[item.key];
+  const used = new Set(Object.values(vramColorOf));
+  const pool = item.kind === 'ai' ? VRAM_AI_COLORS : VRAM_APP_COLORS;
+  const c = pool.find(x => !used.has(x)) || pool[idx % pool.length];
+  return (vramColorOf[item.key] = c);   // 同じモデルはずっと同じ色にする
+}
+
+function renderVramBreakdown(items, gpu) {
+  const stack = document.getElementById('res-vram-stack');
+  const legend = document.getElementById('res-vram-legend');
+  if (!stack) return;
+  if (!items.length || !gpu || !gpu.vram_total_gb) {
+    stack.style.display = 'none'; legend.innerHTML = '';
+    document.getElementById('res-vram-free').textContent = '';
+    return;
+  }
+  stack.style.display = '';
+  const total = gpu.vram_total_gb;
+  const esc = (t) => String(t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  stack.innerHTML = items.map((it, i) => {
+    const pct = Math.min(100, it.gb / total * 100);
+    const label = pct > 9 ? esc(it.label) : '';
+    return `<div style="width:${pct}%;background:${vramColor(it, i)}" title="${esc(it.service)}: ${esc(it.label)} ${it.gb} GB">${label}</div>`;
+  }).join('');
+  const free = Math.max(0, total - (gpu.vram_used_gb || 0));
+  document.getElementById('res-vram-free').textContent = `空き ${free.toFixed(1)} GB / ${total} GB`;
+  legend.innerHTML = items.map((it, i) => `
+    <div><span class="sw" style="background:${vramColor(it, i)}"></span>${esc(it.label)}<span class="svc">${esc(it.service)}</span></div>
+    <div class="num">${it.gb.toFixed(2)} GB</div>
+    <div class="pct">${(it.gb / total * 100).toFixed(0)}%</div>`).join('');
+}
+
+function drawResChart() {
+  const cv = document.getElementById('res-chart');
+  if (!cv) return;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== w) cv.width = w;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  for (const y of [0.25, 0.5, 0.75]) { ctx.beginPath(); ctx.moveTo(0, h * y); ctx.lineTo(w, h * y); ctx.stroke(); }
+  const n = 150;
+  for (const key of ['cpu', 'ram', 'vram', 'gpu']) {
+    ctx.strokeStyle = RES_COLORS[key];
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    let started = false;
+    RES_HISTORY.forEach((p, i) => {
+      const v = p[key];
+      if (v == null) return;
+      const x = w - (RES_HISTORY.length - 1 - i) * (w / (n - 1));
+      const y = h - (v / 100) * (h - 4) - 2;
+      if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+}
+
+async function loadSystem() {
+  try { renderSystem(await (await fetch('/api/system')).json()); } catch (e) { /* 次の配信を待つ */ }
+}
+loadSystem();
+
+function switchTab(id, btn) {
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  btn.classList.add('active');
+  if (id === 'tab-memory') loadEpisodicMemory();
+  if (id === 'tab-persona') loadPersonaTab();
+}
+
+// ── 人格QLoRAタブ ─────────────────────────────────────────
+const PQ_KEYS = ['base_model', 'teacher_model', 'synthetic_samples', 'epochs',
+                 'learning_rate', 'lora_r', 'lora_alpha'];
+
+async function pqApi(path, body) {
+  const opt = body === undefined ? {} : {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)};
+  const res = await fetch(path, opt);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || res.statusText);
+  return data;
+}
+
+async function loadPersonaTab() {
+  try {
+    const s = await pqApi('/api/persona');
+    const c = s.config;
+    const badge = document.getElementById('pq-badge');
+    badge.textContent = s.active ? '使用中' : (c.enabled ? 'フォールバック中' : '未使用');
+    badge.style.background = s.active ? 'var(--green)' : 'var(--border)';
+    document.getElementById('pq-detail').textContent =
+      `応答LLM: ${s.llm_backend}` + (c.enabled ? ` / ${c.runtime_model}` : '');
+    const sel = document.getElementById('pq-model');
+    sel.innerHTML = '<option value="">— 学習済みモデルを選択 —</option>';
+    (s.runs || []).filter(r => r.runtime_model).forEach(r => {
+      const loss = r.eval_loss != null ? ` / eval ${r.eval_loss}` : '';
+      sel.add(new Option(`${r.runtime_model}（${r.run}${loss}）`, r.runtime_model));
+    });
+    if (c.runtime_model) {
+      if (![...sel.options].some(o => o.value === c.runtime_model)) sel.add(new Option(c.runtime_model, c.runtime_model));
+      sel.value = c.runtime_model;
+    }
+    setVal('pq-backend', c.backend);
+    setVal('pq-prompt', c.prompt_mode);
+    PQ_KEYS.forEach(k => setVal('pq-' + k, c[k] ?? ''));
+    document.getElementById('pq-include_chat_history').checked = !!c.include_chat_history;
+  } catch (e) { addLog('warn', '人格QLoRAの状態を取得できません: ' + e.message); }
+  try {
+    const o = await pqApi('/api/ollama');
+    const st = !o.installed ? '未インストール' : (o.running ? '起動中' : '停止中');
+    const loaded = (o.loaded || []).join(', ');
+    document.getElementById('ol-status').textContent =
+      st + (loaded ? ` / VRAM: ${loaded}` : '') + (o.last_error ? ` / ${o.last_error}` : '');
+    document.getElementById('ol-auto_start').checked = !!o.settings.auto_start;
+    document.getElementById('ol-preload_on_start').checked = !!o.settings.preload_on_start;
+    setVal('ol-keep_alive', o.settings.keep_alive);
+  } catch (e) { document.getElementById('ol-status').textContent = '取得失敗: ' + e.message; }
+}
+
+async function activatePersona() {
+  const model = document.getElementById('pq-model-manual').value.trim()
+             || document.getElementById('pq-model').value;
+  if (!model) { alert('人格モデルを選ぶか、モデル名を入力してください'); return; }
+  try {
+    const r = await pqApi('/api/persona/activate', {
+      runtime_model: model,
+      backend: document.getElementById('pq-backend').value,
+      prompt_mode: document.getElementById('pq-prompt').value,
+    });
+    addLog('info', `人格モデルに切替: ${r.runtime_model}`);
+  } catch (e) { alert(e.message); }
+  loadPersonaTab();
+}
+
+async function deactivatePersona() {
+  try { await pqApi('/api/persona/deactivate', {}); addLog('info', '通常のLLMに戻しました'); }
+  catch (e) { alert(e.message); }
+  loadPersonaTab();
+}
+
+async function savePersonaDefaults() {
+  const body = {include_chat_history: document.getElementById('pq-include_chat_history').checked};
+  PQ_KEYS.forEach(k => {
+    const v = document.getElementById('pq-' + k).value.trim();
+    if (v !== '' || k === 'teacher_model') body[k] = ['base_model', 'teacher_model'].includes(k) ? v : Number(v);
+  });
+  try { await pqApi('/api/persona/settings', body); addLog('info', '人格QLoRAの既定値を保存しました'); }
+  catch (e) { alert(e.message); }
+  loadPersonaTab();
+}
+
+async function saveOllamaSettings() {
+  try {
+    await pqApi('/api/ollama/settings', {
+      auto_start: document.getElementById('ol-auto_start').checked,
+      preload_on_start: document.getElementById('ol-preload_on_start').checked,
+      keep_alive: document.getElementById('ol-keep_alive').value.trim() || '30m',
+    });
+    addLog('info', 'Ollamaの設定を保存しました');
+  } catch (e) { alert(e.message); }
+  loadPersonaTab();
+}
+
+function applyConfig(cfg) {
+  if (!cfg) return;
+
+  // LLM
+  setVal('llm-primary',  cfg.llm.primary);
+  setVal('llm-fallback', cfg.llm.fallback || '');
+  const lms = cfg.llm.backends.lmstudio || {};
+  setVal('lms-url',    lms.base_url    || '');
+  setVal('lms-model',  lms.model       || '');
+  setVal('lms-temp',   lms.temperature ?? '');
+  setVal('lms-maxtok', lms.max_tokens  ?? '');
+  const ol = cfg.llm.backends.ollama || {};
+  setVal('ollama-url',   ol.base_url    || '');
+  setVal('ollama-model', ol.model       || '');
+  setVal('ollama-temp',  ol.temperature ?? '');
+
+  // TTS
+  const vv = cfg.tts.backends.voicevox || {};
+  setVal('tts-primary',  cfg.tts.primary);
+  setVal('vv-url',       vv.base_url   || '');
+  setVal('vv-speaker',   vv.speaker_id ?? '');
+  setVal('vv-speed',     vv.speed      ?? '');
+
+  // Avatar
+  const av = cfg.avatar || {};
+  setVal('avatar-type', av.type || 'vrm');
+  setVal('vrm-path',    av.vrm?.model_path  || '');
+  setVal('vrm-idle',    av.vrm?.idle_motion || '');
+  applyLive2DConfig(av.live2d || {});
+  updateAvatarTypeUI();
+
+  // Stream theme
+  if (cfg.character) {
+    const theme = cfg.character.stream_theme || '';
+    setVal('stream-theme-input', theme);
+    updateThemeStatus(theme);
+  }
+
+  // IrodoriTTS
+  const ir = cfg.tts.backends?.irodori || {};
+  setVal('irodori-url',          ir.base_url   || '');
+  setVal('irodori-voice',        ir.voice       || '');
+  setVal('irodori-emotion-voice', String(ir.use_emotion_voice || 'false'));
+  setVal('irodori-prefix',       ir.emotion_voice_prefix || '');
+
+  // Source
+  const srcPrimary = cfg.youtube?.primary_source || 'pytchat';
+  setVal('src-primary', srcPrimary);
+  onSourceChange(srcPrimary);
+  updateVideoIdUI(srcPrimary);
+  // ツイキャス
+  if (cfg.twitcasting) {
+    setVal('tc-user-id',  cfg.twitcasting.user_id || '');
+    setVal('tc-interval', cfg.twitcasting.polling_interval_ms || 2000);
+  }
+  // Twitch
+  if (cfg.twitch) {
+    setVal('tw-nick',    cfg.twitch.nick    || '');
+    setVal('tw-channel', cfg.twitch.channel || '');
+  }
+
+  // Orchestrator
+  const o = cfg.orchestrator;
+  setVal('orch-idle',    o.idle_threshold_sec       ?? '');
+  setVal('orch-history', o.response_history_turns   ?? '');
+  setVal('orch-dedupe',  o.comment_dedupe_window_sec ?? '');
+  setVal('orch-consolidation-trigger', o.consolidation_trigger_turns ?? '');
+}
+
+function populateDevices(devices) {
+  const sel = document.getElementById('audio-device');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">デフォルト</option>';
+  (devices || []).forEach(d => {
+    const opt = document.createElement('option');
+    opt.value = d.name;
+    opt.textContent = `[${d.index}] ${d.name}`;
+    if (d.name === cur) opt.selected = true;
+    sel.appendChild(opt);
+  });
+}
+async function loadDevices() {
+  const d = await wsRequest('get_devices');
+  if (d) populateDevices(d.devices);
+}
+
+// ── 設定保存（WebSocket経由）─────────────────────────────────
+function saveLLMSwitch() {
+  wsSend('set_llm', {
+    primary:  document.getElementById('llm-primary').value,
+    fallback: document.getElementById('llm-fallback').value,
+  });
+  addLog('info', `LLM切替送信: ${document.getElementById('llm-primary').value}`);
+}
+
+function saveLLMBackend(name) {
+  const params = name === 'lmstudio'
+    ? { name, base_url: val('lms-url'), model: val('lms-model'), temperature: val('lms-temp'), max_tokens: val('lms-maxtok') }
+    : { name, base_url: val('ollama-url'), model: val('ollama-model'), temperature: val('ollama-temp') };
+  wsSend('set_llm_backend', params);
+  addLog('info', `${name} パラメータ送信`);
+}
+
+function saveTTS() {
+  wsSend('set_tts', {
+    primary:    document.getElementById('tts-primary').value,
+    base_url:   val('vv-url'),
+    speaker_id: val('vv-speaker'),
+    speed:      val('vv-speed'),
+  });
+  addLog('info', 'TTS設定送信');
+}
+
+function saveIrodoriTTS() {
+  wsSend('set_tts', {
+    primary:              document.getElementById('tts-primary').value,
+    base_url:             val('irodori-url'),
+    voice:                val('irodori-voice'),
+    use_emotion_voice:    val('irodori-emotion-voice') === 'true',
+    emotion_voice_prefix: val('irodori-prefix'),
+  });
+  addLog('info', 'IrodoriTTS設定送信');
+}
+
+function applyMemory(data) {
+  if (!data) return;
+  document.getElementById('memory-path').textContent =
+    `ファイル: ${data.path} ${data.is_loaded ? '✅' : '（未作成）'}`;
+  document.getElementById('memory-content').value = data.content || '';
+}
+
+function saveMemory() {
+  const content = document.getElementById('memory-content').value;
+  wsSend('save_memory', { content });
+  addLog('info', `長期記憶保存送信 (${content.length}文字)`);
+}
+
+// ── エピソード記憶 ────────────────────────────────────────────
+async function loadEpisodicMemory() {
+  const data = await wsRequest('get_episodic_memory', {}, 15000);
+  if (!data) { addLog('error', 'エピソード記憶の取得に失敗'); return; }
+  renderEpisodicMemory(data);
+}
+
+function renderEpisodicMemory(data) {
+  const s = data.stats || {};
+  const statsEl = document.getElementById('episodic-stats');
+  if (statsEl) {
+    const pending = data.pending_turns ?? 0;
+    const trigger = data.trigger_turns ?? 0;
+    statsEl.textContent =
+      `${s.count ?? 0} / ${s.max_entries ?? '—'} 件` +
+      (s.pinned ? `（📌 ${s.pinned} 件）` : '') +
+      `　半減期 ${s.half_life_days ?? '—'}日` +
+      (trigger ? `　次の整理まで ${Math.max(0, trigger - pending)} ターン` : '');
+  }
+
+  const list = document.getElementById('episodic-list');
+  if (!list) return;
+  const entries = data.entries || [];
+  if (!entries.length) {
+    list.innerHTML = '<div style="color:var(--muted);font-size:13px">まだ記憶がありません。'
+      + '配信すると自動で貯まります。</div>';
+    return;
+  }
+  list.innerHTML = entries.map(e => {
+    const when = e.created_at ? new Date(e.created_at * 1000).toLocaleString('ja-JP',
+      { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+    const srcLabel = { auto: '自動', manual: '手動', imported: '移行' }[e.source] || e.source;
+    // スコアが低いほど忘れられやすい。バーで一目で分かるようにする
+    const bar = Math.max(2, Math.min(100, e.score * 40));
+    return `
+      <div style="display:flex;gap:8px;align-items:flex-start;padding:6px 4px;
+                  border-bottom:1px solid var(--border)">
+        <div style="flex:1;min-width:0">
+          <div style="font-size:13px;line-height:1.5">${esc(e.text)}</div>
+          <div style="font-size:10px;color:var(--muted);margin-top:2px;display:flex;gap:8px;align-items:center">
+            <span>${when}</span><span>${srcLabel}</span>
+            <span>参照 ${e.use_count}回</span>
+            <span style="flex:1;max-width:60px;height:4px;background:#222;border-radius:2px;overflow:hidden">
+              <span style="display:block;height:100%;width:${bar}%;background:var(--accent2)"></span>
+            </span>
+            <span>残存度 ${e.score}</span>
+          </div>
+        </div>
+        <button class="btn-ghost" style="font-size:11px;padding:2px 6px;flex:none"
+          title="${e.pinned ? '忘却対象に戻す' : '忘れないように固定する'}"
+          onclick="pinEpisodicMemory(${e.id}, ${!e.pinned})">${e.pinned ? '📌' : '📍'}</button>
+        <button class="btn-ghost" style="font-size:11px;padding:2px 6px;flex:none"
+          title="この記憶を削除" onclick="deleteEpisodicMemory(${e.id})">🗑</button>
+      </div>`;
+  }).join('');
+}
+
+async function addEpisodicMemory() {
+  const input = document.getElementById('episodic-new');
+  const text = input.value.trim();
+  if (!text) return;
+  const r = await wsRequest('add_episodic_memory', { text }, 15000);
+  if (r && r.ok) { input.value = ''; addLog('info', '記憶を追加しました'); }
+  else { addLog('warn', '追加できません: ' + ((r && r.error) || '')); }
+  loadEpisodicMemory();
+}
+
+async function deleteEpisodicMemory(id) {
+  await wsRequest('delete_episodic_memory', { id }, 15000);
+  loadEpisodicMemory();
+}
+
+async function pinEpisodicMemory(id, pinned) {
+  await wsRequest('pin_episodic_memory', { id, pinned }, 15000);
+  loadEpisodicMemory();
+}
+
+async function runConsolidation() {
+  const btn = document.getElementById('consolidate-btn');
+  const result = document.getElementById('consolidation-result');
+  if (btn) { btn.disabled = true; btn.textContent = '🧠 整理中...'; }
+  if (result) { result.style.display = 'none'; }
+
+  const data = await wsRequest('consolidate_memory', {}, 90000);
+
+  if (btn) { btn.disabled = false; btn.textContent = '🧠 今すぐ整理・追記'; }
+  if (!data) {
+    addLog('error', '記憶整理: タイムアウト');
+    return;
+  }
+  if (!data.ok) {
+    addLog('error', '記憶整理失敗: ' + (data.error || ''));
+    return;
+  }
+
+  // 結果表示
+  let msg = '';
+  if (data.added > 0) {
+    msg = data.added + ' 件を長期記憶に追記しました';
+    if (data.skipped_duplicates > 0) msg += '（重複 ' + data.skipped_duplicates + ' 件スキップ）';
+    if (data.added_texts && data.added_texts.length > 0) {
+      msg += '<br><small style="color:var(--muted)">' +
+        data.added_texts.map(function(t) { return '・' + esc(t); }).join('<br>') +
+        '</small>';
+    }
+  } else {
+    msg = '追記なし: ' + (data.reason || '');
+    if (data.skipped_duplicates > 0) msg += '（重複 ' + data.skipped_duplicates + ' 件）';
+  }
+  if (result) {
+    result.innerHTML = msg;
+    result.style.display = 'block';
+    result.style.color = data.added > 0 ? 'var(--green)' : 'var(--muted)';
+  }
+  addLog('info', '記憶整理完了: ' + (data.added > 0 ? data.added + '件追加' : '追加なし'));
+  loadEpisodicMemory();
+}
+
+function setConsolidationInterval() {
+  const minutes = parseInt(document.getElementById('consolidation-interval').value) || 0;
+  wsSend('set_consolidation_interval', { minutes: minutes });
+  addLog('info', '定期整理: ' + (minutes === 0 ? '無効' : minutes + '分ごと'));
+}
+
+async function loadRAGStatus() {
+  const data = await wsRequest('get_rag_status');
+  if (!data) return;
+  const el = document.getElementById('rag-status');
+  if (el) {
+    const modeLabel = data.mode === 'sentence-transformers'
+      ? '<span style="color:var(--green)">sentence-transformers ✓</span>'
+      : '<span style="color:var(--yellow)">TF-IDF（フォールバック）</span>';
+    el.innerHTML = 'モード: ' + modeLabel + ' / チャンク数: ' + data.chunk_count;
+  }
+}
+
+async function ragSearch() {
+  const query = val('rag-query').trim();
+  if (!query) return;
+  const data = await wsRequest('rag_search', { query: query, top_k: 5 });
+  const container = document.getElementById('rag-results');
+  if (!container) return;
+  container.innerHTML = '';
+  if (!data || !data.results || data.results.length === 0) {
+    container.innerHTML = '<div style="color:var(--muted);font-size:13px">関連する記憶が見つかりませんでした</div>';
+    return;
+  }
+  data.results.forEach(function(r) {
+    const d = document.createElement('div');
+    d.style.cssText = 'padding:8px 12px;background:var(--bg);border-radius:6px;border-left:3px solid var(--accent);';
+    const pct = Math.round(r.score * 100);
+    const barColor = pct >= 60 ? 'var(--green)' : pct >= 30 ? 'var(--yellow)' : 'var(--muted)';
+    d.innerHTML = '<div style="display:flex;justify-content:space-between;margin-bottom:4px">'
+      + '<span style="font-size:11px;color:var(--accent2)">' + esc(r.section) + '</span>'
+      + '<span style="font-size:11px;color:' + barColor + '">' + pct + '%</span>'
+      + '</div>'
+      + '<div style="font-size:13px">' + esc(r.text) + '</div>'
+      + '<div style="height:3px;background:var(--border);border-radius:2px;margin-top:6px">'
+      + '<div style="height:3px;width:' + pct + '%;background:' + barColor + ';border-radius:2px"></div>'
+      + '</div>';
+    container.appendChild(d);
+  });
+}
+
+async function reloadMemory() {
+  wsSend('reload_memory');
+  const m = await wsRequest('get_memory');
+  if (m) applyMemory(m);
+}
+
+function saveAudio() {
+  const device = document.getElementById('audio-device').value;
+  wsSend('set_audio', { device: device || null });
+  addLog('info', `デバイス送信: ${device || 'デフォルト'}`);
+}
+
+function saveAvatar() {
+  const modelPath = val('vrm-path');
+  const idleMotion = val('vrm-idle');
+  const avatarType = document.getElementById('avatar-type').value;
+  wsSend('set_avatar', {
+    type:        avatarType,
+    model_path:  modelPath,
+    idle_motion: idleMotion,
+    live2d:      collectLive2DConfig(),
+  });
+  addLog('info', `アバター設定送信: ${avatarType} / ` +
+                 `${avatarType === 'live2d' ? (val('l2d-path') || '自動検出') : modelPath}`);
+}
+
+// ── Live2D ───────────────────────────────────────────────────
+
+function updateAvatarTypeUI() {
+  const type = document.getElementById('avatar-type')?.value || 'vrm';
+  document.querySelectorAll('.avatar-vrm-only').forEach(el => {
+    el.style.display = type === 'vrm' ? '' : 'none';
+  });
+  document.querySelectorAll('.avatar-live2d-only').forEach(el => {
+    el.style.display = type === 'live2d' ? '' : 'none';
+  });
+}
+
+// "happy: exp_01" の行を { happy: "exp_01" } に変換する（空行・コメントは無視）
+function parseMapText(text) {
+  const map = {};
+  (text || '').split(/\r?\n/).forEach(line => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) return;
+    const sep = trimmed.indexOf(':');
+    if (sep < 0) return;
+    const key = trimmed.slice(0, sep).trim();
+    const value = trimmed.slice(sep + 1).trim();
+    if (key && value) map[key] = value;
+  });
+  return map;
+}
+
+function formatMapText(map) {
+  return Object.entries(map || {}).map(([k, v]) => `${k}: ${v}`).join('\n');
+}
+
+function applyLive2DConfig(l2d) {
+  setVal('l2d-path',       l2d.model_path        ?? '');
+  setVal('l2d-scale',      l2d.scale             ?? 0.9);
+  setVal('l2d-posx',       l2d.position_x        ?? 0.5);
+  setVal('l2d-posy',       l2d.position_y        ?? 0.5);
+  setVal('l2d-lipgain',    l2d.lipsync_gain      ?? 1.2);
+  setVal('l2d-idlegroup',  l2d.idle_motion_group ?? 'Idle');
+  setVal('l2d-mouthparam', l2d.mouth_param       ?? '');
+  setVal('l2d-expmap',     formatMapText(l2d.expression_map));
+  setVal('l2d-motionmap',  formatMapText(l2d.motion_map));
+  const select = document.getElementById('l2d-model-select');
+  if (select && l2d.model_path) select.value = l2d.model_path;
+  if (l2d.model_path) showLive2DModelInfo(l2d.model_path);
+}
+
+function collectLive2DConfig() {
+  return {
+    model_path:        val('l2d-path'),
+    scale:             val('l2d-scale'),
+    position_x:        val('l2d-posx'),
+    position_y:        val('l2d-posy'),
+    lipsync_gain:      val('l2d-lipgain'),
+    idle_motion_group: val('l2d-idlegroup'),
+    mouth_param:       val('l2d-mouthparam'),
+    expression_map:    parseMapText(val('l2d-expmap')),
+    motion_map:        parseMapText(val('l2d-motionmap')),
+  };
+}
+
+async function loadLive2DModels() {
+  const select = document.getElementById('l2d-model-select');
+  if (!select) return;
+  try {
+    const resp = await fetch('/api/live2d_models');
+    const data = await resp.json();
+    const models = data.models || [];
+    const current = val('l2d-path');
+    select.innerHTML = '';
+    const auto = document.createElement('option');
+    auto.value = '';
+    auto.textContent = models.length ? '(自動検出)' : '(models/live2d にモデルがありません)';
+    select.appendChild(auto);
+    models.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.path;
+      opt.textContent = `${m.name}  [Cubism ${m.version}]`;
+      select.appendChild(opt);
+    });
+    select.value = current || '';
+  } catch (e) {
+    addLog('warn', 'Live2Dモデル一覧の取得に失敗しました');
+  }
+}
+
+function onLive2DModelPick() {
+  const select = document.getElementById('l2d-model-select');
+  if (!select) return;
+  setVal('l2d-path', select.value);
+  showLive2DModelInfo(select.value);
+}
+
+async function showLive2DModelInfo(path) {
+  const box = document.getElementById('l2d-model-info');
+  if (!box) return;
+  try {
+    const resp = await fetch('/api/live2d_model_info?path=' + encodeURIComponent(path || ''));
+    const data = await resp.json();
+    if (!data.ok) { box.textContent = data.error || ''; return; }
+    const motions = Object.entries(data.motions || {})
+      .map(([g, n]) => `${g}(${n})`).join(' / ') || 'なし';
+    const expressions = (data.expressions || []).join(' / ') || 'なし';
+    box.innerHTML = `読み込み対象: <code>${data.path}</code><br>` +
+                    `モーション群: ${motions}<br>表情: ${expressions}`;
+  } catch (e) {
+    box.textContent = '';
+  }
+}
+
+function reloadAvatarPage() {
+  // アバター画面のWebSocketに直接リロード命令を送る
+  wsSend('reload_avatar', {});
+  addLog('info', 'アバター画面にリロード要求を送信');
+}
+
+const MOTION_LIST = [
+  'idle','nod','wave','tilt','jump','bow',
+  'shake_head','think','excited','shy',
+  'point','clap','stretch','lean_forward','dance'
+];
+
+function initMotionTestButtons() {
+  const container = document.getElementById('motion-test-btns');
+  if (!container) return;
+  container.innerHTML = '';
+  MOTION_LIST.forEach(m => {
+    const btn = document.createElement('button');
+    btn.className = 'btn-ghost';
+    btn.style.cssText = 'padding:5px 10px;font-size:12px';
+    btn.textContent = m;
+    btn.onclick = () => {
+      wsSend('test_motion', { motion: m });
+      addLog('info', `テストモーション: ${m}`);
+    };
+    container.appendChild(btn);
+  });
+}
+
+async function loadCalibrationSettings() {
+  try {
+    const resp = await fetch('/api/avatar_calibration');
+    if (resp.ok) {
+      const data = await resp.json();
+      if ('armDownZ' in data) setVal('calib-armDownZ', data.armDownZ);
+      if ('foreArmZ' in data) setVal('calib-foreArmZ', data.foreArmZ);
+      if ('spineX'   in data) setVal('calib-spineX',   data.spineX);
+    }
+  } catch(e) {}
+}
+
+// ── キャラクター設定 ─────────────────────────────────────────
+async function loadCharacter() {
+  const data = await wsRequest('get_character');
+  if (!data) return;
+  setVal('char-name',        data.name        || '');
+  setVal('char-description', data.description || '');
+  setVal('char-personality', data.personality || '');
+  setVal('char-rules',       data.rules       || '');
+  const pathEl = document.getElementById('char-file-path');
+  if (pathEl) pathEl.textContent = 'ファイル: ' + (data.path || '');
+}
+
+function saveCharacter() {
+  wsSend('save_character', {
+    name:        val('char-name'),
+    description: val('char-description'),
+    personality: val('char-personality'),
+    rules:       val('char-rules'),
+  });
+  addLog('info', `キャラクター設定送信: ${val('char-name')}`);
+}
+
+// ── 短期記憶 ─────────────────────────────────────────────────
+async function loadSTM() {
+  const data = await wsRequest('get_short_term_memory');
+  if (!data) return;
+  const info = document.getElementById('stm-info');
+  const list = document.getElementById('stm-list');
+  if (info) info.textContent = data.count + ' メッセージ / 最大' + (data.max_turns * 2) + 'メッセージ（' + data.total_turns + '累計ターン）';
+  const fill = document.getElementById('stm-progress-fill');
+  const trigInfo = document.getElementById('stm-trigger-info');
+  if (fill && data.consolidation_trigger > 0) {
+    const pct = Math.min(100, Math.round(data.turns_since_consolidation / data.consolidation_trigger * 100));
+    fill.style.width = pct + '%';
+    fill.style.background = pct >= 100 ? 'var(--yellow)' : 'var(--accent)';
+    if (trigInfo) trigInfo.textContent = '整理まで ' + (data.consolidation_trigger - data.turns_since_consolidation) + 'ターン';
+  }
+  if (!list) return;
+  list.innerHTML = '';
+  if (!data.messages || data.messages.length === 0) {
+    list.innerHTML = '<div style="color:var(--muted);font-size:13px;text-align:center;padding:20px">会話履歴なし</div>';
+    return;
+  }
+  data.messages.forEach(function(m) {
+    const d = document.createElement('div');
+    const isUser = m.role === 'user';
+    d.style.cssText = 'padding:8px 12px;border-radius:8px;font-size:13px;line-height:1.5;'
+      + 'background:' + (isUser ? 'var(--bg)' : 'rgba(124,111,247,0.1)') + ';'
+      + 'border-left:3px solid ' + (isUser ? 'var(--accent2)' : 'var(--accent)') + ';';
+    var content = m.content || '';
+    var vmatch = content.match(/<viewer_comment author="([^"]*)"[^>]*>([\s\S]*?)<\/viewer_comment>/);
+    if (vmatch) {
+      d.innerHTML = '<span style="font-size:11px;color:var(--accent2);font-weight:600">👤 ' + esc(vmatch[1]) + '</span><br>' + esc(vmatch[2].trim());
+    } else {
+      d.innerHTML = '<span style="font-size:11px;color:var(--accent);font-weight:600">🎭 AI</span><br>' + esc(content);
+    }
+    list.appendChild(d);
+  });
+  list.scrollTop = list.scrollHeight;
+}
+
+function clearSTM() {
+  if (!confirm('短期記憶をクリアしますか？\nAIが直近の会話を忘れます。')) return;
+  wsSend('clear_short_term_memory');
+  addLog('info', '短期記憶クリア送信');
+  setTimeout(() => loadSTM().catch(() => {}), 500);
+}
+
+// ── プリセット管理 ────────────────────────────────────────────
+async function refreshPresetList() {
+  const data = await wsRequest('list_presets');
+  if (!data || !data.presets) return;
+  const sel = document.getElementById('preset-select');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">— 選択 —</option>';
+  data.presets.forEach(function(p) {
+    const opt = document.createElement('option');
+    opt.value = p.name;
+    opt.textContent = p.name + (p.model_path ? ' (' + p.model_path.split('/').pop() + ')' : '');
+    if (p.name === cur) opt.selected = true;
+    sel.appendChild(opt);
+  });
+}
+
+async function loadPreset() {
+  const name = document.getElementById('preset-select').value;
+  if (!name) { addLog('warn', 'プリセットを選択してください'); return; }
+  const data = await wsRequest('load_preset', { name: name });
+  if (!data || data.type === 'preset_error') {
+    addLog('error', 'プリセット読み込み失敗: ' + (data && data.error || ''));
+    return;
+  }
+  // フォームに反映
+  if (data.character) {
+    setVal('char-name',        data.character.name        || '');
+    setVal('char-description', data.character.description || '');
+    setVal('char-personality', data.character.personality || '');
+    setVal('char-rules',       data.character.rules       || '');
+  }
+  if (data.memory !== undefined) {
+    setVal('memory-content', data.memory);
+    const memPath = document.getElementById('memory-path');
+    if (memPath) memPath.textContent = 'プリセット: ' + name;
+  }
+  if (data.avatar) {
+    setVal('vrm-path',  data.avatar.model_path  || '');
+    setVal('vrm-idle',  data.avatar.idle_motion || '');
+  }
+  if (data.calibration) {
+    setVal('calib-armDownZ', data.calibration.armDownZ || 1.15);
+    setVal('calib-foreArmZ', data.calibration.foreArmZ || 0.05);
+    setVal('calib-spineX',   data.calibration.spineX   || 0.0);
+  }
+  addLog('info', 'プリセット読み込み: ' + name);
+}
+
+function openSavePresetDialog() {
+  const curName = document.getElementById('preset-select').value
+    || val('char-name') || '';
+  setVal('preset-name-input', curName);
+  document.getElementById('save-preset-dialog').style.display = 'block';
+  document.getElementById('preset-name-input').focus();
+}
+
+function closeSavePresetDialog() {
+  document.getElementById('save-preset-dialog').style.display = 'none';
+}
+
+async function savePreset() {
+  const name = val('preset-name-input').trim();
+  if (!name) { addLog('warn', 'プリセット名を入力してください'); return; }
+  const data = await wsRequest('save_preset', {
+    name:        name,
+    description: val('char-description'),
+    personality: val('char-personality'),
+    rules:       val('char-rules'),
+    memory:      val('memory-content'),
+  });
+  if (data && data.ok) {
+    addLog('info', 'プリセット保存: ' + name);
+    closeSavePresetDialog();
+    await refreshPresetList();
+    // 保存したプリセットを選択状態にする
+    document.getElementById('preset-select').value = name;
+  } else {
+    addLog('error', 'プリセット保存失敗');
+  }
+}
+
+async function deletePreset() {
+  const name = document.getElementById('preset-select').value;
+  if (!name) { addLog('warn', 'プリセットを選択してください'); return; }
+  if (!confirm(name + ' を削除しますか？')) return;
+  const data = await wsRequest('delete_preset', { name: name });
+  addLog(data && data.ok ? 'info' : 'error', data && data.ok ? 'プリセット削除: ' + name : '削除失敗');
+  if (data && data.ok) await refreshPresetList();
+}
+
+function saveCalibration() {
+  const data = {
+    armDownZ: parseFloat(val('calib-armDownZ')) || 1.15,
+    foreArmZ: parseFloat(val('calib-foreArmZ')) || 0.05,
+    spineX:   parseFloat(val('calib-spineX'))   || 0.0,
+  };
+  wsSend('set_calibration', data);
+  addLog('info', `キャリブレーション送信: armDownZ=${data.armDownZ} foreArmZ=${data.foreArmZ} spineX=${data.spineX}`);
+}
+
+const PLATFORM_UI = {
+  pytchat:     { label: 'YouTube Video ID',     placeholder: '例: xxxxxxxxxxx（空欄でMockモード）', hint: '配信のURLをそのまま貼り付けてもOK（動画IDを自動で取り出します）' },
+  youtube_api: { label: 'YouTube Video ID',     placeholder: '例: xxxxxxxxxxx',                   hint: '配信のURLをそのまま貼り付けてもOK（動画IDを自動で取り出します）' },
+  twitcasting: { label: 'ツイキャス Movie ID',   placeholder: '空欄で現在のライブを自動検出',          hint: '特定の過去ライブを指定する場合のみ入力' },
+  twitch:      { label: 'Twitch チャンネル名',   placeholder: '空欄で設定のチャンネルを使用',           hint: '設定と異なるチャンネルを使う場合のみ入力' },
+  local:       { label: 'ローカルチャット',       placeholder: '入力不要（"local" で開始されます）',      hint: '配信サイトにつながず、/chat 画面とマイク入力だけに応答します' },
+};
+
+// ローカルテストモード（1対1チャット）で開始し、チャット画面を開く
+function startLocalChat() {
+  wsSend('start', { video_id: 'local' });
+  addLog('info', 'ローカルチャットモードで開始しました');
+  window.open('/chat', '_blank');
+}
+
+function updateVideoIdUI(platform) {
+  const ui = PLATFORM_UI[platform] || PLATFORM_UI.pytchat;
+  const label = document.getElementById('video-id-label');
+  const input = document.getElementById('video-id-input');
+  const hint  = document.getElementById('video-id-hint');
+  if (label) label.textContent = ui.label;
+  if (input) input.placeholder = ui.placeholder;
+  if (hint)  hint.textContent  = ui.hint;
+}
+
+function onSourceChange(val) {
+  document.getElementById('src-youtube-section').style.display =
+    (val === 'pytchat' || val === 'youtube_api') ? '' : 'none';
+  document.getElementById('src-twitcasting-section').style.display =
+    val === 'twitcasting' ? '' : 'none';
+  document.getElementById('src-twitch-section').style.display =
+    val === 'twitch' ? '' : 'none';
+  updateVideoIdUI(val);
+}
+
+function saveTwitcasting() {
+  wsSend('set_twitcasting', {
+    access_token:        val('tc-token'),
+    user_id:             val('tc-user-id'),
+    polling_interval_ms: parseInt(val('tc-interval')) || 2000,
+  });
+  addLog('info', 'ツイキャス設定送信');
+}
+
+function saveTwitch() {
+  wsSend('set_twitch', {
+    token:   val('tw-token'),
+    nick:    val('tw-nick'),
+    channel: val('tw-channel'),
+  });
+  addLog('info', 'Twitch設定送信');
+}
+
+function saveSource() {
+  wsSend('set_source', { primary_source: document.getElementById('src-primary').value });
+  addLog('info', 'コメントソース変更送信（次回start時から反映）');
+}
+
+function saveOrchestrator() {
+  const trigger = parseInt(val('orch-consolidation-trigger'));
+  wsSend('set_orchestrator', {
+    idle_threshold_sec:           parseInt(val('orch-idle'))    || undefined,
+    response_history_turns:       parseInt(val('orch-history')) || undefined,
+    comment_dedupe_window_sec:    parseInt(val('orch-dedupe'))  || undefined,
+    consolidation_trigger_turns:  isNaN(trigger) ? undefined : trigger,
+  });
+  addLog('info', 'Orchestrator設定送信');
+}
+
+// ── ユーティリティ ────────────────────────────────────────────
+
+function setText(id, v) { const el = document.getElementById(id); if (el) el.textContent = v; }
+function setVal(id, v)  { const el = document.getElementById(id); if (el) el.value = v; }
+function val(id)        { return document.getElementById(id)?.value ?? ''; }
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function emotionColor(e) {
+  return { happy:'#4caf50', sad:'#4fc3f7', angry:'#f44336', surprised:'#ffca28', relaxed:'#9c88ff' }[e] || '#7c6ff7';
+}
+function fmtUptime(s) {
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), ss = Math.floor(s%60);
+  return h > 0 ? `${h}h${m}m` : m > 0 ? `${m}m${ss}s` : `${ss}s`;
+}
+
+connect();
+runDiagnose();
+
+</script>
+</body>
+</html>

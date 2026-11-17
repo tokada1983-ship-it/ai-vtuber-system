@@ -1,0 +1,66 @@
+__pycache__/
+*.py[cod]
+.env
+models/*.vrm
+
+# Live2Dモデル一式（配布ライセンスがあるので置き場所だけ用意する）
+models/live2d/*
+!models/live2d/README.md
+audio_cache/*.wav
+.venv/
+
+# エピソード記憶（配信ごとに書き換わる実行時データ）
+# キャラクターの設定そのものは characters/*/memory.md 側に残る
+backend/llm/prompts/characters/*/memories.db
+backend/llm/prompts/characters/*/viewer_profiles.db
+
+# ローカル1対1チャットの会話ログ（個人の会話なのでコミットしない）
+backend/llm/prompts/characters/*/chat_history.jsonl
+backend/llm/prompts/characters/*/chat_history.jsonl.tmp
+
+# Unity (AIVunity/)
+AIVunity/[Ll]ibrary/
+AIVunity/[Tt]emp/
+AIVunity/[Oo]bj/
+AIVunity/[Ll]ogs/
+AIVunity/[Uu]serSettings/
+AIVunity/[Bb]uild/
+AIVunity/[Bb]uilds/
+AIVunity/*.csproj
+AIVunity/*.sln
+
+# 人格QLoRAの学習データ・アダプタ・統合モデル（数GB〜になる）
+models/persona/
+
+# ollama serve を自動起動したときのログ
+ollama_serve.log
+
+# GGUF変換用に取得した llama.cpp（docs/persona_qlora.md 参照）
+tools/llama.cpp/
+
+# 自動起動した外部サーバのログ
+logs/
+
+# 動画アバターのモーション動画（大容量。カタログだけ管理する）
+models/motions/*
+!models/motions/*/catalog.json
+
+# ── 配布後の利用者が生成・配置するもの（誤コミット防止）──
+# 実行時データ（配信アーカイブ・プランナ状態）
+data/
+# データベース全般（記憶・視聴者プロフィール等）
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+# TTS の音声キャッシュ全体
+audio_cache/
+# .env のバリエーション（雛形だけは管理する）
+.env.*
+!.env.example
+# モデルのバイナリ（各自で配置する）
+models/*.gguf
+models/*.safetensors
+# テスト・仮想環境のキャッシュ
+.pytest_cache/
+venv/

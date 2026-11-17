@@ -1,0 +1,35 @@
+# ── 必須 ────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+websockets>=12.0
+httpx>=0.27.0
+pydantic>=2.7.0
+pyyaml>=6.0.1
+structlog>=24.1.0
+numpy>=1.26.0
+psutil>=5.9.0               # CPU・メモリ使用量の監視
+sounddevice>=0.4.7          # 音声出力（仮想オーディオデバイスへの再生）
+
+# ── コメントソース ──────────────────────────────────────────
+pytchat>=0.5.5                       # YouTube Live（APIキー不要）
+google-api-python-client>=2.131.0    # YouTube Data API フォールバック
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.0
+
+# ── 音声認識（マイクで話しかける機能）──────────────────────
+# GPUがあれば自動でCUDAを使う。不要なら config.yaml の stt.enabled を false に。
+faster-whisper>=1.0.0
+
+# ── 任意 ────────────────────────────────────────────────────
+anthropic>=0.28.0           # Claude APIを使う場合
+openai>=1.30.0              # OpenAI APIを使う場合
+pygame>=2.5.0               # BGM再生
+sentence-transformers>=3.0  # 長期記憶のRAG検索（無くてもTF-IDFで動作）
+
+# ── 開発 ────────────────────────────────────────────────────
+# pip install pytest pytest-asyncio
+
+# ── ローカルLLM / TTS は別プロセスで起動する ────────────────
+# LLM : LM Studio (http://localhost:1234) または Ollama (http://localhost:11434)
+# TTS : VOICEVOX (50021) / AivisSpeech (10101) / Irodori-TTS (8088)
+# 起動状況はダッシュボードの「ローカルサービス診断」で確認できる

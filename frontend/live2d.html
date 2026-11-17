@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>AI Vtuber Avatar (Live2D)</title>
+<link rel="icon" href="data:,">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: transparent; overflow: hidden; width: 100vw; height: 100vh; }
+  #live2d-canvas { display: block; width: 100%; height: 100%; }
+
+  #subtitle-overlay {
+    position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.65); color: #fff;
+    padding: 8px 20px; border-radius: 20px;
+    font-size: 20px; font-family: 'Hiragino Sans', 'Yu Gothic', sans-serif;
+    max-width: 80vw; text-align: center;
+    opacity: 0; transition: opacity 0.3s;
+    pointer-events: none;
+  }
+  #subtitle-overlay.visible { opacity: 1; }
+
+  #status-indicator {
+    position: fixed; top: 10px; right: 10px; font-size: 11px;
+    color: rgba(255,255,255,0.4); font-family: monospace;
+  }
+
+  /* モデル未設置のときの案内（OBSでは表示されないよう半透明にとどめる） */
+  #setup-guide {
+    position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    display: none; max-width: 620px;
+    background: rgba(20,20,28,0.85); color: #eee; border-radius: 12px;
+    padding: 20px 24px; line-height: 1.9; font-size: 14px;
+    font-family: 'Hiragino Sans', 'Yu Gothic', sans-serif;
+  }
+  #setup-guide code {
+    background: rgba(255,255,255,0.12); padding: 1px 6px; border-radius: 4px;
+    font-size: 13px;
+  }
+  #setup-guide h2 { font-size: 16px; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<canvas id="live2d-canvas"></canvas>
+<div id="subtitle-overlay"></div>
+<div id="status-indicator">connecting...</div>
+<div id="setup-guide">
+  <h2>Live2Dモデルが見つかりません</h2>
+  モデル一式を <code>models/live2d/&lt;好きな名前&gt;/</code> に置いてください。<br>
+  フォルダの中に <code>*.model3.json</code>（Cubism 4）があれば自動で読み込みます。<br><br>
+  オフライン運用したい場合は Cubism Core を<br>
+  <code>models/live2d/core/live2dcubismcore.min.js</code> に置くとそちらを優先します。<br>
+  旧Cubism 2のモデル（<code>*.model.json</code>）を使う場合は<br>
+  <code>models/live2d/core/live2d.min.js</code> も一緒に置いてください。
+</div>
+
+<script>
+// ────────────────────────────────────────────────────────────────
+// ライブラリ読み込み（PIXI + pixi-live2d-display + Cubism Core）
+//   Cubism Core はライセンス上パッケージに同梱できないため、
+//   ローカルに置かれていればそれを、無ければ公式CDNを使う。
+// ────────────────────────────────────────────────────────────────
+
+const CDN = {
+  pixi:     'https://cdn.jsdelivr.net/npm/pixi.js@6.5.10/dist/browser/pixi.min.js',
+  cubism4:  'https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js',
+  both:     'https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/index.min.js',
+  core4:    'https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js',
+};
+
+function loadScript(url) {
+  return new Promise((resolve, reject) => {
+    const el = document.createElement('script');
+    el.src = url;
+    el.onload = () => resolve(url);
+    el.onerror = () => reject(new Error('load failed: ' + url));
+    document.head.appendChild(el);
+  });
+}
+
+async function loadRuntime() {
+  // ローカルCoreの有無はサーバーが教えてくれる（cfg.core）
+  const core = cfg.core || {};
+  if (core.cubism2) await loadScript(core.cubism2);   // 旧Cubism 2モデル用
+
+  await loadScript(core.cubism4 || CDN.core4);
+  await loadScript(CDN.pixi);
+  // Cubism 2も使うならバンドル版、Cubism 4だけなら軽い方を読む
+  await loadScript(core.cubism2 ? CDN.both : CDN.cubism4);
+  try { PIXI.live2d.Live2DModel.registerTicker(PIXI.Ticker); } catch (e) {}
+}
+
+// ────────────────────────────────────────────────────────────────
+// 設定
+// ────────────────────────────────────────────────────────────────
+
+let cfg = {
+  model_path: '',
+  scale: 0.9,
+  position_x: 0.5,
+  position_y: 0.5,
+  idle_motion_group: 'Idle',
+  lipsync_gain: 1.2,
+  mouth_param: '',
+  expression_map: {},
+  motion_map: {},
+  core: {},          // ローカルに置かれたCubism Coreのパス（サーバーが返す）
+};
+
+// ?mute=1 を付けるとアバター画面側では音を鳴らさず口だけ動かす
+// （バックエンドがスピーカーへ出しているので二重再生を避けたいとき用）
+const MUTED = new URLSearchParams(location.search).get('mute') === '1';
+// ── 掛け合い配信: この画面が担当するキャラ ──────────────────────
+// /avatar?char=<id> で指定（省略時はリーダー）。他のキャラの発話には反応しない
+const CHAR_PARAM = new URLSearchParams(location.search).get('char') || '';
+let MY_CHAR = CHAR_PARAM;
+function isMine(msg) {
+  if (!MY_CHAR) return true;
+  if (msg.type === 'config_update') return !msg.characters || msg.characters.includes(MY_CHAR);
+  return !msg.character || msg.character === MY_CHAR;
+}
+function avatarConfigUrl() {
+  return '/api/avatar_config' + (CHAR_PARAM ? '?char=' + encodeURIComponent(CHAR_PARAM) : '');
+}
+
+
+function setStatus(msg) {
+  document.getElementById('status-indicator').textContent = msg;
+}
+
+function modelUrl(path) {
+  const text = (path || '').trim();
+  if (!text) return '';
+  if (text.startsWith('http://') || text.startsWith('https://')) return text;
+  const normalized = text.replace(/\\/g, '/');
+  return normalized.startsWith('/') ? normalized : '/' + normalized;
+}
+
+// ────────────────────────────────────────────────────────────────
+// モデル管理
+// ────────────────────────────────────────────────────────────────
+
+let app = null;
+let model = null;
+let motionGroups = [];      // モデルが持つモーショングループ名
+let expressionNames = [];   // モデルが持つ表情名
+
+function initApp() {
+  if (app) return;
+  app = new PIXI.Application({
+    view: document.getElementById('live2d-canvas'),
+    autoStart: true,
+    resizeTo: window,
+    backgroundAlpha: 0,     // OBSでクロマキー不要の透過背景
+    antialias: true,
+  });
+  window.addEventListener('resize', () => setTimeout(layoutModel, 0));
+}
+
+function layoutModel() {
+  if (!model || !app) return;
+  const w = app.renderer.width  / app.renderer.resolution;
+  const h = app.renderer.height / app.renderer.resolution;
+  const im = model.internalModel;
+  const baseHeight = im.originalHeight || im.height || model.height || 1;
+  const scale = (h * (cfg.scale || 0.9)) / baseHeight;
+  model.scale.set(scale);
+  model.anchor.set(0.5, 0.5);
+  model.x = w * (cfg.position_x ?? 0.5);
+  model.y = h * (cfg.position_y ?? 0.5);
+}
+
+async function loadModel(path) {
+  const url = modelUrl(path);
+  if (!url) {
+    document.getElementById('setup-guide').style.display = 'block';
+    setStatus('no model');
+    return;
+  }
+  document.getElementById('setup-guide').style.display = 'none';
+  setStatus('loading: ' + url);
+
+  try {
+    const next = await PIXI.live2d.Live2DModel.from(url, { autoInteract: false });
+
+    if (model) {
+      app.stage.removeChild(model);
+      model.destroy();
+      model = null;
+    }
+    model = next;
+    app.stage.addChild(model);
+
+    const settings = model.internalModel.settings || {};
+    motionGroups = Object.keys(
+      settings.motions || settings.FileReferences?.Motions || {}
+    );
+    expressionNames = (settings.expressions || [])
+      .map(e => e.Name || e.name || '')
+      .filter(Boolean);
+
+    // アイドル時に自動再生されるグループを設定に合わせる
+    const mm = model.internalModel.motionManager;
+    const idleGroup = matchGroup(cfg.idle_motion_group) || matchGroup('idle');
+    if (idleGroup) mm.groups.idle = idleGroup;
+
+    hookLipsync();
+
+    layoutModel();
+    console.log('[live2d] loaded', url, { motionGroups, expressionNames });
+    setStatus('live2d ready');
+  } catch (e) {
+    console.error('[live2d] load failed:', e);
+    setStatus('load failed');
+    document.getElementById('setup-guide').style.display = 'block';
+  }
+}
+
+function matchGroup(name) {
+  if (!name) return null;
+  const lower = String(name).toLowerCase();
+  return motionGroups.find(g => g.toLowerCase() === lower)
+      || motionGroups.find(g => g.toLowerCase().includes(lower))
+      || null;
+}
+
+// ────────────────────────────────────────────────────────────────
+// リップシンク（口パラメータをモーションの後から上書きする）
+// ────────────────────────────────────────────────────────────────
+
+let mouthTarget = 0;    // 音量から決まる目標値
+let mouthValue = 0;     // 実際に適用している値（なめらかに追従させる）
+let mouthParamIds = null;
+let lastFrameAt = performance.now();
+
+function resolveMouthParams(coreModel) {
+  if (cfg.mouth_param) return [cfg.mouth_param];
+  const candidates = ['ParamMouthOpenY', 'PARAM_MOUTH_OPEN_Y'];
+  if (typeof coreModel.getParameterIndex === 'function') {
+    for (const id of candidates) {
+      try { if (coreModel.getParameterIndex(id) >= 0) return [id]; } catch (e) {}
+    }
+  }
+  return candidates;   // 判定できなければ両方に投げる（無い方は無視される）
+}
+
+function setParam(coreModel, id, value) {
+  try {
+    if (typeof coreModel.setParameterValueById === 'function') {
+      coreModel.setParameterValueById(id, value);
+    } else if (typeof coreModel.setParamFloat === 'function') {
+      coreModel.setParamFloat(id, value);
+    }
+  } catch (e) {}
+}
+
+function addParam(coreModel, id, value) {
+  if (!value) return;
+  try {
+    if (typeof coreModel.addParameterValueById === 'function') {
+      coreModel.addParameterValueById(id, value);
+    } else if (typeof coreModel.addToParamFloat === 'function') {
+      coreModel.addToParamFloat(id, value);
+    } else {
+      setParam(coreModel, id, value);
+    }
+  } catch (e) {}
+}
+
+function hookLipsync() {
+  const mm = model.internalModel.motionManager;
+  if (mm.__aivHooked) return;
+  const original = mm.update.bind(mm);
+  mm.update = (coreModel, now) => {
+    const result = original(coreModel, now);
+    // モーション適用後に口と簡易モーションを上書き／加算する
+    const dt = Math.min((performance.now() - lastFrameAt) / 1000, 0.1);
+    lastFrameAt = performance.now();
+    applyMouth(coreModel, dt);
+    applyProceduralMotion(coreModel, dt);
+    return result;
+  };
+  mm.__aivHooked = true;
+  mouthParamIds = null;
+}
+
+function applyMouth(coreModel, dt) {
+  if (!mouthParamIds) mouthParamIds = resolveMouthParams(coreModel);
+  // 追従を少し鈍らせる（値がガタつくと口がバタつくため）
+  mouthValue += (mouthTarget - mouthValue) * Math.min(dt * 18, 1);
+  const v = Math.max(0, Math.min(1, mouthValue * (cfg.lipsync_gain || 1)));
+  for (const id of mouthParamIds) setParam(coreModel, id, v);
+}
+
+// ────────────────────────────────────────────────────────────────
+// モーション（モデルのモーション優先、無ければパラメータで簡易再現）
+// ────────────────────────────────────────────────────────────────
+
+// AI側のモーション名 → モデルのグループ名として探す候補
+const MOTION_HINTS = {
+  idle:         ['idle'],
+  nod:          ['tap', 'idle'],
+  wave:         ['greet', 'hello', 'tap', 'hand'],
+  tilt:         ['tap', 'idle'],
+  jump:         ['tap', 'body'],
+  bow:          ['greet', 'tap'],
+  shake_head:   ['tap', 'idle'],
+  think:        ['idle'],
+  excited:      ['tap', 'body'],
+  shy:          ['tap', 'idle'],
+  point:        ['tap'],
+  clap:         ['tap', 'body'],
+  stretch:      ['idle'],
+  lean_forward: ['idle'],
+  dance:        ['tap', 'body'],
+};
+
+// モデルにモーションが無いときの簡易表現（頭と体のパラメータを動かす）
+const PROCEDURAL = {
+  nod:        { dur: 1.0 },
+  tilt:       { dur: 1.4 },
+  shake_head: { dur: 1.2 },
+  bow:        { dur: 1.6 },
+  jump:       { dur: 0.9 },
+  excited:    { dur: 1.8 },
+  shy:        { dur: 1.6 },
+  think:      { dur: 3.0 },
+  wave:       { dur: 2.0 },
+  clap:       { dur: 2.0 },
+  point:      { dur: 1.5 },
+  stretch:    { dur: 2.0 },
+  dance:      { dur: 3.0 },
+  lean_forward: { dur: 2.0 },
+};
+
+let procMotion = null;   // { name, t, dur }
+
+function playMotion(name) {
+  const motion = name || 'idle';
+  procMotion = null;
+
+  if (!model) return;
+  if (motion === 'none') return;
+  if (motion === 'idle') return;   // アイドルはライブラリの自動再生に任せる
+
+  // 1. 設定の対応表（"Group" または "Group:2" で番号指定）
+  const mapped = cfg.motion_map?.[motion];
+  if (mapped) {
+    const [rawGroup, rawIndex] = String(mapped).split(':');
+    const group = matchGroup(rawGroup);
+    if (group) {
+      const index = rawIndex !== undefined ? Number(rawIndex) : undefined;
+      model.motion(group, Number.isFinite(index) ? index : undefined,
+                   PIXI.live2d.MotionPriority.NORMAL);
+      return;
+    }
+  }
+
+  // 2. モーション名と同名／近い名前のグループ
+  for (const candidate of [motion, ...(MOTION_HINTS[motion] || [])]) {
+    const group = matchGroup(candidate);
+    // idleグループはアイドル動作なので、明示指定でない限り反応には使わない
+    if (group && !(group.toLowerCase().includes('idle') && candidate !== motion)) {
+      model.motion(group, undefined, PIXI.live2d.MotionPriority.NORMAL);
+      return;
+    }
+  }
+
+  // 3. モデル側に該当モーションが無ければパラメータで簡易再現する
+  const proc = PROCEDURAL[motion];
+  if (proc) procMotion = { name: motion, t: 0, dur: proc.dur };
+}
+
+function applyProceduralMotion(coreModel, dt) {
+  if (!procMotion) return;
+  procMotion.t += dt;
+  const t = procMotion.t;
+  const p = Math.min(t / procMotion.dur, 1);
+  // 立ち上がり／終わりで滑らかに戻す包絡線
+  const env = Math.sin(Math.min(p, 1) * Math.PI);
+
+  // Cubism標準パラメータ: X=左右首振り Y=うなずき Z=首かしげ（±30）
+  const head = (x, y, z) => {
+    addParam(coreModel, 'ParamAngleX', x); addParam(coreModel, 'PARAM_ANGLE_X', x);
+    addParam(coreModel, 'ParamAngleY', y); addParam(coreModel, 'PARAM_ANGLE_Y', y);
+    addParam(coreModel, 'ParamAngleZ', z); addParam(coreModel, 'PARAM_ANGLE_Z', z);
+  };
+  const body = (x, z) => {
+    addParam(coreModel, 'ParamBodyAngleX', x); addParam(coreModel, 'PARAM_BODY_ANGLE_X', x);
+    addParam(coreModel, 'ParamBodyAngleZ', z); addParam(coreModel, 'PARAM_BODY_ANGLE_Z', z);
+  };
+
+  switch (procMotion.name) {
+    case 'nod':        head(0, -22 * env, 0); body(0, 0); break;
+    case 'shake_head': head(Math.sin(t * Math.PI * 4) * 22 * env, 0, 0); break;
+    case 'tilt':       head(0, 0, 20 * env); break;
+    case 'bow':        head(0, -28 * env, 0); body(-8 * env, 0); break;
+    case 'jump':       head(0, 12 * env, 0); body(0, Math.sin(t * Math.PI * 4) * 6 * env); break;
+    case 'excited':    head(Math.sin(t * Math.PI * 6) * 10 * env, 8 * env, 0);
+                       body(0, Math.sin(t * Math.PI * 6) * 8 * env); break;
+    case 'shy':        head(12 * env, -12 * env, 10 * env); break;
+    case 'think':      head(14 * env, -8 * env, 12 * env); break;
+    case 'wave':       head(0, 6 * env, Math.sin(t * Math.PI * 4) * 12 * env); break;
+    case 'clap':       head(0, -6 * env, 0); body(0, Math.sin(t * Math.PI * 5) * 6 * env); break;
+    case 'point':      head(-14 * env, -6 * env, 0); body(-6 * env, 0); break;
+    case 'stretch':    head(0, 16 * env, 0); body(6 * env, 0); break;
+    case 'dance':      head(Math.sin(t * Math.PI * 2) * 14 * env, 0,
+                            Math.sin(t * Math.PI * 2 + Math.PI / 2) * 12 * env);
+                       body(0, Math.sin(t * Math.PI * 2) * 10 * env); break;
+    case 'lean_forward': head(0, -10 * env, 0); body(-6 * env, 0); break;
+  }
+
+  if (p >= 1) procMotion = null;
+}
+
+// ────────────────────────────────────────────────────────────────
+// 表情
+// ────────────────────────────────────────────────────────────────
+
+function setEmotion(emotion) {
+  if (!model) return;
+  const name = emotion || 'neutral';
+  const manager = model.internalModel.motionManager.expressionManager;
+  if (!manager) return;
+
+  const mapped = cfg.expression_map?.[name];
+  const target = mapped
+    || expressionNames.find(e => e.toLowerCase() === name)
+    || expressionNames.find(e => e.toLowerCase().includes(name));
+
+  if (target) {
+    try { model.expression(target); } catch (e) { console.warn('[live2d] expression:', e); }
+  } else if (name === 'neutral') {
+    try { manager.resetExpression(); } catch (e) {}
+  }
+}
+
+// ────────────────────────────────────────────────────────────────
+// WebSocket
+// ────────────────────────────────────────────────────────────────
+
+const subtitle = document.getElementById('subtitle-overlay');
+let subtitleTimer = null;
+let audioCtx = null;
+let lipsyncInterval = null;
+let currentSource = null;
+
+function connectWS() {
+  const ws = new WebSocket(`ws://${location.host}/ws/avatar`);
+
+  ws.onopen  = () => setStatus(model ? 'live2d ready' : 'connected');
+  ws.onclose = () => { setStatus('disconnected'); setTimeout(connectWS, 3000); };
+
+  ws.onmessage = (e) => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch (err) { return; }
+    if (!isMine(msg)) return;
+
+    if (msg.type === 'config_update') {
+      // VRMに切り替わったなら /avatar を開き直して描画方式ごと差し替える
+      if (msg.avatar_type && msg.avatar_type !== 'live2d' && location.pathname === '/avatar') {
+        location.reload();
+        return;
+      }
+      const before = cfg.model_path;
+      if (msg.live2d) cfg = { ...cfg, ...msg.live2d };
+      if (cfg.model_path !== before) {
+        loadModel(cfg.model_path);
+      } else {
+        // 大きさ・位置だけの変更は読み直さずに反映する
+        const mm = model?.internalModel?.motionManager;
+        const idleGroup = matchGroup(cfg.idle_motion_group);
+        if (mm && idleGroup) mm.groups.idle = idleGroup;
+        mouthParamIds = null;
+        layoutModel();
+      }
+    }
+
+    if (msg.type === 'test_motion') {
+      playMotion(msg.motion || 'wave');
+    }
+
+    if (msg.type === 'speech_start') {
+      setEmotion(msg.emotion || 'neutral');
+      subtitle.textContent = msg.text || '';
+      subtitle.classList.add('visible');
+      if (msg.audio_url) {
+        playAudioLipsync(msg.audio_url);
+      } else {
+        simulateLipsync(msg.text?.length || 0);
+      }
+    }
+
+    if (msg.type === 'motion') {
+      playMotion(msg.motion || 'idle');
+    }
+
+    if (msg.type === 'speech_end') {
+      setEmotion('neutral');
+      clearTimeout(subtitleTimer);
+      subtitleTimer = setTimeout(() => subtitle.classList.remove('visible'), 1500);
+      stopLipsync();
+    }
+  };
+}
+
+async function playAudioLipsync(url) {
+  stopLipsync();
+  try {
+    if (!audioCtx) audioCtx = new AudioContext();
+    if (audioCtx.state === 'suspended') { try { await audioCtx.resume(); } catch (e) {} }
+
+    const resp = await fetch(url);
+    const buf = await resp.arrayBuffer();
+    const decoded = await audioCtx.decodeAudioData(buf);
+    const source = audioCtx.createBufferSource();
+    source.buffer = decoded;
+
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(analyser);
+    // ?mute=1 のときは解析だけしてスピーカーには出さない
+    if (!MUTED) analyser.connect(audioCtx.destination);
+    source.start();
+    currentSource = source;
+
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    lipsyncInterval = setInterval(() => {
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) sum += Math.abs(data[i] - 128);
+      mouthTarget = Math.min((sum / data.length) / 30, 1);
+    }, 50);
+
+    source.onended = () => stopLipsync();
+  } catch (e) {
+    console.warn('[live2d] audio play error:', e);
+    simulateLipsync(20);
+  }
+}
+
+function simulateLipsync(textLen) {
+  stopLipsync();
+  let t = 0;
+  const duration = Math.max(textLen * 0.12, 1.0) * 1000;
+  lipsyncInterval = setInterval(() => {
+    t += 80;
+    if (t > duration) { stopLipsync(); return; }
+    mouthTarget = 0.3 + Math.sin(t * 0.03) * 0.3;
+  }, 80);
+}
+
+function stopLipsync() {
+  clearInterval(lipsyncInterval);
+  lipsyncInterval = null;
+  if (currentSource) {
+    try { currentSource.onended = null; currentSource.stop(); } catch (e) {}
+    currentSource = null;
+  }
+  mouthTarget = 0;
+}
+
+// ────────────────────────────────────────────────────────────────
+// 起動
+// ────────────────────────────────────────────────────────────────
+
+async function init() {
+  try {
+    const resp = await fetch(avatarConfigUrl());
+    const data = await resp.json();
+    if (data.character) MY_CHAR = data.character;
+    if (data.live2d) cfg = { ...cfg, ...data.live2d };
+    console.log('[live2d] config:', cfg);
+  } catch (e) {
+    console.warn('[live2d] config fetch failed, using defaults:', e);
+  }
+
+  try {
+    await loadRuntime();
+  } catch (e) {
+    console.error('[live2d] runtime load failed:', e);
+    setStatus('runtime load failed');
+    document.getElementById('setup-guide').style.display = 'block';
+    return;
+  }
+
+  initApp();
+  await loadModel(cfg.model_path);
+}
+
+init();
+connectWS();
+</script>
+</body>
+</html>
