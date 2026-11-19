@@ -20,6 +20,17 @@ llm:
   # 発話フォーマット。tag = タグ方式（現行。人格QLoRAのタグ形式学習と対）
   # json = 従来のJSON方式（ロールバック用に残置）
   protocol: tag
+  # num_ctx 適応制御（Ollama）: 生成ごとの prompt_eval_count を見て段を
+  # 自動で上げ下げする。false にすると従来動作（backends.ollama の
+  # extra_payload に書かれた num_ctx 固定）に戻る
+  adaptive_ctx: true
+  context_tiers: [4096, 6144, 8192, 12288, 16384]
+  context_initial: 8192
+  context_raise_ratio: 0.85
+  context_lower_ratio: 0.45
+  context_cooldown_sec: 300
+  context_lower_turns: 50
+  context_lower_window_sec: 1800
   backends:
     lmstudio:
       base_url: http://localhost:1234/v1
@@ -34,7 +45,7 @@ llm:
       temperature: 0.8
       max_tokens: 500
       api_key_env: ''
-      extra_payload: {think: false, format: json}
+      extra_payload: {think: false, format: json, num_ctx: 8192}
     claude:
       base_url: ''
       model: claude-sonnet-4-20250514

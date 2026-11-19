@@ -115,7 +115,166 @@ const els = [document.getElementById('vA'), document.getElementById('vB')];
 let front = 0;                // 表示中レイヤーの index
 const voice = document.getElementById('voice');
 
-function setStatus(msg) { document.getElementById('status-indicator').textContent = msg; }
+// ── ヘルスチェック（ハートビート／再生ウォッチドッグ／エラー転送） ──
+// 2026-11-19 の配信テストで「WS は connected 表示のまま再生だけ凍結」し、
+// 外部から生死判定できなかった反省から入れた仕組み。
+// 再生の進行を数えてバックエンドへ送り続け、止まったら自分で回復を試み、
+// 起きたことは WS 経由でバックエンドのログに残す。
+const health = {
+  frames: 0,               // 実際に表示されたフレーム数（requestVideoFrameCallback）
+  progressSec: 0,          // currentTime が進んだ累計秒（フレーム数の代替指標）
+  lastTime: -1,            // フロント動画の前回 currentTime
+  lastProgressAt: performance.now(),  // currentTime が最後に進んだ時刻
+  lastWsAt: 0,             // 最後に WS メッセージを受信した時刻
+  ws: null,
+  currentClip: '',         // 再生中クリップの URL（swapTo で更新）
+  stallCount: 0,           // 同一クリップでの連続回復試行回数
+  rvfc: typeof document.getElementById('vA').requestVideoFrameCallback === 'function',
+};
+function healthFrames() {
+  return (health.rvfc && health.frames > 0) ? health.frames : Math.round(health.progressSec);
+}
+let statusBase = 'video avatar';
+function renderStatus() {
+  const age = health.lastWsAt ? Math.round((performance.now() - health.lastWsAt) / 1000) + 's' : '-';
+  document.getElementById('status-indicator').textContent =
+    statusBase + ' · f:' + healthFrames() + ' ws:' + age;
+}
+function setStatus(msg) { statusBase = msg; renderStatus(); }
+
+// 表示フレーム数の計測（実際に提示されたフレームだけを数える）
+if (health.rvfc) {
+  const countFrames = (el) => {
+    el.requestVideoFrameCallback(() => { health.frames++; countFrames(el); });
+  };
+  els.forEach(countFrames);
+}
+
+function sendToHub(obj) {
+  try {
+    if (health.ws && health.ws.readyState === WebSocket.OPEN) health.ws.send(JSON.stringify(obj));
+  } catch (e) { /* 送れなくてもページ自体は止めない */ }
+}
+const _eventSentAt = {};
+function sendPageEvent(event, detail) {
+  const now = performance.now();
+  if (_eventSentAt[event] && now - _eventSentAt[event] < 5000) return;  // 同種は5秒に1回まで
+  _eventSentAt[event] = now;
+  sendToHub({ type: 'page_event', character: MY_CHAR, page: 'video', event: event,
+              detail: String(detail || '').slice(0, 300) });
+}
+window.addEventListener('error', (e) => {
+  sendPageEvent('page_error', (e.message || 'error') + ' @' + (e.filename || '') + ':' + (e.lineno || ''));
+});
+window.addEventListener('unhandledrejection', (e) => {
+  sendPageEvent('page_error', 'unhandledrejection: ' + ((e.reason && e.reason.message) || e.reason || ''));
+});
+
+function clipName(url) { return url ? String(url).split('/').pop() : ''; }
+
+// メディアイベントのテレメトリ（デコード停滞・読込失敗を黙らせない）
+els.forEach((el, idx) => {
+  el.addEventListener('error', () => {
+    const err = el.error ? 'code=' + el.error.code : '';
+    sendPageEvent('media_error', 'el=' + idx + ' clip=' + clipName(el.getAttribute('src') || '') + ' ' + err);
+    if (idx === front) skipStalledClip('media_error');
+  });
+  for (const ev of ['stalled', 'waiting']) {
+    el.addEventListener(ev, () => {
+      if (idx !== front) return;
+      const clipAtEvent = health.currentClip;
+      const timeAtEvent = el.currentTime || 0;
+      setTimeout(() => {
+        // 切替直後の一瞬の waiting は正常系。3秒後も詰まっている場合だけ知らせる
+        if (idx !== front || health.currentClip !== clipAtEvent) return;
+        if (el.readyState >= 3 && (el.currentTime || 0) > timeAtEvent + 0.1) return;
+        sendPageEvent('media_' + ev, 'clip=' + clipName(clipAtEvent) +
+          ' readyState=' + el.readyState + ' networkState=' + el.networkState);
+      }, 3000);
+    });
+  }
+});
+
+// ── 再生ウォッチドッグ ────────────────────────────────────────
+// フロントの <video> は「再生中のはずなのに currentTime が進まない」状態になると
+// ended も error も発火せず永久に止まる（2026-11-19 の凍結の型）。
+// 進行を見張り、段階的に回復する：再開 → 同じクリップ再読込 → 次のクリップへ。
+// それでも短時間に繰り返すならページ自体を再読込する（多重リロード防止つき）。
+const STALL_SEC = 6;
+const _stallEpisodes = [];
+
+function skipStalledClip(reason) {
+  sendPageEvent('playback_stall', reason + ' clip=' + clipName(health.currentClip));
+  const now = Date.now();
+  _stallEpisodes.push(now);
+  while (_stallEpisodes.length && now - _stallEpisodes[0] > 10 * 60 * 1000) _stallEpisodes.shift();
+  health.stallCount = 0;
+  health.lastProgressAt = performance.now();
+  if (_stallEpisodes.length >= 3) {
+    const last = +(sessionStorage.getItem('aivtWatchdogReload') || 0);
+    if (now - last > 10 * 60 * 1000) {
+      sessionStorage.setItem('aivtWatchdogReload', String(now));
+      sendPageEvent('watchdog_reload', 'stall episodes=' + _stallEpisodes.length);
+      setTimeout(() => location.reload(), 300);
+      return;
+    }
+  }
+  onClipEnded();   // 通常の「次のクリップへ」と同じ経路で進める
+}
+
+function recoverStall(el, stallSec) {
+  health.stallCount++;
+  sendPageEvent('playback_stall',
+    'try=' + health.stallCount + ' clip=' + clipName(health.currentClip) +
+    ' stall=' + stallSec.toFixed(0) + 's readyState=' + el.readyState +
+    ' networkState=' + el.networkState + ' paused=' + el.paused);
+  health.lastProgressAt = performance.now();   // 次の判定まで猶予を与える
+  if (health.stallCount === 1) {
+    const p = el.play(); if (p) p.catch(() => {});
+  } else if (health.stallCount === 2) {
+    if (health.currentClip) { el.src = health.currentClip; el.load(); }
+    const p = el.play(); if (p) p.catch(() => {});
+  } else {
+    skipStalledClip('unrecoverable');
+  }
+}
+
+setInterval(() => {
+  renderStatus();
+  const el = els[front];
+  if (!el || !health.currentClip) return;
+  const now = performance.now();
+  const ct = el.currentTime || 0;
+  const delta = ct - health.lastTime;
+  if (health.lastTime >= 0 && delta > 0.03 && delta < 1.5) {
+    health.progressSec += delta;
+    health.lastTime = ct;
+    health.lastProgressAt = now;
+    health.stallCount = 0;
+  } else if (health.lastTime < 0) {
+    health.lastTime = ct;
+  }
+  const stallSec = (now - health.lastProgressAt) / 1000;
+  if (el.ended) {
+    // ended イベントを取りこぼすと末尾フレームで止まり続ける。通常は起きない保険
+    if (stallSec > 4) { health.lastProgressAt = now; onClipEnded(); }
+    return;
+  }
+  if (stallSec > STALL_SEC) recoverStall(el, stallSec);
+}, 1000);
+
+// ハートビート：3秒ごとに「生きていて、再生が進んでいる」ことを送る
+setInterval(() => {
+  const el = els[front];
+  sendToHub({
+    type: 'heartbeat', character: MY_CHAR, page: 'video',
+    frames: healthFrames(),
+    state_time: el ? +(el.currentTime || 0).toFixed(2) : 0,
+    ready_state: el ? el.readyState : 0,
+    clip: clipName(health.currentClip), mode: mode,
+    context_lost: false,
+  });
+}, 3000);
 function showNotice(msg) {
   const n = document.getElementById('notice');
   n.textContent = msg || '';
@@ -138,8 +297,13 @@ function swapTo(url, { loop = false } = {}) {
   nxt.loop = loop;
   nxt.src = url;
   nxt.currentTime = 0;
+  health.currentClip = url;
+  health.lastTime = -1;
+  health.lastProgressAt = performance.now();
   const p = nxt.play();
-  if (p) p.catch(() => {});
+  if (p) p.catch((err) => {
+    sendPageEvent('play_rejected', 'clip=' + clipName(url) + ' ' + ((err && err.name) || err));
+  });
   nxt.classList.add('active');
   cur.classList.remove('active');
   // 裏になった方は少し遅らせて止める（クロスフェードの残像を残さない）
@@ -270,9 +434,11 @@ function showThought(msg) {
 
 function connectWS() {
   const ws = new WebSocket(`ws://${location.host}/ws/avatar`);
+  health.ws = ws;
   ws.onopen = () => setStatus('connected');
   ws.onclose = () => { setStatus('disconnected'); setTimeout(connectWS, 3000); };
   ws.onmessage = (e) => {
+    health.lastWsAt = performance.now();
     let msg;
     try { msg = JSON.parse(e.data); } catch (err) { return; }
     if (!isMine(msg)) return;

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 from fastapi import WebSocket
@@ -28,6 +29,12 @@ class WebSocketHub:
             "chat": [],      # ローカル1対1チャット画面
         }
         self._lock = asyncio.Lock()
+        # アバターページの生死判定（ページから届くハートビートで更新する。
+        # ページは描画・再生が止まっても WS 接続だけ残ることがあるため、
+        # 接続の有無ではなく「フレーム数が増えているか」で健全性を測る）
+        self._avatar_health: dict[str, dict[str, Any]] = {}
+        self._hb_last_log: dict[str, float] = {}
+        self._hb_stall_warned: dict[str, float] = {}
 
     async def connect(self, ws: WebSocket, channel: str = "dashboard") -> None:
         await ws.accept()
@@ -138,3 +145,80 @@ class WebSocketHub:
 
     async def send_log(self, level: str, message: str) -> None:
         await self.broadcast("dashboard", {"type": "log", "level": level, "message": message})
+
+    # ── ページ → サーバ（ハートビート／イベント） ──────────────
+    #
+    # アバターページは数秒ごとに {"type": "heartbeat", ...} を送り、
+    # 異常時は {"type": "page_event", "event": ..., "detail": ...} を送る。
+    # ここでキャラ別に最終状態を保持し、ログは間引いて残す。
+
+    async def handle_client_message(self, channel: str, data: dict[str, Any]) -> bool:
+        """ページから届いたハートビート／イベントを処理する。処理したら True"""
+        mtype = data.get("type")
+        if mtype == "heartbeat":
+            self._note_heartbeat(channel, data)
+            return True
+        if mtype == "page_event":
+            self._note_page_event(data)
+            return True
+        return False
+
+    def _note_heartbeat(self, channel: str, data: dict[str, Any]) -> None:
+        char = str(data.get("character") or "unknown")
+        now = time.time()
+        frames = data.get("frames")
+        prev = self._avatar_health.get(char)
+        # フレーム数が前回と同値＝描画・再生が進んでいない（接続だけ生きている）
+        stalled = (
+            prev is not None
+            and frames is not None
+            and prev.get("frames") == frames
+            and not data.get("context_lost")
+        )
+        self._avatar_health[char] = {
+            "channel": channel,
+            "page": data.get("page"),
+            "frames": frames,
+            "state_time": data.get("state_time"),
+            "context_lost": bool(data.get("context_lost")),
+            "clip": data.get("clip"),
+            "ready_state": data.get("ready_state"),
+            "mode": data.get("mode"),
+            "received_at": now,
+            "count": (prev.get("count", 0) + 1) if prev else 1,
+            "stalled": stalled,
+        }
+        if stalled:
+            if now - self._hb_stall_warned.get(char, 0.0) >= 30.0:
+                self._hb_stall_warned[char] = now
+                logger.warning(
+                    "Avatar heartbeat stalled", character=char,
+                    frames=frames, clip=data.get("clip"),
+                    state_time=data.get("state_time"),
+                )
+        elif now - self._hb_last_log.get(char, 0.0) >= 60.0:
+            self._hb_last_log[char] = now
+            logger.info(
+                "Avatar heartbeat", character=char, page=data.get("page"),
+                frames=frames, state_time=data.get("state_time"),
+                clip=data.get("clip"), ready_state=data.get("ready_state"),
+            )
+
+    def _note_page_event(self, data: dict[str, Any]) -> None:
+        char = str(data.get("character") or "unknown")
+        event = str(data.get("event") or "unknown")
+        detail = str(data.get("detail") or "")[:300]
+        warn_events = {
+            "context_lost", "page_error", "tick_error", "watchdog_reload",
+            "playback_stall", "media_error", "play_rejected",
+        }
+        # 注意: structlog は "event" をログ本文の引数名として予約しているため、
+        # kwarg 名に event は使えない（event_name に逃がす）
+        if event in warn_events:
+            logger.warning("Avatar page event", character=char, event_name=event, detail=detail)
+        else:
+            logger.info("Avatar page event", character=char, event_name=event, detail=detail)
+
+    def avatar_health(self) -> dict[str, dict[str, Any]]:
+        """キャラ別の最終ハートビート状態（写し）を返す"""
+        return {k: dict(v) for k, v in self._avatar_health.items()}

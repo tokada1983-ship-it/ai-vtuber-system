@@ -66,6 +66,27 @@ LLM_BACKENDS: dict[str, Callable[[LLMBackendConfig], LLMBackend]] = {
 }
 
 
+def _apply_adaptive_ctx(backend: LLMBackend | None,
+                        config: AppConfig) -> LLMBackend | None:
+    """config.llm の num_ctx 適応制御設定をバックエンドへ伝える。
+
+    対応するバックエンド（Ollama）だけが configure_adaptive_ctx を持ち、
+    それ以外は素通りする。HybridRouter の内側にも行き渡らせる
+    （ルーター生成前に内側が印付けされる経路が主だが、念のため再帰する）。
+    """
+    if backend is None:
+        return None
+    from backend.llm.hybrid_router import HybridRouter
+    if isinstance(backend, HybridRouter):
+        _apply_adaptive_ctx(backend.idle_backend, config)
+        _apply_adaptive_ctx(backend.fast_backend, config)
+        return backend
+    setter = getattr(backend, "configure_adaptive_ctx", None)
+    if setter is not None:
+        setter(config.llm)
+    return backend
+
+
 def _apply_protocol(backend: LLMBackend | None,
                     config: AppConfig) -> LLMBackend | None:
     """config.llm.protocol をバックエンドへ伝える（Phase 5 Stage D）。
@@ -73,9 +94,12 @@ def _apply_protocol(backend: LLMBackend | None,
     バックエンドはこれを見てパーサ（JSON / タグ）を切り替え、Ollama は
     format:json の送信を抑える。is_persona と同じ「生成時に印を付ける」
     方式で、config 側の単一の切替点（llm.protocol）から全体に行き渡る。
+    あわせて num_ctx 適応制御の設定（llm.adaptive_ctx 等）もここから
+    行き渡らせる（生成時の印付けはこの1箇所に集約する）。
     """
     if backend is not None:
         backend.protocol = str(config.llm.protocol or "json").lower()
+        _apply_adaptive_ctx(backend, config)
     return backend
 
 

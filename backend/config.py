@@ -88,6 +88,24 @@ class LLMConfig(BaseModel):
     # プロンプトのフォーマット節・パーサ・計測が一体で切り替わる。
     # "json" に戻せば従来動作に完全復帰する（ロールバック経路）
     protocol: str = "json"
+    # num_ctx 適応制御（Ollama のみ。2026-11-19 問題2対策の恒久化）:
+    # プロンプトが num_ctx に達して生成枠が潰れる事故を受け、固定値では
+    # なく生成ごとの prompt_eval_count を見て段（context_tiers）を自動で
+    # 上げ下げする。上げる条件は「現段の context_raise_ratio 超」または
+    # done_reason=length、下げる条件は「現段の context_lower_ratio 未満が
+    # 持続（context_lower_turns 回連続 or context_lower_window_sec 秒）」。
+    # 段の適用はターン境界のみで、適用後は context_cooldown_sec の間は
+    # 再変更しない。adaptive_ctx=False で従来動作（各バックエンドの
+    # extra_payload に書かれた num_ctx 固定）に戻る。
+    adaptive_ctx: bool = True
+    context_tiers: list[int] = Field(
+        default_factory=lambda: [4096, 6144, 8192, 12288, 16384])
+    context_initial: int = 8192
+    context_raise_ratio: float = 0.85
+    context_lower_ratio: float = 0.45
+    context_cooldown_sec: float = 300.0
+    context_lower_turns: int = 50
+    context_lower_window_sec: float = 1800.0
     backends: dict[str, LLMBackendConfig] = Field(default_factory=dict)
     hybrid: HybridLLMConfig = Field(default_factory=HybridLLMConfig)
 

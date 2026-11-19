@@ -32,6 +32,7 @@ class HybridRouter(LLMBackend):
     def __init__(self, idle_backend: LLMBackend, fast_backend: LLMBackend):
         self._idle = idle_backend
         self._fast = fast_backend
+        self._last_served: LLMBackend | None = None  # 直近に生成した内側
 
     # ── 振り分け ──────────────────────────────────────────────
 
@@ -54,6 +55,7 @@ class HybridRouter(LLMBackend):
         temperature: float | None = None,
     ) -> LLMResponse:
         backend = self._pick(route)
+        self._last_served = backend
         # 温度の上書きは指定されたときだけ内側へ渡す（未指定時の呼び出し
         # 形状は従来どおりに保ち、温度引数を持たない実装とも共存する）
         extra = {"temperature": temperature} if temperature is not None else {}
@@ -61,6 +63,7 @@ class HybridRouter(LLMBackend):
         if route != "idle" and backend is self._fast and (result.skip or not result.speech):
             # クラウドの空振りはローカルで拾い直す（1回だけ）
             logger.warning("HybridRouter: fast backend returned empty, retrying on idle backend")
+            self._last_served = self._idle
             retry = await self._idle.generate(system_prompt, messages, **extra)
             if not retry.skip and retry.speech:
                 return retry
@@ -75,6 +78,7 @@ class HybridRouter(LLMBackend):
         temperature: float | None = None,
     ) -> AsyncIterator[str]:
         backend = self._pick(route)
+        self._last_served = backend
         extra = {"temperature": temperature} if temperature is not None else {}
         produced = False
         async for delta in backend.generate_stream(system_prompt, messages, **extra):
@@ -83,8 +87,24 @@ class HybridRouter(LLMBackend):
         if not produced and route != "idle" and backend is self._fast:
             # 1文字も出なかったときだけローカルで流し直す（途中失敗の二重発話は防ぐ）
             logger.warning("HybridRouter: fast stream produced nothing, retrying on idle backend")
+            self._last_served = self._idle
             async for delta in self._idle.generate_stream(system_prompt, messages, **extra):
                 yield delta
+
+    def last_generation_meta(self) -> dict:
+        """直近に実際に生成した内側バックエンドの生成メタを返す"""
+        backend = self._last_served or self._idle
+        return backend.last_generation_meta()
+
+    def begin_turn(self) -> None:
+        """ターン境界の通知を内側バックエンドへ委譲する（適応 num_ctx 用）"""
+        for backend in (self._idle, self._fast):
+            backend.begin_turn()
+
+    def context_status(self) -> dict:
+        """コンテキスト枠の状態は待機系（ローカル）のものを代表させる"""
+        status = self._idle.context_status()
+        return status if status else self._fast.context_status()
 
     async def probe(self) -> bool:
         """プライマリ（待機系＝ローカル）の回復確認を内側へ委譲する。

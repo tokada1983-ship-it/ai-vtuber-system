@@ -26,8 +26,9 @@ from pathlib import Path
 from backend.llm.parser import (PARSE_OUTCOME_FATAL, PARSE_OUTCOME_OK,
                                 PARSE_OUTCOME_SALVAGED,
                                 TAG_OUTCOME_DEGRADED, TAG_OUTCOME_FATAL,
-                                TAG_OUTCOME_OK, contains_meta_leak,
-                                dedupe_repeated_sentences,
+                                TAG_OUTCOME_NO_SPEECH, TAG_OUTCOME_OK,
+                                contains_meta_leak,
+                                dedupe_repeated_sentences, log_tag_no_speech,
                                 parse_llm_output, record_parse_outcome,
                                 record_tag_parse_outcome, scan_tag_output,
                                 strip_think_tags, truncate_at_meta_leak)
@@ -483,9 +484,10 @@ class TagSpeechStreamParser(SpeechStreamParser):
     def build_response(self) -> LLMResponse:
         """ストリーム全体から最終的な LLMResponse を作り、計測する。
 
-        計測区分は PROTOCOL §4-5（ok / degraded / fatal）。タグだけの
-        出力（skip の意思表示）は JSON 方式の skip:true と同様に
-        ok として数える。発話の安全検査（メタ漏れ等）は払い出し時に
+        計測区分は PROTOCOL §4-5（ok / degraded / fatal）に no_speech を
+        加えたもの。タグだけの出力（両タグ完備＋本文なし）は skip の
+        意思表示かもしれないが、ヘッダ直後で止まった生成と区別できない
+        ため ok には数えない。発話の安全検査（メタ漏れ等）は払い出し時に
         orchestrator が文単位で行っているため、ここでは行わない。
         """
         text = strip_think_tags(self._raw)
@@ -494,8 +496,8 @@ class TagSpeechStreamParser(SpeechStreamParser):
         speech = scan.speech.strip()
         if not speech:
             if scan.emotion_raw and scan.motion_raw:
-                record_tag_parse_outcome(
-                    TAG_OUTCOME_DEGRADED if scan.issues else TAG_OUTCOME_OK)
+                # 両タグ完備＋本文なしは ok と分離して数える（計測是正）
+                record_tag_parse_outcome(TAG_OUTCOME_NO_SPEECH)
             else:
                 record_tag_parse_outcome(TAG_OUTCOME_FATAL)
             return LLMResponse(speech="", skip=True, raw={"protocol": "tag"})
@@ -511,3 +513,26 @@ class TagSpeechStreamParser(SpeechStreamParser):
             effect=scan.effect,
             thought=scan.thought.strip(),
         )
+
+    def report_no_speech(self, gen_meta: dict | None = None) -> str:
+        """ストリームが1文も生まなかった生成の計測と診断ログ。
+
+        build_response は発話が成立したときしか呼ばれないため、無発話で
+        終わったストリームは従来どの区分にも数えられず、内訳が見えな
+        かった。最終走査で本文が無い場合に限り、「両タグ完備＋本文なし」
+        なら no_speech、それ以外（ヘッダ途中で切断・空）なら fatal と
+        して数え、生出力と生成メタを警告に残す。戻り値は記録した区分
+        （本文があった場合は "" で、何も記録しない）。
+        """
+        text = strip_think_tags(self._raw)
+        scan = scan_tag_output(text, final=True, flip_names=self._flip_names)
+        self._scan = scan
+        if scan.speech.strip():
+            return ""
+        if scan.emotion_raw and scan.motion_raw:
+            outcome = TAG_OUTCOME_NO_SPEECH
+        else:
+            outcome = TAG_OUTCOME_FATAL
+        record_tag_parse_outcome(outcome)
+        log_tag_no_speech(self._raw, source="streaming", gen_meta=gen_meta)
+        return outcome

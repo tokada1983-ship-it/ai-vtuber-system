@@ -82,6 +82,13 @@ async def websocket_endpoint(ws: WebSocket, channel: str):
             cmd = data.get("cmd")
             if cmd:
                 await _handle_ws_cmd(cmd, data, ws=ws)
+            elif data.get("type") in ("heartbeat", "page_event"):
+                # アバターページの生死判定（ハートビート）と異常通知。
+                # テレメトリ処理の失敗で本筋の接続を落とさないよう、ここで例外を隔離する
+                try:
+                    await hub.handle_client_message(channel, data)
+                except Exception as e:
+                    logger.warning("WS client message error", channel=channel, error=str(e))
     except WebSocketDisconnect:
         await hub.disconnect(ws, channel)
     except Exception as e:

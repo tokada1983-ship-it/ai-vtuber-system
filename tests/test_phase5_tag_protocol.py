@@ -1,7 +1,7 @@
 """Phase 5 Stage D（タグ方式の消費側移行）のテスト
 
 - parse_tag_output / scan_tag_output: タグ走査、タグ破損時の発話成立、
-  fx/th の配送形、ok / degraded / fatal の計測（JSON 側と分離）
+  fx/th の配送形、ok / degraded / fatal / no_speech の計測（JSON 側と分離）
 - TagSpeechStreamParser: タグの途中で分割されても文が正しく出ること、
   peek / extract_effect / extract_thought / build_response
 - プロンプト: protocol=tag でフォーマット節・fx節・th節がタグ記法に
@@ -47,7 +47,8 @@ class TestParseTagOutput:
         assert resp.speech == SPEECH_TEXT
         assert resp.emotion.value == "happy"
         assert resp.motion.value == "wave"
-        assert _delta(before, after) == {"ok": 1, "degraded": 0, "fatal": 0}
+        assert _delta(before, after) == {"ok": 1, "degraded": 0, "fatal": 0,
+                                         "no_speech": 0}
 
     def test_fx_and_thought_extracted(self):
         resp = parse_tag_output(
@@ -88,12 +89,15 @@ class TestParseTagOutput:
         resp = parse_tag_output("[emo:happy][mot:nod]これは[注意]テストだよ。")
         assert resp.speech == "これはテストだよ。"
 
-    def test_tags_only_is_skip_and_counts_ok(self):
+    def test_tags_only_is_skip_and_counts_no_speech(self):
+        # 両タグ完備＋本文なしは ok ではなく no_speech に分離して数える
+        # （2026-11-19 計測是正。従来は counts_ok として ok に入っていた）
         before = tag_parse_outcome_stats()
         resp = parse_tag_output("[emo:neutral][mot:idle]")
         after = tag_parse_outcome_stats()
         assert resp.skip and resp.speech == ""
-        assert _delta(before, after) == {"ok": 1, "degraded": 0, "fatal": 0}
+        assert _delta(before, after) == {"ok": 0, "degraded": 0, "fatal": 0,
+                                         "no_speech": 1}
 
     def test_empty_output_is_fatal(self):
         before = tag_parse_outcome_stats()

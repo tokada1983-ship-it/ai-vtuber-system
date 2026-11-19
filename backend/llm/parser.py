@@ -501,22 +501,27 @@ def parse_llm_output(raw_text: str, _count: bool = True) -> LLMResponse:
 # ── タグ方式パーサ（Phase 5 Stage D） ─────────────────────────
 # PROTOCOL.md の文法 `[emo:][mot:]発話[fx:][th:]` を解釈する。
 # JSON 方式と違い、タグが欠落・破損しても発話本文は成立させる。
-# 計測は ok / degraded / fatal の3区分（PROTOCOL §4-5）で、JSON 側の
-# parse_outcomes とは別カウンタに分ける（knowledge_status は
-# protocol に応じて片方だけを出す）。
+# 計測は ok / degraded / fatal / no_speech の区分（PROTOCOL §4-5 に
+# no_speech を追加）で、JSON 側の parse_outcomes とは別カウンタに
+# 分ける（knowledge_status は protocol に応じて片方だけを出す）。
 
 TAG_OUTCOME_OK = "ok"
 TAG_OUTCOME_DEGRADED = "degraded"
 TAG_OUTCOME_FATAL = "fatal"
+# 両タグ完備＋本文なし。PROTOCOL §3 では skip の意思表示だが、意図せず
+# ヘッダ直後で生成が止まったケースと区別がつかないため、ok から分離
+# して数える（2026-11-19 の配信テストで多発した件の計測是正）
+TAG_OUTCOME_NO_SPEECH = "no_speech"
 _tag_parse_outcomes: dict[str, int] = {
     TAG_OUTCOME_OK: 0,
     TAG_OUTCOME_DEGRADED: 0,
     TAG_OUTCOME_FATAL: 0,
+    TAG_OUTCOME_NO_SPEECH: 0,
 }
 
 
 def tag_parse_outcome_stats() -> dict[str, int]:
-    """タグ方式パース結果の累計（ok / degraded / fatal）"""
+    """タグ方式パース結果の累計（ok / degraded / fatal / no_speech）"""
     return dict(_tag_parse_outcomes)
 
 
@@ -524,6 +529,38 @@ def record_tag_parse_outcome(outcome: str) -> None:
     """タグ方式のパース結果を1件数える"""
     if outcome in _tag_parse_outcomes:
         _tag_parse_outcomes[outcome] += 1
+
+
+def tag_no_speech_fields(raw_text: str,
+                         gen_meta: dict | None = None) -> dict:
+    """no-speech 診断用のログフィールドを組み立てる。
+
+    strip 前の生出力プレビュー、思考タグ除去で消えた文字数、バックエンドが
+    保持した生成メタ（done_reason / eval_count / 思考フィールドの文字数）を
+    返す。2026-11-19 の配信テストでは strip 後の断片しかログに残らず、
+    「思考チャネルが生成予算を食って本文が切れた」のか「ヘッダ直後で
+    EOS した」のか切り分けできなかったための観測追加。
+    """
+    raw = raw_text or ""
+    stripped = strip_think_tags(raw)
+    meta = gen_meta or {}
+    return {
+        "raw_preview": raw[:300],
+        "after_strip_preview": stripped.strip()[:300],
+        "think_stripped_chars": len(raw) - len(stripped),
+        "thinking_chars": meta.get("thinking_chars"),
+        "done_reason": meta.get("done_reason"),
+        "eval_count": meta.get("eval_count"),
+        # プロンプト側のトークン数。num_ctx に近ければコンテキスト溢れ
+        "prompt_eval_count": meta.get("prompt_eval_count"),
+    }
+
+
+def log_tag_no_speech(raw_text: str, *, source: str,
+                      gen_meta: dict | None = None) -> None:
+    """タグ方式で発話が得られなかった生成を、診断情報つきで警告に残す"""
+    logger.warning("No speech in tag output", source=source,
+                   **tag_no_speech_fields(raw_text, gen_meta))
 
 
 _TAG_TOKEN_RE = re.compile(r"\[(emo|mot|fx|th):([^\[\]]*)\]")
@@ -686,16 +723,20 @@ def scan_tag_output(text: str, *, final: bool = True,
 
 
 def parse_tag_output(raw_text: str, _count: bool = True,
-                     flip_names=None) -> LLMResponse:
+                     flip_names=None,
+                     gen_meta: dict | None = None) -> LLMResponse:
     """タグ方式の全文パース（非ストリーミング経路用）。
 
     JSON 方式の parse_llm_output と同じ安全基準（思考タグ除去・
     メタ漏れ遮断・同一文の繰り返し除去）を適用し、タグが壊れて
     いても発話が成立すれば返す。失敗時は skip=True（例外は投げない）。
+
+    gen_meta はバックエンドが保持した生成メタ（done_reason 等）。
+    no-speech の警告ログに診断情報として添える。
     """
-    text = (raw_text or "").strip()
-    logger.debug("LLM raw output (tag)", preview=text[:200])
-    text = strip_think_tags(text).strip()
+    raw_in = (raw_text or "").strip()
+    logger.debug("LLM raw output (tag)", preview=raw_in[:200])
+    text = strip_think_tags(raw_in).strip()
     text = re.sub(r"```(?:json|text)?\s*", "", text)
     text = re.sub(r"```", "", text).strip()
 
@@ -703,16 +744,16 @@ def parse_tag_output(raw_text: str, _count: bool = True,
     speech = scan.speech.strip()
 
     if not speech:
-        # タグだけの出力は skip の意思表示（PROTOCOL §3）。JSON 方式で
-        # skip:true が ok に数えられるのと揃え、致命にはしない
+        # タグだけの出力は skip の意思表示（PROTOCOL §3）だが、意図せず
+        # ヘッダ直後で止まった生成と区別できないため、ok には数えず
+        # no_speech として分離する（2026-11-19 計測是正）
         if scan.emotion_raw and scan.motion_raw:
             if _count:
-                record_tag_parse_outcome(
-                    TAG_OUTCOME_DEGRADED if scan.issues else TAG_OUTCOME_OK)
+                record_tag_parse_outcome(TAG_OUTCOME_NO_SPEECH)
             return LLMResponse(speech="", skip=True, raw={"protocol": "tag"})
         if _count:
             record_tag_parse_outcome(TAG_OUTCOME_FATAL)
-        logger.warning("No speech in tag output", raw_preview=text[:300])
+        log_tag_no_speech(raw_in, source="non-streaming", gen_meta=gen_meta)
         return LLMResponse(speech="", skip=True)
 
     if _count:

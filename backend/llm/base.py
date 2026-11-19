@@ -68,6 +68,30 @@ class LLMBackend(ABC):
                 "skip": False,
             }, ensure_ascii=False)
 
+    def begin_turn(self) -> None:
+        """ターン境界の通知。既定は無動作。
+
+        段の適用をターン境界に限定する仕組み（適応 num_ctx など）が、
+        次の発話ターンの開始前に保留中の変更を反映するために使う。
+        対応するバックエンド（Ollama）だけが上書きする。
+        """
+
+    def context_status(self) -> dict:
+        """コンテキスト枠の状態（適応 num_ctx の現在段・直近の
+        prompt_eval_count など）。対応するバックエンドだけが値を返し、
+        それ以外は空 dict。knowledge_status がキャラ別に集める。
+        """
+        return {}
+
+    def last_generation_meta(self) -> dict:
+        """直近の生成メタ（done_reason / eval_count / thinking 文字数など）。
+
+        保持しているバックエンド（Ollama）だけが値を返し、それ以外は
+        空 dict。no-speech 失敗の切り分け（思考が生成予算を食ったか、
+        ヘッダ直後で EOS したか）に使う。
+        """
+        return dict(getattr(self, "_last_gen_meta", {}) or {})
+
     async def aclose(self) -> None:
         """保持している接続を閉じる（バックエンドを作り直す前に呼ばれる）"""
 

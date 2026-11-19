@@ -47,10 +47,12 @@ from backend.llm.prompt_builder import (
     _speech_limit,
 )
 from backend.llm.streaming import SpeechStreamParser, TagSpeechStreamParser
-from backend.llm.parser import (contains_meta_leak,
+from backend.llm.parser import (TAG_OUTCOME_FATAL, TAG_OUTCOME_NO_SPEECH,
+                                contains_meta_leak,
                                 dedupe_repeated_sentences,
                                 parse_outcome_stats,
-                                strip_greeting_template)
+                                strip_greeting_template,
+                                tag_parse_outcome_stats)
 from backend.logger import get_logger
 from backend.memory.reflection_engine import ReflectionEngine
 from backend.mind.mind_loop import (MindLoop, find_relevant_opinions,
@@ -83,6 +85,8 @@ class _StreamSpeakResult:
     spoke: bool = False                  # 1文でも実際に発話したか
     blocked: str = ""                    # 応答後フィルタで中断した理由
     spoken: list[str] = dataclasses.field(default_factory=list)  # 実際に喋った文
+    tag_no_speech: bool = False          # タグ方式で本文なしに終わったか
+    gen_meta: dict = dataclasses.field(default_factory=dict)  # 生成メタ（done_reason等）
 
 
 @dataclasses.dataclass(order=True)
@@ -145,6 +149,13 @@ class Orchestrator:
     _PREFETCH_TTL_SEC = 120.0
     _RECOVERY_TEMP_MAX = 1.2       # 上乗せ後の上限
     _TEMP_OVERRIDE_TTL_SEC = 120.0  # 温度上書きが消費されなかった場合の失効
+    # no-speech 対策（2026-11-19）: ヘッダのみで終わる生成への再試行は
+    # 同一条件にせず温度を下げ、回復時の温度上昇は no-speech 系の失敗
+    # では使わない。idle 1ターンあたりの生成回数にも上限を設ける
+    _NOSPEECH_TEMP_DROP = 0.3      # フォールバック再試行での温度の下げ幅
+    _NOSPEECH_TEMP_FLOOR = 0.2     # 下げた温度の下限
+    _IDLE_TURN_GEN_CAP = 6         # idle 1ターンあたりの生成回数上限
+    _NOSPEECH_TURN_LIMIT = 2       # idle 1ターンで許す no-speech 系失敗数
     # Phase 4: failback はプローブの連続成功がこの回数に達したら行う
     _FAILBACK_PROBE_SUCCESSES = 2
 
@@ -275,6 +286,8 @@ class Orchestrator:
         self._theme_hint_consumed_gram: str = ""  # ヒント消費直後の検証用（gram）
         # 回復リトライ1回目の温度上書き（Phase 4）: キャラkey → (温度, 失効時刻)
         self._temp_override: dict[str, tuple[float, float]] = {}
+        # no-speech 対策（2026-11-19）: idle ターン内の生成予算（None=無制限）
+        self._gen_budget: int | None = None
         # failback 用プローブの連続成功回数（キャラkey → 回数。Phase 4）
         self._failback_probe_success: dict[str, int] = {}
         self._saturation_events: list[tuple[float, str]] = []  # (時刻, 語) 吸着の発火履歴
@@ -745,6 +758,10 @@ class Orchestrator:
             "news": self._news.status() if self._news else None,
             "planner": self._planner.status() if self._planner else None,
             "parse_outcomes": parse_outcome_stats(self._cfg.llm.protocol),
+            "llm_context": {
+                agent.key: agent.llm.context_status()
+                for agent in self._agents if agent.llm is not None
+            },
             "autonomous_topic": {
                 "enabled": self._cfg.knowledge.autonomous_topic.enabled,
                 "weights": self._cfg.knowledge.autonomous_topic.weights,
@@ -2655,6 +2672,7 @@ class Orchestrator:
         取れなければ従来どおり記憶のキーワードから話す（ネット不要のフォールバック）。
         掛け合い中は、しばらく喋っていない方が話題を振り、相方が受ける。
         """
+        self._gen_budget = None  # 前ターンの予算が残っていたら掃除する
         speaker = agent or self._director.pick_idle_speaker(self._agents)
         if agent is None and len(self._agents) > 1:
             # 回復フローでクールダウン中の話者は選ばない（director は
@@ -2791,6 +2809,10 @@ class Orchestrator:
         idle_repeat = False
         current = speaker
         attempt = 0
+        # no-speech 対策（2026-11-19）: このターンの生成予算と、
+        # no-speech 系失敗の累計を初期化する
+        self._gen_budget = self._IDLE_TURN_GEN_CAP
+        no_speech_failures = 0
         while response is None and attempt < 3:
             attempt += 1
             if attempt > 1:
@@ -2828,6 +2850,7 @@ class Orchestrator:
                             self._cfg, long_term_memory_text=idle_mem,
                             **current.prompt_kwargs())
 
+                    failures_before = self._tag_failure_count()
                     response = await self._generate_and_speak(
                         system_prompt, current, route="idle",
                         compact_retry=attempt >= 2)
@@ -2854,13 +2877,31 @@ class Orchestrator:
 
             if response is not None:
                 break
+            # この試行の失敗が no-speech 系（ヘッダのみ・本文なし）
+            # だったかを数える
+            no_speech_failures += max(
+                0, self._tag_failure_count() - failures_before)
+            if no_speech_failures >= self._NOSPEECH_TURN_LIMIT:
+                # ヘッダのみの失敗を繰り返しても条件は好転しない。
+                # 生成を打ち切ってフォールバック台詞に委ねる
+                logger.info("idle speech recovery: stopping retries "
+                            "(no-speech cap)", character=current.name,
+                            no_speech_failures=no_speech_failures)
+                break
             if attempt == 1:
                 # 1回目の失敗: 回復ヒントを積んで同じ話者で再生成する。
-                # あわせて再生成の温度も少し上げ、生成条件自体を変える（Phase 4）
+                # 通常は再生成の温度も少し上げて生成条件自体を変える
+                # （Phase 4）が、no-speech 系の失敗では温度上昇が
+                # 逆効果になるため、ヒントのみにする（2026-11-19）
                 self._recovery_hint_pending = current.key
-                self._arm_recovery_temperature(current)
-                logger.info("idle speech recovery: retry with hint",
-                            character=current.name)
+                if no_speech_failures:
+                    logger.info("idle speech recovery: retry with hint "
+                                "(no temperature raise; no-speech failure)",
+                                character=current.name)
+                else:
+                    self._arm_recovery_temperature(current)
+                    logger.info("idle speech recovery: retry with hint",
+                                character=current.name)
             elif attempt == 2:
                 # 2回目の失敗: 話者を交代し、詰まった側をしばらく選ばない
                 partner = self._other_agent(current)
@@ -2872,6 +2913,8 @@ class Orchestrator:
                             from_character=current.name,
                             to_character=partner.name)
                 current = partner
+
+        self._gen_budget = None
 
         if response is None:
             # それでも喋れなければ、定型の繋ぎ台詞で無言を必ず回避する
@@ -2890,19 +2933,50 @@ class Orchestrator:
             self._schedule_consolidation()
             self._maybe_start_prefetch()
 
+    def _backend_base_temperature(self, agent: CharacterAgent) -> float:
+        """そのキャラの待機系バックエンドのベース温度（取れなければ 0.8）"""
+        base = 0.8
+        llm = agent.llm
+        inner = getattr(llm, "idle_backend", llm) if llm is not None else None
+        cfg = getattr(inner, "_cfg", None) if inner is not None else None
+        if cfg is not None:
+            try:
+                base = float(getattr(cfg, "temperature", base))
+            except (TypeError, ValueError):
+                pass
+        return base
+
+    def _tag_failure_count(self) -> int:
+        """タグ方式の失敗系（fatal + no_speech）の累計。json 方式では 0。
+
+        生成の前後で差分を取ることで、その生成の失敗が no-speech 系
+        （ヘッダのみ・本文なし）だったかを判定する。
+        """
+        if str(self._cfg.llm.protocol or "json").lower() != "tag":
+            return 0
+        stats = tag_parse_outcome_stats()
+        return stats.get(TAG_OUTCOME_FATAL, 0) \
+            + stats.get(TAG_OUTCOME_NO_SPEECH, 0)
+
+    def _consume_gen_budget(self) -> bool:
+        """idle ターンの生成予算を1つ消費する。予算外（None）なら常に True"""
+        if self._gen_budget is None:
+            return True
+        if self._gen_budget <= 0:
+            return False
+        self._gen_budget -= 1
+        return True
+
     def _arm_recovery_temperature(self, agent: CharacterAgent) -> None:
         """回復リトライ1回目の再生成だけ、生成温度を少し上げて条件を変える。
 
         ベース温度はそのキャラの待機系バックエンド設定から読む（取れなければ
         既定の 0.8）。上書きは _generate_and_speak の idle 経路で1回だけ
         消費され、消費されなくても短時間で失効する（Phase 4）。
+        なお no-speech 系の失敗では呼び出し側が装填自体を止める
+        （温度上昇は「ヘッダ直後で止まる」生成には逆効果。2026-11-19）。
         """
-        base = 0.8
-        llm = agent.llm
-        inner = getattr(llm, "idle_backend", llm) if llm is not None else None
-        cfg = getattr(inner, "_cfg", None) if inner is not None else None
-        if cfg is not None:
-            base = float(getattr(cfg, "temperature", base))
+        base = self._backend_base_temperature(agent)
         raised = min(base + self._RECOVERY_TEMP_RAISE, self._RECOVERY_TEMP_MAX)
         self._temp_override[agent.key] = (
             raised, time.monotonic() + self._TEMP_OVERRIDE_TTL_SEC)
@@ -3001,13 +3075,20 @@ class Orchestrator:
         response: LLMResponse | None = None
         actions: list = []
         for attempt in range(2):
+            failures_before = self._tag_failure_count()
             response, actions = await self._generate_idle_response(
                 system_prompt, speaker)
             if response is not None:
                 break
             if attempt == 0:
                 self._recovery_hint_pending = speaker.key
-                self._arm_recovery_temperature(speaker)
+                if self._tag_failure_count() > failures_before:
+                    # no-speech 系の失敗では温度を上げない（本経路と同方針）
+                    logger.info("prefetch recovery: hint only "
+                                "(no temperature raise; no-speech failure)",
+                                character=speaker.name)
+                else:
+                    self._arm_recovery_temperature(speaker)
         if response is None:
             if topic is not None and self._planner is not None:
                 try:
@@ -3046,6 +3127,9 @@ class Orchestrator:
         llm = agent.llm
         if not llm:
             return None, []
+        # 先行生成は「次のターン」の生成なので、ここもターン境界として
+        # 適応 num_ctx の段変更を適用する
+        llm.begin_turn()
         temperature: float | None = None
         armed = self._temp_override.pop(agent.key, None)
         if armed is not None and time.monotonic() <= armed[1]:
@@ -3167,6 +3251,9 @@ class Orchestrator:
         llm = agent.llm
         if not llm:
             return None
+        # ターン境界: 適応 num_ctx の保留中の段変更はここでだけ適用する
+        # （生成の途中で段が変わらないようにするため）
+        llm.begin_turn()
         # 回復リトライ用に温度の上書きが積まれていれば、この生成（idle
         # 経路のみ）で消費する。期限切れの上書きは捨てる（Phase 4）
         temperature: float | None = None
@@ -3204,6 +3291,11 @@ class Orchestrator:
             and llm.supports_streaming
             and agent.tts is not None
         )
+        if route == "idle" and not self._consume_gen_budget():
+            # idle ターンの生成予算を使い切った（_speak_idle が設定する）
+            logger.info("idle generation budget exhausted",
+                        character=agent.name)
+            return None
         if use_stream:
             result = await self._speak_streaming(system_prompt, messages, agent,
                                                  allow_intro=allow_intro,
@@ -3222,9 +3314,39 @@ class Orchestrator:
             # 1文も喋れていないので、一括生成でやり直す（二重発話にはならない）
             logger.info("Streaming produced no speech, falling back to non-streaming")
 
+        if use_stream and route == "idle" \
+                and not self._consume_gen_budget():
+            # ストリーミングで予算を使い切った場合は一括再試行もしない
+            logger.info("idle generation budget exhausted before fallback",
+                        character=agent.name)
+            return None
         # 温度の上書きは指定があるときだけ渡す（未指定時の呼び出し形状は
         # 従来どおりに保ち、温度引数を持たない実装とも共存する）
         gen_extra = {"temperature": temperature} if temperature is not None else {}
+        if use_stream and result.tag_no_speech:
+            # ヘッダのみで終わった生成の一括再試行は同一条件にしない。
+            # 温度を下げて「ヘッダ直後で止まる」サンプリングから外しにいく
+            # （回復の温度上書きが積まれていても、こちらを優先する）
+            effective = temperature if temperature is not None \
+                else self._backend_base_temperature(agent)
+            lowered = max(effective - self._NOSPEECH_TEMP_DROP,
+                          self._NOSPEECH_TEMP_FLOOR)
+            gen_extra = {"temperature": lowered}
+            if result.gen_meta.get("done_reason") == "length":
+                # コンテキスト溢れ（プロンプトが num_ctx に達して生成枠が
+                # 数トークンしか残っていない）で切れた生成は、温度を変えても
+                # 決定的に再び切れる。文脈を直近だけに切り詰めて生成枠を
+                # 確保する（P1-D の compact retry と同じ考え方）
+                messages = messages[-self._COMPACT_RETRY_MESSAGES:]
+                logger.info("non-streaming retry with compact context "
+                            "(tag no-speech, length-truncated)",
+                            character=agent.name, temperature=lowered,
+                            prompt_eval_count=result.gen_meta.get(
+                                "prompt_eval_count"))
+            else:
+                logger.info("non-streaming retry with lowered temperature "
+                            "(tag no-speech)", character=agent.name,
+                            temperature=lowered)
         response = await llm.generate(system_prompt, messages, route=route,
                                       **gen_extra)
         if response.skip or not response.speech:
@@ -3570,6 +3692,20 @@ class Orchestrator:
                 leftover = synth_queue.get_nowait()
                 if leftover:
                     leftover[2].cancel()
+
+        if not state.spoke and isinstance(parser, TagSpeechStreamParser):
+            # タグ方式で1文も生まなかったストリームは、計測と診断ログに
+            # 残す（従来はフォールバック先の成否に埋もれて内訳が見えず、
+            # 成功率が実態より良く見えていた。2026-11-19 観測追加）
+            meta: dict = {}
+            try:
+                if agent.llm is not None:
+                    meta = agent.llm.last_generation_meta()
+            except Exception:
+                meta = {}
+            state.gen_meta = meta
+            if parser.report_no_speech(meta):
+                state.tag_no_speech = True
 
         if state.spoke:
             # エフェクトはJSON末尾にあるため、生成完了が発話消費より遅れた
