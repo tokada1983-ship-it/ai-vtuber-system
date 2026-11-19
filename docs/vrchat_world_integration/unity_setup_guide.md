@@ -106,4 +106,4 @@ VRMアバターをUnityで扱うための公式パッケージです。
 - **移動**: `{"cmd": "unity_move", "x": 3.0, "y": 0.0, "z": 5.0}` (座標 3.0, 0, 5.0 へNavMeshで歩いて移動)
 - **座る**: `{"cmd": "unity_action", "action": "sit", "target": "Gimmick_Chair"}`
 - **立ち上がる**: `{"cmd": "unity_action", "action": "stand"}`
-- **LLMでの自律動作**: LLM（サンプル等）の発話中に `[action: walk_to, target: 1.0,0,3.5]` のような文字列が含まれていると、AI VTuberは自動的にその指示を解釈し、歩き出します。
+- **LLMでの自律動作**: LLM（Character1等）の発話中に `[action: walk_to, target: 1.0,0,3.5]` のような文字列が含まれていると、AI VTuberは自動的にその指示を解釈し、歩き出します。

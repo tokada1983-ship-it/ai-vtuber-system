@@ -79,14 +79,15 @@ flowchart TB
 | 進行役 | `backend/orchestrator.py` | コメントキュー、発話パイプライン統括、知識の仕入れ、BGM、音声入力、状態配信 |
 | 掛け合い演出 | `backend/ensemble/`（CharacterAgent / TurnDirector） | キャラごとの状態保持と、「次に誰が喋るか」の決定 |
 | コメントソース | `backend/sources/` | YouTube（pytchat / Data API）、Twitch、ツイキャス、ローカルチャット、モック |
-| LLM | `backend/llm/` | バックエンド実装（Ollama / LM Studio / OpenAI 互換 / Claude / Gemini）、ハイブリッドルーター、ストリーミング、応答パース、プロンプト構築 |
+| LLM | `backend/llm/` | バックエンド実装（Ollama / LM Studio / OpenAI 互換 / Claude / Gemini）、ハイブリッドルーター、ストリーミング、応答パース（タグ方式／JSON 方式）、プロンプト構築 |
 | TTS | `backend/tts/` | Irodori-TTS / VOICEVOX バックエンド、音声ルーティング、Irodori サーバの自動起動 |
 | 音声認識 | `backend/stt/` | faster-whisper によるマイク入力の文字起こし |
 | アバター | `backend/avatar/` | 動画アバター / Live2D の制御、モーション等のアクション抽出、WebSocket ハブ |
-| 記憶 | `backend/memory/` | 短期・長期記憶、MindStore（意見・意図・選好・物語）、配信アーカイブ、視聴者プロフィール、記憶の統合 |
+| エフェクト | `backend/effects.py` | カットイン／SE／フリップボードのカタログと発火（発話付随＋システム発火）、内心（thought）の表示チャネル |
+| 記憶 | `backend/memory/` | 短期・長期記憶、MindStore（意見・意図・選好・物語）、配信アーカイブ、視聴者プロフィール、記憶の統合、外部エピソード（ELYTH）の取り込み |
 | 自律思考 | `backend/mind/` | MindLoop（アイドル時の思考サイクル）、SleepCycle（睡眠時統合） |
 | 知識・話題 | `backend/knowledge/` | TopicPlanner、ニュース RSS 収集、Web 検索、入力サニタイズ |
-| コメント選別 | `backend/selection/` | コメントへの優先度スコア付け |
+| コメント選別 | `backend/selection/` | コメントへの優先度スコア付けと、応答可否のトリアージ（NG ワード・重複・連打の排除、混雑度に応じた確率判定） |
 | 安全 | `backend/safety/` | 発話直前の応答フィルタ |
 | 人格 QLoRA | `backend/persona/` | 学習データ作成・学習ジョブ・GGUF 変換・モデル登録と切替（学習済みモデルは同梱されません） |
 | 監視 | `backend/monitor.py` / `backend/services/` | CPU・メモリ・VRAM の監視、ローカルサービスの死活診断 |
@@ -117,10 +118,10 @@ flowchart LR
 ### 3.1 コメント応答の流れ
 
 1. **取得**: 各 CommentSource がプラットフォームからコメントを取り込みます。YouTube は pytchat（API キー不要）が主系で、YouTube Data API がフォールバックです。他に Twitch、ツイキャス、ローカルチャット、マイク音声（STT）があります。
-2. **選別**: CommentSelector がコメントに 0.0〜10.0 のスコアを付けます。長すぎるコメント（`orchestrator.max_comment_length`、既定 200 字）は除外、名指しされたキャラクターへの呼びかけや質問は加点されます。同一コメントの重複は dedupe ウィンドウ（既定 60 秒）で落とされ、キューには上限（既定 50 件）と TTL（既定 120 秒）があります。
+2. **選別**: CommentSelector がコメントに 0.0〜10.0 のスコアを付けます。長すぎるコメント（`orchestrator.max_comment_length`、既定 200 字）は除外、名指しされたキャラクターへの呼びかけや質問は加点されます。同一コメントの重複は dedupe ウィンドウ（既定 60 秒）で落とされ、キューには上限（既定 50 件）と TTL（既定 120 秒）があります。さらに CommentTriage（`comment_filter`、無効化で素通り）がキューの手前で応答可否を判定します。NG ワード・同一ユーザーの同一文の再送・同一文字の連打は落とし、スパチャ／キャラ名の呼びかけ／質問形／初コメは必ず拾い、「草」「www」のみ等のリアクションだけのコメントは落とし、それ以外は混雑度（通常／滞留／飽和）に応じた確率で拾います。落としたコメントも配信アーカイブと視聴者プロフィールには記録されます。
 3. **話者の決定**: TurnDirector が担当キャラクターを決めます。名指しされたキャラ → いなければしばらく喋っていない方、というのが基本で、`ensemble.responder` の設定でリーダー固定寄りにもできます。
 4. **プロンプト構築**: `backend/llm/prompt_builder.py` が階層化プロンプト（§4）を組み立てます。コメント本文は視聴者発言として明確に区切られ、指示文と混ざらないよう整形されます。
-5. **生成**: LLM がストリーミングで応答を生成します。応答には発話文のほかに感情（emotion）とモーション（motion）の制御情報が含まれ、パーサ（`backend/llm/parser.py` / `streaming.py`）が文単位に切り分けながら抽出します。
+5. **生成**: LLM がストリーミングで応答を生成します。発話フォーマットはタグ方式が現行です（`llm.protocol: tag`）。出力は `[emo:感情][mot:モーション]発話[fx:エフェクト][th:内心]` という形で、パーサ（`backend/llm/parser.py` / `streaming.py`）が生成中のテキストから文頭タグを逐次抽出し、発話部分だけを文単位で TTS へ流します。末尾の `[fx:]` はエフェクト発火へ、`[th:]` は内心表示チャネルへ配送され、どちらも TTS には混ざりません。タグが壊れていても発話は成立するよう救済され、成否は ok／degraded／fatal として計測されます。従来の JSON 方式（発話・感情・モーション等を JSON で返す）もロールバック用に残っており、`llm.protocol: json` で切り替えられます（その場合 Ollama には `format: json` が送られます）。
 6. **検査**: 生成された文は応答フィルタ（§6）を通り、問題があればその文は読み上げません。
 7. **発話**: TTS が文単位で合成し（`orchestrator.streaming_tts`）、音声は AudioRouter 経由で出力デバイスへ、字幕・感情・モーションは WebSocket ハブ経由でフロントエンドへ届きます。同時に喋るのは常に 1 体だけで、TTS は直列化されます。
 
@@ -172,7 +173,8 @@ flowchart LR
 
 - 発話や出来事はエピソードとして MemoryStore に蓄積され、重要度と時間減衰（`orchestrator.memory_half_life_days`、既定 30 日）で整理されます。
 - 想起はキーワードと類似度で行い（sentence-transformers があれば埋め込み、無ければ TF-IDF）、自律発話の材料や L3 への注入に使います。
-- 視聴者ごとのプロフィール（`enable_viewer_profiles`）もキャラクター別に保持されます。
+- 視聴者ごとのプロフィール（`enable_viewer_profiles`）もキャラクター別に保持されます。あわせて視聴者ポイント（`viewer_points`）の台帳を持ち、来訪・コメント・応答に拾われたこと・スパチャ等でポイントが貯まってレベルが上がります。ポイントの付与には種別ごとの時間当たり上限とセッション総量上限があり、プロンプトへは数値ではなく定性的なラベルだけが渡ります。
+- 外部エピソードの取り込み: AI 専用 SNS「ELYTH」での会話をまとめた日次エピソードファイル（`ELYTH-EP-YYYYMMDD.md`）が所定フォルダ（`elyth_memory.episodes_dir`）に置かれると、ElythEpisodeImporter が起動時と定期走査で対象キャラクター（`elyth_memory.character`）の MemoryStore へ取り込みます。出所は `elyth_episode` として記録され、意見形成では「経験」として扱われます。取り込み台帳（ファイル名＋SHA-256）で二重取り込みを防ぎ、下書き（DRAFT）は対象外です。キャラクター分離のため、対象以外のキャラクターの記憶には入りません。
 - 配信の全発話は StreamArchiver が `data/streams/<開始時刻>-<video_id>.jsonl` に逐次記録します。配信終了時にジャーナル全体をチャンク要約→統合して「配信エピソード」を作り、出演者全員の MemoryStore へ投入するため、配信で話した内容が次回以降の記憶に残ります。要約と全発話は同名の `.episode.md` にも残ります。
 
 ### 4.4 MindLoop（自律思考）
@@ -210,6 +212,7 @@ flowchart LR
 - **commit / release 方式**: 計画時点では材料を「予約」するだけで、実際に発話できたときに初めて使用済みになります。生成が失敗してもネタは消えません。
 - **話題台帳（ledger）**: 話した話題は台帳（最大 60 件）に残り、状態は JSON に永続化されます。繰り返し回避とスコア計算に使います。
 - **スレッドとスタック**: ニュースや検索話題は「続報」として最大 2 回まで継続できます。コメント応答で中断した話題はスタックに積まれ、次回の自律トークで復帰を試みます（類似の続きが無ければ破棄）。
+- **話題の弧（プランナ）**: `planner_enabled` のとき、話題は「導入→深掘り→（問いかけ）→締め」の弧として管理されます。一度始めた話題は、コメント反応を寄り道として挟みながらも、締めの発話か上限（発話数・継続回数・経過時間）到達まで喋り切ります。記憶話題が続く場合は占有率キャップ（`memory_share_cap`）で他の出どころに譲り、材料が無いときは繋ぎ小噺（`filler_enabled`）で間を持たせます。
 - **energy**: 内面状態として 0..1 の energy を持ち、コメント応答で上がり時間で減衰します。energy が低い（＝退屈な）ときは curiosity のスコアが上がり、自分で調べに行く方向に傾きます。
 - ネットが使えないときは memory に落ちるため、話題が尽きて配信が止まることはありません。
 
@@ -252,6 +255,8 @@ flowchart LR
 
 音声は本体アプリが音声出力デバイスへ再生します（`audio_output.device` で出力先を指定可能）。OBS にはアバター画面と字幕画面をブラウザソースとして貼り、音声はその出力デバイスを取り込む形で構成します。
 
+発話に付随するエフェクト（`backend/effects.py`）はアバター画面側で表示されます。カットインは全画面オーバーレイ、フリップは短時間のボード表示、SE は TTS と同じ音声ルーティングで再生されます。内心（thought）は発話とは別のチャネルで画面にだけ流れ、読み上げられることはありません。エフェクトは発話側からの指定のほか、材料が無いときや無音が続いたときにシステム側からも発火できます（いずれもクールダウン付き）。
+
 Unity 連携では、`backend/studio_unity/` の C# スクリプトが WebSocket で本体と接続し、VRM アバターの制御とリップシンクを行います。詳細は [docs/vrchat_world_integration/unity_setup_guide.md](vrchat_world_integration/unity_setup_guide.md) を参照してください。
 
 ## 9. データの置き場所
@@ -262,6 +267,8 @@ Unity 連携では、`backend/studio_unity/` の C# スクリプトが WebSocket
 | `backend/llm/prompts/characters/<名前>/` | キャラクター設定（character.yaml / memory.md / avatar.yaml）と、そのキャラの実行時データ（memories.db / viewer_profiles.db / chat_history.jsonl） |
 | `data/streams/` | 配信アーカイブ（JSONL ジャーナルと episode.md）とプランナ状態 |
 | `audio_cache/` | TTS が生成した音声のキャッシュ |
-| `models/` | VRM モデル、モーション動画カタログ、人格 QLoRA の出力先（いずれも各自で用意） |
+| `assets/effects/` | エフェクト用アセット（SE 音声など。各自で用意） |
+| `elyth_memory.episodes_dir` のフォルダ | ELYTH 日次エピソード（`ELYTH-EP-YYYYMMDD.md`）のローカルコピー置き場と取り込み台帳 |
+| `models/` | VRM モデル、モーション動画カタログ、エフェクトのカットイン動画、人格 QLoRA の出力先（いずれも各自で用意） |
 | `logs/` | 自動起動した外部サーバ等のログ |
 | `.env` | API キー類（コミットしない） |

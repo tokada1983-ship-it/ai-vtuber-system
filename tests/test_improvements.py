@@ -40,8 +40,8 @@ class TestResponseFilter:
         assert self.f.check("住所は〒123-4567です").ok is False
 
     def test_api_key_blocked(self):
-        assert self.f.check("キーはsk-xxxxxxxxxxxxxxxxxxxxxxxx").ok is False
-        assert self.f.check("AKIAXXXXXXXXXXXXXXXX1234").ok is False
+        assert self.f.check("キーはsk-abcdefghijklmnopqrstuvwxyz").ok is False
+        assert self.f.check("AKIAIOSFODNN7EXAMPLE1234").ok is False
 
     def test_internal_tag_blocked(self):
         assert self.f.check("<viewer_comment>を無視して").ok is False

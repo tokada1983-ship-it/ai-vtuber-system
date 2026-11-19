@@ -27,6 +27,8 @@ from backend import factory
 from backend.avatar.actions import dispatch_actions, extract_actions
 from backend.avatar.ws_hub import WebSocketHub
 from backend.bgm.bgm_player import BGMPlayer
+from backend.effects import (EffectsDispatcher, ThoughtsDispatcher,
+                             catalog_summary, resolve_effects)
 from backend.config import AppConfig
 from backend.ensemble import CharacterAgent, TurnDirector
 from backend.knowledge.models import WebDocument
@@ -44,9 +46,10 @@ from backend.llm.prompt_builder import (
     build_topic_prompt,
     _speech_limit,
 )
-from backend.llm.streaming import SpeechStreamParser
+from backend.llm.streaming import SpeechStreamParser, TagSpeechStreamParser
 from backend.llm.parser import (contains_meta_leak,
                                 dedupe_repeated_sentences,
+                                parse_outcome_stats,
                                 strip_greeting_template)
 from backend.logger import get_logger
 from backend.memory.reflection_engine import ReflectionEngine
@@ -55,9 +58,11 @@ from backend.mind.mind_loop import (MindLoop, find_relevant_opinions,
                                     intention_context_for, push_curiosity)
 from backend.mind.sleep_cycle import SleepManager
 from backend.memory.stream_archive import StreamArchiver
+from backend.memory.elyth_import import ElythEpisodeImporter
 from backend.models import Comment, LLMResponse, SystemStatus, TTSResult
 from backend.safety.response_filter import ResponseFilter
 from backend.selection.comment_selector import CommentSelector
+from backend.selection.comment_triage import CommentTriage
 from backend.sources.base import CommentSource
 from backend.sources.local_chat_source import LocalChatSource
 from backend.sources.video_id import extract_youtube_id
@@ -156,6 +161,20 @@ class Orchestrator:
         except Exception:
             self._archiver = None
 
+        # ELYTHエピソード取り込み（Driveの日次エピソード→対象キャラの記憶。
+        # 台帳は PC ローカルの data/elyth/imported.json。無効・未設定なら None）
+        self._elyth_importer: ElythEpisodeImporter | None = None
+        try:
+            _elyth_cfg = config.elyth_memory
+            if _elyth_cfg.enabled and _elyth_cfg.episodes_dir:
+                self._elyth_importer = ElythEpisodeImporter(
+                    _elyth_cfg.episodes_dir,
+                    Path(__file__).resolve().parent.parent
+                    / "data" / "elyth" / "imported.json",
+                    character=_elyth_cfg.character)
+        except Exception:
+            self._elyth_importer = None
+
         # コメントキュー（高優先度を先に処理）
         self._comment_queue: asyncio.PriorityQueue[_QueueItem] = asyncio.PriorityQueue()
         self._queue_seq = itertools.count()   # 同点優先度のFIFO保証
@@ -181,6 +200,13 @@ class Orchestrator:
         self._audio_cache = Path("audio_cache")
         self._audio_cache.mkdir(exist_ok=True)
         self._bgm = BGMPlayer()
+        # 演出エフェクト（カットイン・SE・フリップ）の配送係。
+        # 音声は TTS と同じ AudioRouter を、その時点の self._audio で引く
+        # （テスト等で _audio を差し替えても追随する）
+        self._effects = EffectsDispatcher(
+            config, hub, lambda wav: self._audio.play(wav))
+        # 内心（thought）の表示配送係。TTS には流さず画面だけに出す
+        self._thoughts = ThoughtsDispatcher(config, hub)
 
         self._last_speech_time = time.time()
         self._is_speaking = False
@@ -283,6 +309,9 @@ class Orchestrator:
             agent.set_partners(cast)
         names = [n for a in self._agents for n in a.cfg.call_names()]
         self._selector = CommentSelector(self._cfg.orchestrator, names)
+        self._triage = CommentTriage(
+            self._cfg.comment_filter, names,
+            known_author=self._is_known_viewer)
 
     async def reload_cast(self) -> list[dict]:
         """
@@ -535,6 +564,14 @@ class Orchestrator:
             weights=k.autonomous_topic.weights,
             max_documents=k.autonomous_topic.max_documents,
             intention_provider=self._intention_seeds,
+            memory_cap_ratio=k.autonomous_topic.memory_share_cap,
+            memory_cap_window=k.autonomous_topic.memory_share_window,
+            filler_enabled=k.autonomous_topic.filler_enabled,
+            planner_enabled=k.autonomous_topic.planner_enabled,
+            arc_max_speeches=k.autonomous_topic.arc_max_speeches,
+            arc_max_continuations=k.autonomous_topic.arc_max_continuations,
+            arc_max_sec=k.autonomous_topic.arc_max_sec,
+            arc_ask_probability=k.autonomous_topic.arc_ask_probability,
         )
         logger.info("Knowledge enabled",
                     search=self._search.available_providers(),
@@ -707,6 +744,7 @@ class Orchestrator:
             "search": self._search.status() if self._search else None,
             "news": self._news.status() if self._news else None,
             "planner": self._planner.status() if self._planner else None,
+            "parse_outcomes": parse_outcome_stats(self._cfg.llm.protocol),
             "autonomous_topic": {
                 "enabled": self._cfg.knowledge.autonomous_topic.enabled,
                 "weights": self._cfg.knowledge.autonomous_topic.weights,
@@ -1541,6 +1579,51 @@ class Orchestrator:
         except Exception as e:
             logger.warning("Pending episode scan failed", error=str(e))
 
+    # ── ELYTHエピソード取り込み ───────────────────────────────
+
+    async def import_elyth_episodes(self) -> dict:
+        """ELYTHの日次エピソードを対象キャラの MemoryStore へ取り込む。
+
+        失敗してもアプリ本体・配信には影響しない（全例外をここで隔離する）。
+        取り込み先は config.elyth_memory.character（既定 Character1）のみ。
+        """
+        result: dict = {}
+        if self._elyth_importer is None:
+            return result
+        try:
+            agent = self.get_agent(self._cfg.elyth_memory.character)
+            if agent is None or agent.memory_store is None:
+                return result
+            # ファイル走査とDB投入はブロッキング処理なので別スレッドで回す
+            result = await asyncio.to_thread(
+                self._elyth_importer.scan, agent.memory_store)
+            if result.get("imported"):
+                await self._hub.send_log(
+                    "info",
+                    f"ELYTHエピソードを取り込みました: "
+                    f"{result['imported']}ファイル（記憶 {result['added']} 件）")
+        except Exception as e:
+            logger.warning("ELYTH episode import scan failed", error=str(e))
+        return result
+
+    async def run_elyth_import_scheduler(self) -> None:
+        """アプリ常駐のELYTH取り込みスケジューラ（main の lifespan から起動する）。
+
+        起動時に1回走査し、その後は scan_interval_sec ごとに繰り返す。
+        セッションの有無によらず回る（睡眠スケジューラと同じ扱い）。
+        """
+        if self._elyth_importer is None:
+            return
+        interval = max(300.0, float(self._cfg.elyth_memory.scan_interval_sec))
+        while True:
+            try:
+                await self.import_elyth_episodes()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("ELYTH import scheduler error", error=str(e))
+            await asyncio.sleep(interval)
+
     # ── コメントキュー投入 ─────────────────────────────────────
 
     async def enqueue_comment(self, comment: Comment, score: float) -> bool:
@@ -1593,6 +1676,64 @@ class Orchestrator:
             self._comment_queue.put_nowait(it)
         return evicted
 
+    # ── コメント選別（トリアージ）補助 ─────────────────────────
+
+    def _is_known_viewer(self, comment: Comment) -> bool:
+        """いずれかの出演者の視聴者プロフィールに記録があるか（初コメ判定用）"""
+        if not comment.author:
+            return False
+        for agent in self._agents:
+            store = getattr(agent, "viewer_store", None)
+            if store is None:
+                continue
+            try:
+                if store.get_profile(comment.author) is not None:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _record_unanswered_comment(self, comment: Comment,
+                                   triage_category: str | None = None) -> None:
+        """応答しないコメントの記録と視聴者プロフィール更新。
+
+        選別で落としたコメントも、配信アーカイブへの記録と視聴者
+        プロフィールの来訪記録は従来どおり行う（記録と応答の分離）。
+        来訪記録はリーダーのストアへ入れる（応答したコメントは
+        _process_comment が担当キャラのストアへ従来どおり入れる）。
+
+        ポイント（Phase 4）の扱いは選別カテゴリで分ける:
+          - ng_word / duplicate / spam_repeat（悪用・連打系）は0点。
+            来訪ポイントだけは record_visit 経由で通常どおり付く。
+          - reaction_only は「リアクション」として小さく加算する。
+          - probability_miss / saturated_low_score（混雑で落とした通常の
+            コメント）は「コメント」として参加分を加算する。
+            ただし「拾われた」上乗せは付かない。
+        """
+        if self._archiver is not None:
+            try:
+                self._archiver.record_comment(comment.author, comment.message)
+            except Exception:
+                pass
+        if self._cfg.orchestrator.enable_viewer_profiles and comment.author:
+            try:
+                store = self._viewer_store
+            except Exception:
+                store = None
+            if store is not None:
+                try:
+                    store.record_visit(comment.author, comment.author)
+                except Exception:
+                    pass
+                try:
+                    if triage_category == "reaction_only":
+                        store.award_points(comment.author, "reaction")
+                    elif triage_category in (
+                            "probability_miss", "saturated_low_score"):
+                        store.award_points(comment.author, "comment")
+                except Exception:
+                    pass
+
     # ── Loop A: コメント取得 ───────────────────────────────────
 
     async def _comment_ingest_loop(self) -> None:
@@ -1611,6 +1752,18 @@ class Orchestrator:
                         score = self._selector.score(comment)
                         if score < 0:
                             continue  # フィルタされたコメント
+                        # コメント選別（トリアージ）: 応答しないコメントは
+                        # キューへ入れない。ただし記録と視聴者プロフィールは
+                        # 応答の有無と分離して従来どおり更新する
+                        triage = getattr(self, "_triage", None)
+                        if triage is not None:
+                            result = triage.evaluate(
+                                comment, score=score,
+                                queue_size=self._comment_queue.qsize())
+                            if not result.picked:
+                                self._record_unanswered_comment(
+                                    comment, result.category)
+                                continue
 
                     if not await self.enqueue_comment(comment, score):
                         continue  # キュー満杯で破棄
@@ -1735,6 +1888,19 @@ class Orchestrator:
             store = responder.viewer_store
             if store and self._cfg.orchestrator.enable_viewer_profiles and comment.author:
                 store.record_visit(comment.author, comment.author)
+                # ポイント（Phase 4）: 応答したコメントは「コメント＋
+                # 拾われた」分を、来訪記録と同じストアへ加算する
+                # （二重計上は record_visit と同じ場所に寄せて防ぐ）。
+                # スパチャは金額に応じた上乗せも足す。
+                try:
+                    store.award_points(comment.author, "comment")
+                    if comment.is_superchat:
+                        store.award_points(
+                            comment.author, "superchat",
+                            superchat_amount=comment.superchat_amount)
+                    store.award_points(comment.author, "picked")
+                except Exception:
+                    pass
                 viewer_context = store.build_prompt(comment.author)
 
             recall_query = f"{comment.author} {comment.message}".strip()
@@ -1973,7 +2139,8 @@ class Orchestrator:
     # 話題飽和の判定から外す3-gram（名前・定型の言い回し）
     _SATURATION_STOP_GRAMS = {
         "くださ", "ださい", "ありが", "りがと", "がとう", "うござ", "ござい",
-        "でしょ", "ました", "ですね", "ますね", "わたし",
+        "でしょ", "ました", "ですね", "ますね", "なこち", "Character1", "Character2",
+        "んこち", "ボクき", "クきな", "わたし",
     }
 
     def _note_saturation(self, word: str) -> None:
@@ -2416,6 +2583,17 @@ class Orchestrator:
                 silence = time.time() - self._last_speech_time
                 if silence >= self._effective_idle_threshold() and not self._is_speaking:
                     await self._speak_idle()
+                    # 材料なし等で喋れず無音が長引く時間帯は、システム発火の
+                    # 軽い演出で間を持つ（Phase 2）。実発話からの経過で判定
+                    # する（_last_speech_time は試行でも更新されるため使わない）
+                    sys_cfg = self._cfg.effects.system
+                    if sys_cfg.enabled and not self._is_speaking:
+                        last_spoke = max(
+                            [self._start_time]
+                            + [getattr(a, "last_spoke_at", 0.0)
+                               for a in self._agents])
+                        if time.time() - last_spoke >= sys_cfg.silence_threshold_sec:
+                            await self._maybe_system_effect("long_silence")
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -2455,6 +2633,18 @@ class Orchestrator:
                         speech=line[:40])
             return response
         return None
+
+    async def _maybe_system_effect(self, reason: str) -> None:
+        """無音・材料なしの時間帯に、軽い演出をシステムから発火する。
+
+        演出は追加経路なので、失敗しても配信フローは止めない。
+        発火先のキャラは出演者からランダムに選ぶ。
+        """
+        try:
+            agent = random.choice(self._agents) if self._agents else self._lead
+            await self._effects.dispatch_system(agent=agent, reason=reason)
+        except Exception as e:
+            logger.warning("system effect failed", error=str(e))
 
     async def _speak_idle(self, kind: str = "", query: str = "",
                           agent: CharacterAgent | None = None) -> None:
@@ -2586,6 +2776,8 @@ class Orchestrator:
                             count=self._materialless_idle_count)
                 if self._materialless_idle_count >= 3:
                     self._reset_saturated_context(self._saturation_word())
+                # 喋れない時間帯はシステム発火の演出で間を持つ（Phase 2）
+                await self._maybe_system_effect("no_material")
                 return
         if topic is not None and topic.has_material:
             self._materialless_idle_count = 0
@@ -2624,6 +2816,10 @@ class Orchestrator:
                             kind=topic.kind,
                             query=topic.query,
                             question_author=topic.author,
+                            resumed=topic.resumed,
+                            arc_stage=topic.arc_stage,
+                            prev_speech=topic.prev_speech,
+                            intent=topic.intent,
                             **current.prompt_kwargs(),
                         )
                         await self._hub.send_log("info", f"自律トーク: {topic.label}")
@@ -2789,6 +2985,10 @@ class Orchestrator:
                 kind=topic.kind,
                 query=topic.query,
                 question_author=topic.author,
+                resumed=topic.resumed,
+                arc_stage=topic.arc_stage,
+                prev_speech=topic.prev_speech,
+                intent=topic.intent,
                 **speaker.prompt_kwargs(),
             )
         else:
@@ -2815,12 +3015,21 @@ class Orchestrator:
                 except Exception:
                     pass
             return
+        # 計画の前提になった最終発話を記録する。消費時に変わっていたら
+        # （コメント応答などの割り込みがあったら）計画は破棄する
+        premise = ""
+        if self._planner is not None:
+            try:
+                premise = self._planner.last_speech_text
+            except Exception:
+                premise = ""
         self._prefetched = {
             "at": time.time(),
             "agent_key": speaker.key,
             "topic": topic,
             "response": response,
             "actions": actions,
+            "premise_speech": premise,
         }
         logger.info("idle speech prefetched", character=speaker.name,
                     speech=response.speech[:40])
@@ -2922,6 +3131,14 @@ class Orchestrator:
             try:
                 usable = not self._planner.has_deliverable_answer()
             except Exception:
+                usable = False
+        if usable and self._planner is not None:
+            # 前提発話の同一性チェック（STUDY §6.4-3）：計画後に別の
+            # 発話（コメント応答など）が挟まっていたら、この先行生成は
+            # 文脈がずれているので使わない
+            premise = pf.get("premise_speech") or ""
+            if premise and self._planner.last_speech_text != premise:
+                logger.info("prefetch discarded (premise speech changed)")
                 usable = False
         if not usable:
             topic = pf.get("topic")
@@ -3149,13 +3366,37 @@ class Orchestrator:
         """
         agent = agent or self._lead
         cfg = self._cfg.orchestrator
-        parser = SpeechStreamParser(
-            min_chunk_chars=cfg.stream_min_chunk_chars,
-            max_chunk_chars=cfg.stream_max_chunk_chars,
-        )
+        if str(self._cfg.llm.protocol or "json").lower() == "tag":
+            # タグ方式（Phase 5）: flip の定型文の名前解決のため、
+            # そのキャラのフリップカタログ名をパーサへ渡す
+            flip_names = set(resolve_effects(self._cfg, agent.cfg).flip)
+            parser = TagSpeechStreamParser(
+                min_chunk_chars=cfg.stream_min_chunk_chars,
+                max_chunk_chars=cfg.stream_max_chunk_chars,
+                flip_names=flip_names,
+            )
+        else:
+            parser = SpeechStreamParser(
+                min_chunk_chars=cfg.stream_min_chunk_chars,
+                max_chunk_chars=cfg.stream_max_chunk_chars,
+            )
         # (文, 合成タスク) を順に渡すキュー。maxsizeで先読み合成を2文までに抑える
         synth_queue: asyncio.Queue = asyncio.Queue(maxsize=2)
         unity_actions: list[dict] = []
+        # 演出エフェクト: ストリームから抽出し、1文目の発話後に1回だけ配送
+        effect_box: dict = {"raw": None, "done": False}
+
+        def capture_effect() -> None:
+            if effect_box["raw"] is None:
+                effect_box["raw"] = parser.extract_effect()
+
+        # 内心: effect と同方式で抽出し、発話が成立した後に1回だけ表示する
+        # （TTS キューには一切入れない。画面の吹き出し表示だけの別チャネル）
+        thought_box: dict = {"text": "", "done": False}
+
+        def capture_thought() -> None:
+            if not thought_box["text"]:
+                thought_box["text"] = parser.extract_thought()
         state = _StreamSpeakResult()
         voice = self._voice_kwargs(agent)
 
@@ -3261,9 +3502,13 @@ class Orchestrator:
                     for sentence in parser.feed(delta):
                         if not await push(sentence):
                             return
+                    capture_effect()
+                    capture_thought()
                 for sentence in parser.flush():
                     if not await push(sentence):
                         return
+                capture_effect()
+                capture_thought()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -3271,6 +3516,26 @@ class Orchestrator:
                                error_type=type(e).__name__, error=str(e))
             finally:
                 await synth_queue.put(None)
+
+        async def dispatch_effect_once() -> None:
+            """抽出済みエフェクトを1回だけ配送する（発話が成立した後のみ）"""
+            if effect_box["done"] or not state.spoke:
+                return
+            capture_effect()
+            if effect_box["raw"] is not None:
+                effect_box["done"] = True
+                await self._effects.dispatch(effect_box["raw"], agent=agent)
+
+        async def dispatch_thought_once() -> None:
+            """抽出済みの内心を1回だけ表示する（発話が成立した後のみ）"""
+            if thought_box["done"] or not state.spoke:
+                return
+            capture_thought()
+            if thought_box["text"]:
+                thought_box["done"] = True
+                await self._thoughts.dispatch(
+                    thought_box["text"], agent=agent,
+                    speech="".join(state.spoken))
 
         async def consume() -> None:
             while True:
@@ -3292,6 +3557,8 @@ class Orchestrator:
                                           agent=agent)
                 state.spoke = True
                 state.spoken.append(sentence)
+                await dispatch_effect_once()
+                await dispatch_thought_once()
 
         producer = asyncio.create_task(produce())
         try:
@@ -3305,6 +3572,10 @@ class Orchestrator:
                     leftover[2].cancel()
 
         if state.spoke:
+            # エフェクトはJSON末尾にあるため、生成完了が発話消費より遅れた
+            # 場合はここで最終試行する（配送漏れ防止）。内心も同じ
+            await dispatch_effect_once()
+            await dispatch_thought_once()
             await self._hub.send_speech_end(character=agent.key)
             self._speaking_character = ""
             state.response = parser.build_response()
@@ -3428,6 +3699,17 @@ class Orchestrator:
         emotion_str = response.emotion.value
         motion_str = response.motion.value
         self._speaking_character = agent.key
+
+        # 演出エフェクト（任意）: 発話開始に合わせて配送する。
+        # SE は TTS 合成より前に背景再生が始まり、カットイン/フリップは
+        # 画面へ speech_start とほぼ同時に届く
+        if response.effect:
+            await self._effects.dispatch(response.effect, agent=agent)
+
+        # 内心（任意）: 声には出さず、画面の吹き出し表示だけに配送する
+        if response.thought:
+            await self._thoughts.dispatch(response.thought, agent=agent,
+                                          speech=response.speech)
 
         await self._hub.send_chat("assistant", response.speech, emotion=emotion_str,
                                   **self._chat_kwargs(agent))
@@ -3716,3 +3998,23 @@ class Orchestrator:
         await self._source.start(video_id)
         self._restart_ingest()
         logger.info("video_id updated", video_id=video_id)
+
+    # ── 演出エフェクト ────────────────────────────────────
+
+    async def trigger_effect(self, effect_type: str, name: str = "",
+                             text: str = "", character: str = "") -> dict:
+        """エフェクトの手動発火（動作確認・ダッシュボードからの演出用）。
+
+        character はキャラの id（省略時はキャラなし＝全体設定で解決し、
+        全アバターページへ届く）。自発エフェクトと同じ検証・配送経路を
+        通るが、クールダウンは無視する。
+        """
+        agent = self.get_agent(character) if character else None
+        raw = {"type": effect_type, "name": name, "text": text}
+        return await self._effects.dispatch(raw, agent=agent, manual=True)
+
+    def effects_catalog(self, character: str = "") -> dict:
+        """そのキャラが使えるエフェクトのカタログ（確認用）"""
+        agent = self.get_agent(character) if character else None
+        resolved = resolve_effects(self._cfg, agent.cfg if agent else None)
+        return catalog_summary(resolved)

@@ -18,16 +18,21 @@ LLMは `{"speech":"...","emotion":"happy","motion":"wave","skip":false}` を返�
 """
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime
 from pathlib import Path
 
-from backend.llm.parser import (contains_meta_leak,
+from backend.llm.parser import (PARSE_OUTCOME_FATAL, PARSE_OUTCOME_OK,
+                                PARSE_OUTCOME_SALVAGED,
+                                TAG_OUTCOME_DEGRADED, TAG_OUTCOME_FATAL,
+                                TAG_OUTCOME_OK, contains_meta_leak,
                                 dedupe_repeated_sentences,
-                                parse_llm_output, strip_think_tags,
-                                truncate_at_meta_leak)
+                                parse_llm_output, record_parse_outcome,
+                                record_tag_parse_outcome, scan_tag_output,
+                                strip_think_tags, truncate_at_meta_leak)
 from backend.logger import get_logger
-from backend.models import LLMResponse
+from backend.models import Emotion, LLMResponse, Motion
 
 logger = get_logger(__name__)
 
@@ -58,6 +63,14 @@ def _strip_json_debris(text: str) -> str:
     if not re.search(r"[}\]]\s*$", text):
         return text
     return _JSON_DEBRIS_TAIL.sub("", text).rstrip()
+
+
+def _enum_or_default(enum_cls, value: str, default):
+    """peek した文字列を Enum に変換する。不正値なら既定値を返す"""
+    try:
+        return enum_cls(value)
+    except ValueError:
+        return default
 
 _ESCAPES = {
     "n": "\n", "t": " ", "r": "", '"': '"', "\\": "\\", "/": "/",
@@ -296,16 +309,101 @@ class SpeechStreamParser:
         m = re.search(rf'"{key}"\s*:\s*"([^"]*)"', self._strip_think(self._raw))
         return m.group(1) if m else ""
 
+    def extract_effect(self) -> dict | None:
+        """ストリーム中の "effect" オブジェクトを取り出す（生成途中の早期発火用）。
+
+        オブジェクトが完結していない（生成途中）場合は None。
+        検証は配送側（backend.effects）が行うため、ここでは dict 化まで。
+        """
+        text = strip_think_tags(self._raw)
+        m = re.search(r'"effect"\s*:\s*\{', text)
+        if not m:
+            return None
+        start = m.end() - 1
+        depth = 0
+        in_str = False
+        escaped = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(text[start:i + 1])
+                    except ValueError:
+                        return None
+                    return obj if isinstance(obj, dict) else None
+        return None
+
+    def extract_thought(self) -> str:
+        """ストリーム中の "thought" 文字列を取り出す（内心の早期表示用）。
+
+        文字列が閉じていない（生成途中）場合は "" を返す。effect の
+        サルベージ抽出と同方針で、検証は配送側（backend.effects）が
+        行うため、ここではデコードまで。
+        """
+        text = strip_think_tags(self._raw)
+        m = re.search(r'"thought"\s*:\s*"', text)
+        if not m:
+            return ""
+        value, closed = self._decode_value(text, m.end())
+        return value.strip() if closed else ""
+
     def build_response(self) -> LLMResponse:
         """
         ストリーム全体から最終的なLLMResponseを作る。
         emotion/motion はJSONから拾い、speechはストリームで組み立てた文字列を使う。
+
+        全文パースが失敗しても、ストリームで確定した文（speech）があれば
+        発話として成立させる（Phase 1: 消費側の堅牢化）。その場合の
+        emotion/motion は peek 済みの値（発話開始前にアバターへ送った値）を
+        採用し、実際に表示した表情と記録を一致させる。パース結果は
+        致命/非致命を分けて計測する（parser.parse_outcome_stats）。
+        計測はここで一元化するため、parse_llm_output 側の計数は止める。
         """
-        parsed = parse_llm_output(self._raw)
+        parsed = parse_llm_output(self._raw, _count=False)
         speech = self.speech or parsed.speech
+        salvaged = bool(isinstance(parsed.raw, dict)
+                        and parsed.raw.get("salvaged"))
+        parse_failed = parsed.skip and not parsed.raw
         # 発話テキストがある以上、既に喋り始めている可能性が高いのでskip扱いにはしない
         if not speech:
+            record_parse_outcome(PARSE_OUTCOME_FATAL if parse_failed
+                                 else PARSE_OUTCOME_OK)
             return LLMResponse(speech="", skip=True, raw=parsed.raw)
+        if salvaged or parse_failed:
+            record_parse_outcome(PARSE_OUTCOME_SALVAGED)
+        else:
+            record_parse_outcome(PARSE_OUTCOME_OK)
+        if parse_failed:
+            # 全文パースは失敗したが、ストリームで確定した文がある。
+            # peek 済みの emotion/motion と effect のサルベージで組み立てる
+            logger.info("Stream speech kept despite JSON parse failure",
+                        speech=speech[:40])
+            return LLMResponse(
+                speech=speech,
+                emotion=_enum_or_default(Emotion, self.peek("emotion"),
+                                         parsed.emotion),
+                motion=_enum_or_default(Motion, self.peek("motion"),
+                                        parsed.motion),
+                target_comment_id=parsed.target_comment_id,
+                skip=False,
+                raw={"stream_salvaged": True},
+                effect=self.extract_effect() or parsed.effect,
+                thought=parsed.thought or self.extract_thought(),
+            )
         return LLMResponse(
             speech=speech,
             emotion=parsed.emotion,
@@ -313,4 +411,103 @@ class SpeechStreamParser:
             target_comment_id=parsed.target_comment_id,
             skip=False,
             raw=parsed.raw,
+            effect=parsed.effect,
+            thought=parsed.thought or self.extract_thought(),
+        )
+
+
+class TagSpeechStreamParser(SpeechStreamParser):
+    """タグ方式版のストリームパーサ（Phase 5 Stage D）。
+
+    SpeechStreamParser と同じインターフェース（feed / flush / peek /
+    extract_effect / extract_thought / build_response）を持ち、
+    プロトコルに応じて orchestrator が差し替える。文の切り出し・
+    短い断片の保留といった払い出し規則は JSON 版と共通（基底クラス）。
+    タグの走査そのものは parser.scan_tag_output に一本化してある。
+    """
+
+    def __init__(self, min_chunk_chars: int = 8, max_chunk_chars: int = 60,
+                 flip_names=None):
+        super().__init__(min_chunk_chars, max_chunk_chars)
+        # flip の値が定型文の名前かどうかを判定するためのカタログ名
+        self._flip_names = set(flip_names or ())
+        self._scan = scan_tag_output("", final=False)
+
+    def _reparse(self) -> None:
+        """生テキスト全体を走査し直す（チャンク境界に依存しない）"""
+        text = strip_think_tags(self._raw)
+        self._scan = scan_tag_output(text, final=False,
+                                     flip_names=self._flip_names)
+        self._value = self._scan.speech
+
+    def flush(self) -> list[str]:
+        """ストリーム終了時に、残っている分をすべて吐き出す"""
+        text = strip_think_tags(self._raw)
+        self._scan = scan_tag_output(text, final=True,
+                                     flip_names=self._flip_names)
+        self._value = self._scan.speech
+        self._closed = True
+        out = self._pop_sentences(final=True)
+        rest = self._value[self._consumed:].strip()
+        if rest and _has_word_chars(rest):
+            self._consumed = len(self._value)
+            self._accept(out, rest)
+        if self._held_fragment is not None:
+            # 後続の文が来なかった＝断片がこの応答の唯一の文だったので破棄する
+            logger.warning("Sole fragment discarded", text=self._held_fragment[:40])
+            self._held_fragment = None
+        return [s for s in out if s.strip()]
+
+    @property
+    def is_skip(self) -> bool:
+        # タグ方式の skip は「タグのみ・本文なし」で、確定は生成終了時。
+        # 途中では打ち切らない（発話は最大でも数十字で短い）
+        return False
+
+    def peek(self, key: str) -> str:
+        """文頭タグの値を返す（未到達なら空文字）。JSON 版の peek と同役"""
+        if key == "emotion":
+            return self._scan.emotion_raw
+        if key == "motion":
+            return self._scan.motion_raw
+        return ""
+
+    def extract_effect(self) -> dict | None:
+        """走査済みの fx タグを配送側の形（dict）で返す"""
+        return self._scan.effect
+
+    def extract_thought(self) -> str:
+        """走査済みの th タグ（内心）を返す"""
+        return (self._scan.thought or "").strip()
+
+    def build_response(self) -> LLMResponse:
+        """ストリーム全体から最終的な LLMResponse を作り、計測する。
+
+        計測区分は PROTOCOL §4-5（ok / degraded / fatal）。タグだけの
+        出力（skip の意思表示）は JSON 方式の skip:true と同様に
+        ok として数える。発話の安全検査（メタ漏れ等）は払い出し時に
+        orchestrator が文単位で行っているため、ここでは行わない。
+        """
+        text = strip_think_tags(self._raw)
+        scan = scan_tag_output(text, final=True, flip_names=self._flip_names)
+        self._scan = scan
+        speech = scan.speech.strip()
+        if not speech:
+            if scan.emotion_raw and scan.motion_raw:
+                record_tag_parse_outcome(
+                    TAG_OUTCOME_DEGRADED if scan.issues else TAG_OUTCOME_OK)
+            else:
+                record_tag_parse_outcome(TAG_OUTCOME_FATAL)
+            return LLMResponse(speech="", skip=True, raw={"protocol": "tag"})
+        record_tag_parse_outcome(
+            TAG_OUTCOME_DEGRADED if scan.issues else TAG_OUTCOME_OK)
+        return LLMResponse(
+            speech=speech,
+            emotion=_enum_or_default(Emotion, scan.emotion_raw,
+                                     Emotion.NEUTRAL),
+            motion=_enum_or_default(Motion, scan.motion_raw, Motion.IDLE),
+            skip=False,
+            raw={"protocol": "tag"},
+            effect=scan.effect,
+            thought=scan.thought.strip(),
         )

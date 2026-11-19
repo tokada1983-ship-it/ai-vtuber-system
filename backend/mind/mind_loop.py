@@ -86,6 +86,7 @@ _SEED_NG = re.compile(
 
 _PROV_BY_MEMORY_SOURCE = {
     "stream_episode": "experienced",
+    "elyth_episode": "experienced",
     "auto": "experienced",
     "web": "researched",
     "manual": "told",

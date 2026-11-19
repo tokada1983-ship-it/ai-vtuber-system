@@ -16,7 +16,7 @@ import httpx
 
 from backend.config import LLMBackendConfig
 from backend.llm.base import LLMBackend
-from backend.llm.parser import parse_llm_output
+from backend.llm.parser import parse_llm_output, parse_tag_output
 from backend.llm.sse import iter_openai_sse
 from backend.logger import get_logger
 from backend.models import ChatMessage, LLMResponse
@@ -115,7 +115,8 @@ class OpenAICompatBackend(LLMBackend):
                                prompt_tokens=usage.get("prompt_tokens", "?"),
                                finish_reason=data["choices"][0].get("finish_reason", "?"))
                 return LLMResponse(speech="", skip=True)
-            result = parse_llm_output(raw_text)
+            result = parse_tag_output(raw_text) \
+                if self.protocol == "tag" else parse_llm_output(raw_text)
             logger.info(f"{self.name} response",
                         speech=result.speech[:40] if result.speech else "skip",
                         emotion=result.emotion.value if not result.skip else "-")

@@ -8,7 +8,7 @@ import httpx
 from backend.config import LLMBackendConfig
 from backend.llm import ollama_service
 from backend.llm.base import LLMBackend
-from backend.llm.parser import parse_llm_output
+from backend.llm.parser import parse_llm_output, parse_tag_output
 from backend.llm.sse import iter_ndjson
 from backend.logger import get_logger
 from backend.models import ChatMessage, LLMResponse
@@ -111,7 +111,10 @@ class OllamaBackend(LLMBackend):
         # JSONモード（文法制約でJSON以外の出力を抑える）。think と同じ
         # extra_payload 伝搬で、config に "format": "json" と書かれた
         # バックエンドだけ有効になる（既定は無指定＝OFF。Phase 4）
-        if "format" in extra:
+        # タグ方式（protocol="tag"）ではプレーンテキスト生成が前提のため、
+        # config に残っていても送らない（PROTOCOL §7。戻すときは
+        # protocol を json にするだけで従来動作に復帰する）
+        if "format" in extra and self.protocol != "tag":
             payload["format"] = extra["format"]
         return payload
 
@@ -142,7 +145,8 @@ class OllamaBackend(LLMBackend):
             data = resp.json()
             raw_text = data["message"]["content"]
             self._healthy = True
-            result = parse_llm_output(raw_text)
+            result = parse_tag_output(raw_text) \
+                if self.protocol == "tag" else parse_llm_output(raw_text)
             logger.debug("Ollama response", speech=result.speech[:40] if result.speech else "skip")
             return result
 

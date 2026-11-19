@@ -66,6 +66,19 @@ LLM_BACKENDS: dict[str, Callable[[LLMBackendConfig], LLMBackend]] = {
 }
 
 
+def _apply_protocol(backend: LLMBackend | None,
+                    config: AppConfig) -> LLMBackend | None:
+    """config.llm.protocol をバックエンドへ伝える（Phase 5 Stage D）。
+
+    バックエンドはこれを見てパーサ（JSON / タグ）を切り替え、Ollama は
+    format:json の送信を抑える。is_persona と同じ「生成時に印を付ける」
+    方式で、config 側の単一の切替点（llm.protocol）から全体に行き渡る。
+    """
+    if backend is not None:
+        backend.protocol = str(config.llm.protocol or "json").lower()
+    return backend
+
+
 def create_llm(name: str, cfg: LLMBackendConfig | None) -> LLMBackend | None:
     """バックエンド名と設定からLLMを作る。未知の名前・設定なしなら None。"""
     factory = LLM_BACKENDS.get(name)
@@ -83,11 +96,14 @@ def build_llm(config: AppConfig) -> tuple[LLMBackend, LLMBackend | None]:
     ヘルスチェックで通常モデルに切り替わるので配信は止まらない。
     """
     llm_cfg = config.llm
-    primary = create_llm(llm_cfg.primary, llm_cfg.get_backend(llm_cfg.primary))
+    primary = _apply_protocol(
+        create_llm(llm_cfg.primary, llm_cfg.get_backend(llm_cfg.primary)), config)
     if primary is None:
         from backend.llm.ollama_backend import OllamaBackend
-        primary = OllamaBackend(llm_cfg.get_backend("ollama") or LLMBackendConfig())
-    fallback = create_llm(llm_cfg.fallback, llm_cfg.get_backend(llm_cfg.fallback))
+        primary = _apply_protocol(
+            OllamaBackend(llm_cfg.get_backend("ollama") or LLMBackendConfig()), config)
+    fallback = _apply_protocol(
+        create_llm(llm_cfg.fallback, llm_cfg.get_backend(llm_cfg.fallback)), config)
 
     persona_llm = build_persona_llm(config)
     if persona_llm is not None:
@@ -123,12 +139,14 @@ def build_character_llm(
         return build_character_llm(
             config, character.model_copy(update={"llm": type(over)()}), is_lead=is_lead)
     cfg = base_cfg.model_copy(update={"model": over.model}) if over.model else base_cfg
-    primary = create_llm(name, cfg)
+    primary = _apply_protocol(create_llm(name, cfg), config)
     if primary is None:
         logger.warning("unknown character llm backend", character=character.name, backend=name)
         return build_llm(config)
     # 専用モデルが落ちていたら全体の primary に戻す
-    fallback = create_llm(config.llm.primary, config.llm.get_backend(config.llm.primary))
+    fallback = _apply_protocol(
+        create_llm(config.llm.primary, config.llm.get_backend(config.llm.primary)),
+        config)
     return wrap_hybrid(config, primary), fallback
 
 
@@ -149,7 +167,7 @@ def wrap_hybrid(config: AppConfig, base: LLMBackend) -> LLMBackend:
         if cfg is None:
             logger.warning("hybrid backend not configured", backend=name)
             return None
-        backend = create_llm(name, cfg)
+        backend = _apply_protocol(create_llm(name, cfg), config)
         if backend is None:
             logger.warning("hybrid backend unknown", backend=name)
         return backend
@@ -181,7 +199,7 @@ def build_persona_llm(config: AppConfig) -> LLMBackend | None:
         return None
     # 接続先（base_url 等）は流用し、モデル名だけ専用モデルに差し替える
     cfg = base_cfg.model_copy(update={"model": p.runtime_model})
-    llm = create_llm(p.backend, cfg)
+    llm = _apply_protocol(create_llm(p.backend, cfg), config)
     if llm is None:
         logger.warning("unknown persona backend", backend=p.backend)
         return None

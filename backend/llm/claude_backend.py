@@ -5,7 +5,7 @@ import os
 
 from backend.config import LLMBackendConfig
 from backend.llm.base import LLMBackend
-from backend.llm.parser import parse_llm_output
+from backend.llm.parser import parse_llm_output, parse_tag_output
 from backend.logger import get_logger
 from backend.models import ChatMessage, LLMResponse
 
@@ -52,7 +52,8 @@ class ClaudeBackend(LLMBackend):
             )
             raw_text = response.content[0].text
             self._healthy = True
-            return parse_llm_output(raw_text)
+            return parse_tag_output(raw_text) \
+                if self.protocol == "tag" else parse_llm_output(raw_text)
 
         except Exception as e:
             logger.warning("Claude backend error", error=str(e))

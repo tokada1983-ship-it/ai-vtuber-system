@@ -130,7 +130,7 @@ _QUOTE = re.compile(r"「([^「」]{4,400})」", re.DOTALL)
 
 
 def _is_line(text: str) -> bool:
-    """「わらわ」「眠れる森の番人」のような語句・肩書きはセリフ扱いしない"""
+    """「わらわ」「深淵より目覚めし999歳の大妖狐」のような語句・肩書きはセリフ扱いしない"""
     return len(text) >= 12 and bool(re.search(r"[、。！？!?…]", text))
 
 

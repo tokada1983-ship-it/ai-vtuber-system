@@ -425,7 +425,7 @@ class TestOllamaService:
 
     def test_remote_server_is_not_spawned(self, monkeypatch):
         from backend.llm import ollama_service as osvc
-        svc = osvc.OllamaService("http://127.0.0.1:11434")
+        svc = osvc.OllamaService("http://192.168.0.10:11434")
 
         async def down(timeout=2.0):
             return False
@@ -512,7 +512,7 @@ class TestIrodoriService:
         assert irodori_service.get_service(self._cfg(tmp_path)) is not None
         assert irodori_service.get_service(self._cfg(tmp_path, primary="voicevox")) is None
         assert irodori_service.get_service(self._cfg(tmp_path, auto_start=False)) is None
-        assert irodori_service.get_service(self._cfg(tmp_path, url="http://127.0.0.1:8088/v1")) is None
+        assert irodori_service.get_service(self._cfg(tmp_path, url="http://192.168.0.5:8088/v1")) is None
 
     def test_health_url_and_command(self, tmp_path):
         from backend.tts import irodori_service

@@ -47,10 +47,10 @@ def make_duo(**ensemble) -> tuple[Orchestrator, FakeHub, StubTTS, StubTTS]:
     cfg.knowledge.enabled = False
     cfg.characters = [
         CharacterConfig(name="Character1", id="Character1", data_dir=str(tmp),
-                        prompt_file=_write_char(tmp, "Character1", "元気なAI"),
+                        prompt_file=_write_char(tmp, "Character1", "大妖狐のAI"),
                         aliases=["character1"]),
         CharacterConfig(name="Character2", id="Character2", data_dir=str(tmp),
-                        prompt_file=_write_char(tmp, "Character2", "落ち着いた相方AI")),
+                        prompt_file=_write_char(tmp, "Character2", "未来から来た相方AI")),
     ]
     cfg.ensemble = EnsembleConfig(turn_gap_sec=0, **ensemble)
     hub = FakeHub()
@@ -98,8 +98,8 @@ class TestConfig:
         assert [c.name for c in cfg.cast] == ["A"]
 
     def test_empty_prompt_file_uses_character_folder(self):
-        ch = CharacterConfig(name="Character1", prompt_file="", data_dir="data")
-        assert ch.resolved_prompt_file() == Path("data/characters/Character1/character.yaml")
+        ch = CharacterConfig(name="Character2", prompt_file="", data_dir="data")
+        assert ch.resolved_prompt_file() == Path("data/characters/Character2/character.yaml")
 
 
 # ── 話者の決め方 ──────────────────────────────────────────────
@@ -167,7 +167,7 @@ class TestPrompts:
         pb = build_system_prompt(orch._cfg, **b.prompt_kwargs())
         assert "キャラクター設定: Character1" in pa and "Character2" in pa
         assert "キャラクター設定: Character2" in pb and "共演者" in pb
-        assert "落ち着いた相方AI" in pa       # 相方の紹介が入る
+        assert "未来から来た相方AI" in pa       # 相方の紹介が入る
 
     def test_single_character_prompt_has_no_cast_note(self):
         cfg = AppConfig()

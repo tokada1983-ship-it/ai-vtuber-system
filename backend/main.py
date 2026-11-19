@@ -38,8 +38,13 @@ async def _lifespan(app: FastAPI):
     # アプリ常駐で回す（夜間枠＋キャッチアップをアイドル時に実行する）
     sleep_task = asyncio.create_task(orchestrator.run_sleep_scheduler(),
                                      name="sleep")
+    # ELYTHエピソード取り込みもアプリ常駐で回す（起動時＋定期走査。
+    # 未設定・無効のときはスケジューラ側が即終了する）
+    elyth_task = asyncio.create_task(orchestrator.run_elyth_import_scheduler(),
+                                     name="elyth-import")
     yield
     sleep_task.cancel()
+    elyth_task.cancel()
     await monitor.stop()
     await orchestrator.stop()
     # stop() は後処理を背景化したので、アプリ終了時は完了まで待つ

@@ -184,6 +184,26 @@ async def api_stop():
     await orchestrator.stop()
     return {"ok": True}
 
+@router.post("/api/effects/trigger")
+async def api_effects_trigger(body: dict):
+    """演出エフェクト（カットイン・効果音・フリップ）の手動発火。
+
+    動作確認とダッシュボードからの手動演出用。自発エフェクトと同じ
+    検証・配送経路を通る（クールダウンだけ無視する）。
+    body: {"type": "cutin"|"se"|"flip", "name": ..., "text": ...,
+           "character": <キャラid, 任意>}
+    """
+    return await orchestrator.trigger_effect(
+        str(body.get("type", "")), name=str(body.get("name", "")),
+        text=str(body.get("text", "")), character=str(body.get("character", "")))
+
+
+@router.get("/api/effects/catalog")
+async def api_effects_catalog(character: str = ""):
+    """使えるエフェクトのカタログ（?character=<id> でキャラ別に解決）"""
+    return orchestrator.effects_catalog(character)
+
+
 @router.post("/api/video_id")
 async def api_set_video_id(body: dict):
     video_id = body.get("video_id", "")

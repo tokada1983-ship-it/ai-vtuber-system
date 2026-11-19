@@ -81,6 +81,34 @@ _SEED_COOLDOWN_SEC = 1800.0
 _THEME_OVERLAP_SEED_MAX = 0.35
 _THEME_OVERLAP_MEMORY_MAX = 0.5
 
+# memory 占有率ハードキャップ（Phase 1 / STUDY §3-C1）。台帳がこの件数
+# たまるまでは誤爆を避けるためキャップを効かせない
+_MEMORY_CAP_MIN_SAMPLES = 10
+# 話題化した記憶を L3 常駐注入（build_idle_memory）へ再浮上させない
+# クールダウン（秒。STUDY §3-C3 の最小形：プランナー側の台帳を共有する）
+_TOPIC_MEMORY_COOLDOWN_SEC = 1800.0
+
+# 次発言プランニング（Phase 3 / STUDY §6-(a1)）：展開の発話で「問いかけ」
+# の意図を選ぶための energy の下限。これより退屈なときは問いかけず、
+# 深掘りに専念させる
+_ARC_ASK_MIN_ENERGY = 0.35
+# 弧が完遂してからこの秒数以内に始めた新規話題は「転換」の意図にする
+_ARC_TRANSITION_WINDOW_SEC = 300.0
+
+# 定番小噺プール（Phase 1 / STUDY §3-C2）：ニュース・検索・記憶の材料が
+# すべて尽きたときのフォールバック終端。材料として数える軽い話題で、
+# 特定の事実を主張しない、季節・日常・配信まわりの無難なお題に限る
+_FILLER_TOPICS: list[tuple[str, str]] = [
+    ("季節の変わり目", "いまの季節の空気や、最近の天気の移り変わりについて軽く触れる。季節らしい食べ物や景色の話でもよい"),
+    ("今日の調子", "今日の自分の調子や気分について短く話す。見てくれている人の今日の様子も気にかける"),
+    ("カフェの近況", "カフェの店内の様子や、最近淹れた飲み物の話など、身の回りの小さな近況を話す"),
+    ("視聴者への呼びかけ", "見てくれている人への感謝と、コメントや感想を気軽に書いてほしいという呼びかけをする"),
+    ("最近のマイブーム", "最近なんとなく気に入っている小さなこと（飲み物・道具・習慣など）を1つ挙げて話す"),
+    ("一息のすすめ", "見ている人へ、温かい飲み物や深呼吸など、小さな休憩のすすめを話す"),
+    ("近いうちの楽しみ", "近いうちに楽しみにしている小さなことを話す。実在しない予定を断定はしない"),
+    ("配信の裏側", "配信の準備や機材まわりで最近あった小さな出来事を話す。具体的な固有名詞は出さない"),
+]
+
 
 def _title_tokens(text: str) -> set[str]:
     """タイトル類似度用の素朴なトークン化（日本語は文字バイグラム併用）"""
@@ -109,6 +137,10 @@ class Topic:
     resumed: bool = False                       # 中断した話題の続報なら True
     pending_id: str = ""                        # 保留回答キュー由来ならそのID（Phase 3）
     author: str = ""                            # kind="answer" のときの質問者名（Phase 3）
+    arc_stage: str = ""                         # 話題の弧の段階（"" | introduce | deepen | close）。Phase 1 では状態と既定意図まで
+    prev_speech: str = ""                       # 継続時に、直前の自分の発話（実文・切り詰め）
+    intent: str = ""                            # 次発言の意図（Phase 3: "" | introduce | deepen | ask | react | close | transition）
+    arc_key: str = ""                           # 弧の同一判定キー（Phase 3）
 
     @property
     def has_material(self) -> bool:
@@ -125,6 +157,10 @@ class Topic:
             "resumed": self.resumed,
             "pending_id": self.pending_id,
             "author": self.author,
+            "arc_stage": self.arc_stage,
+            "prev_speech": self.prev_speech,
+            "intent": self.intent,
+            "arc_key": self.arc_key,
         }
 
 
@@ -143,6 +179,14 @@ class TopicPlanner:
         max_documents: int = 3,
         history_size: int = 12,
         state_path: str | None = None,
+        memory_cap_ratio: float = 0.45,
+        memory_cap_window: int = 20,
+        filler_enabled: bool = False,
+        planner_enabled: bool = True,
+        arc_max_speeches: int = 4,
+        arc_max_continuations: int = 2,
+        arc_max_sec: float = 900.0,
+        arc_ask_probability: float = 0.25,
     ):
         self._news = news
         self._search = search
@@ -157,6 +201,29 @@ class TopicPlanner:
         self.max_documents = max_documents
         self._history: deque[str] = deque(maxlen=history_size)
         self.last_topic: Topic | None = None
+        # Phase 1 の穴埋め設定（STUDY §3-C1/C2）
+        self._memory_cap_ratio = float(memory_cap_ratio)
+        self._memory_cap_window = max(1, int(memory_cap_window))
+        self._filler_enabled = bool(filler_enabled)
+        # 次発言プランニング（Phase 3 / STUDY §6-(a1)）：弧の状態と意図の
+        # ルール決定・完遂判定。無効化すると意図は付かず、弧の段階付けは
+        # Phase 1 までの規則（継続上限で締め）に戻る
+        self._planner_enabled = bool(planner_enabled)
+        self._arc_max_speeches = max(1, int(arc_max_speeches))
+        self._arc_max_continuations = max(0, int(arc_max_continuations))
+        self._arc_max_sec = float(arc_max_sec)
+        self._arc_ask_probability = min(1.0, max(0.0,
+                                                 float(arc_ask_probability)))
+        # 弧の計測（完遂／期限切れ／放棄の回数）と、直近の完遂時刻
+        # （完遂直後の新規話題を「転換」の意図にするために使う）
+        self._arc_stats: dict[str, int] = {"completed": 0, "expired": 0,
+                                           "abandoned": 0}
+        self._last_arc_end_at: float = 0.0
+        # 話題化した記憶の使用台帳（正規化キー → 使用時刻）。L3 常駐注入の
+        # サンプリングと共有し、同じ記憶の二経路での繰り返しを断つ（§3-C3）
+        self._topic_memory_used_at: dict[str, float] = {}
+        # 直前の自分の発話（継続フレーミングで「さっきの話」として渡す）
+        self._last_speech_text: str = ""
 
         # ── 決定層の状態（2026-11-14 追加） ──
         self._born_at = time.time()
@@ -210,11 +277,18 @@ class TopicPlanner:
     def energy(self) -> float:
         return self._decay_energy(time.time())
 
+    @property
+    def last_speech_text(self) -> str:
+        """直前の自分の発話の実文（継続フレーミング／先行生成の前提照合用）"""
+        return self._last_speech_text
+
     def note_speech(self, idle: bool = False, text: str = "") -> None:
         """発話イベントの通知（Orchestrator._after_speech から呼ばれる）"""
         now = time.time()
         self._decay_energy(now)
         if text:
+            # 継続フレーミング用に、直前の発話の実文を短く保持する
+            self._last_speech_text = text.strip()[:120]
             # 直近発話のテーマを覚える（次の話題選択で重複を避けるため）
             toks = _title_tokens(text)
             if toks:
@@ -268,7 +342,19 @@ class TopicPlanner:
             return
         if any(e.get("topic_id") == last.get("topic_id") for e in self._stack):
             return
-        self._stack.append({**last, "suspended_at": now})
+        entry = {**last, "suspended_at": now}
+        th = self._thread
+        if th is not None and th.get("kind") == last.get("kind") \
+                and (not th.get("topic_id")
+                     or th.get("topic_id") == last.get("topic_id")):
+            # 弧の状態も一緒に退避する（Phase 3）。コメント応答は寄り道で、
+            # 復帰時は弧の途中から再開し、締めまでの残りを数え直さない
+            entry["arc_speeches"] = int(th.get("speeches") or 0)
+            entry["arc_started_at"] = float(th.get("started_at") or 0)
+            entry["arc_stage"] = th.get("stage") or ""
+            entry["continuations"] = int(th.get("continuations") or 0)
+            entry["arc_key"] = th.get("arc_key") or ""
+        self._stack.append(entry)
         del self._stack[:-3]
         self._save_state()
         logger.info("topic suspended", kind=last.get("kind"),
@@ -292,6 +378,8 @@ class TopicPlanner:
                 "stack": self._stack,
                 "thread": self._thread,
                 "seed_used_at": self._seed_used_at,
+                "topic_memory_used_at": self._topic_memory_used_at,
+                "arc_stats": self._arc_stats,
             }
             tmp = self._state_path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -325,9 +413,19 @@ class TopicPlanner:
                 str(k): float(v) for k, v in su.items()
                 if isinstance(v, (int, float))
                 and now - float(v) < _SEED_COOLDOWN_SEC * 4}
+            tmu = data.get("topic_memory_used_at") or {}
+            self._topic_memory_used_at = {
+                str(k): float(v) for k, v in tmu.items()
+                if isinstance(v, (int, float))
+                and now - float(v) < _TOPIC_MEMORY_COOLDOWN_SEC * 4}
             th = data.get("thread")
             if isinstance(th, dict) and time.time() - float(th.get("at") or 0) < 600:
                 self._thread = th
+            ast = data.get("arc_stats") or {}
+            if isinstance(ast, dict):
+                for k in ("completed", "expired", "abandoned"):
+                    if isinstance(ast.get(k), (int, float)):
+                        self._arc_stats[k] = int(ast[k])
             logger.info("planner state loaded", ledger=len(self._ledger))
         except Exception as e:
             logger.warning("planner state load failed", error=str(e))
@@ -359,8 +457,134 @@ class TopicPlanner:
 
     def reset_thread(self) -> None:
         """継続中スレッドを破棄する（文脈リセット用）"""
+        if self._thread is not None and self._planner_enabled:
+            # 締めに届かず捨てられた弧として数える（Phase 3 の計測）
+            self._arc_stats["abandoned"] = \
+                int(self._arc_stats.get("abandoned") or 0) + 1
         self._thread = None
         self._save_state()
+
+    # ── 弧（アーク）の状態管理（Phase 3） ─────────────────────
+    # 1つの話題は「導入→展開→締め」の弧として扱う。弧の解放は、
+    # 締めの発話が commit された時点（完遂）か、上限時間の超過
+    # （期限切れ）のときだけ。コメント応答などの割り込みでは解放しない
+
+    @staticmethod
+    def _arc_key_for(title: str, query: str) -> str:
+        """弧の同一判定キー（タイトル優先、空白を落として先頭80字）"""
+        base = (title or query or "").strip()
+        return re.sub(r"\s+", "", base)[:80]
+
+    def _fresh_intent(self) -> str:
+        """新規話題の意図。直前に弧が完遂していれば「転換」、通常は「導入」"""
+        if not self._planner_enabled:
+            return ""
+        if self._last_arc_end_at \
+                and time.time() - self._last_arc_end_at \
+                < _ARC_TRANSITION_WINDOW_SEC:
+            return "transition"
+        return "introduce"
+
+    def _decide_arc(self, speeches: int, continuations: int,
+                    now: float) -> tuple[str, str]:
+        """継続発話の弧段階（arc_stage）と意図（intent）をルールで決める。
+
+        speeches は弧の現在の発話数（これから話す分を含まない）、
+        continuations はこれまでの継続回数。次の発話が上限（継続回数／
+        発話数）に達する回なら「締め」。展開の回は、energy が低くない
+        ときに確率で「問いかけ」を混ぜる。プランナー無効時は Phase 1
+        までの規則（継続上限に達する回が締め、意図は付けない）に倒す。
+        """
+        if not self._planner_enabled:
+            stage = "close" \
+                if continuations + 1 >= self._arc_max_continuations \
+                else "deepen"
+            return stage, ""
+        if continuations + 1 >= self._arc_max_continuations \
+                or speeches + 1 >= self._arc_max_speeches:
+            return "close", "close"
+        if random.random() < self._arc_ask_probability \
+                and self._decay_energy(now) >= _ARC_ASK_MIN_ENERGY:
+            return "deepen", "ask"
+        return "deepen", "deepen"
+
+    def _advance_thread(self, th: dict, now: float, stage: str,
+                        arc_key: str, started_at: float,
+                        speeches: int) -> None:
+        """継続が決まったスレッドの弧状態を1歩進める（計画時点の更新）"""
+        th["continuations"] = int(th.get("continuations") or 0) + 1
+        th["speeches"] = speeches + 1
+        th["at"] = now
+        th["stage"] = stage
+        th["started_at"] = started_at
+        th["arc_key"] = arc_key
+        th["closing"] = stage == "close"
+
+    def _restore_thread(self, entry: dict, now: float, stage: str,
+                        arc_key: str, started_at: float, speeches: int,
+                        continuations: int) -> None:
+        """復帰した話題の弧状態をスレッドへ戻す。
+
+        別の弧が進行中ならそちらを優先し、スレッドは触らない（復帰の
+        発話自体は一発の続報として成立させる）。
+        """
+        th = self._thread
+        if th is not None and th.get("arc_key") and arc_key \
+                and th.get("arc_key") != arc_key:
+            return
+        self._thread = {
+            "kind": entry.get("kind"),
+            "title": entry.get("title") or "",
+            "query": entry.get("query") or "",
+            "at": now,
+            "continuations": continuations + 1,
+            "stage": stage,
+            "speeches": speeches + 1,
+            "started_at": started_at,
+            "closing": stage == "close",
+            "arc_key": arc_key,
+            "topic_id": "",
+        }
+        self._save_state()
+
+    def _expire_thread(self, reason: str) -> None:
+        """進行中の弧を、締めに届かないまま解放する（計測に残す）"""
+        th = self._thread
+        if th is None:
+            return
+        self._thread = None
+        if self._planner_enabled:
+            self._arc_stats["expired"] = \
+                int(self._arc_stats.get("expired") or 0) + 1
+            logger.info("topic arc expired", reason=reason,
+                        kind=th.get("kind"), speeches=th.get("speeches"))
+        self._save_state()
+
+    def _complete_arc(self, topic: Topic, now: float) -> None:
+        """弧の完遂を記録し、スレッドと残った復帰予約を解放する。
+
+        commit() から、プランナー有効かつ「締め」の発話が実際に喋れた
+        ときだけ呼ばれる（発話失敗時は release() で締め予定を取り消し、
+        弧は開いたままになる）。
+        """
+        th = self._thread
+        speeches = int((th or {}).get("speeches") or 0)
+        if self._ledger and self._ledger[-1].get("topic_id") == topic.topic_id:
+            self._ledger[-1]["arc_completed"] = True
+            if speeches:
+                self._ledger[-1]["arc_speeches"] = speeches
+        self._arc_stats["completed"] = \
+            int(self._arc_stats.get("completed") or 0) + 1
+        self._last_arc_end_at = now
+        if th is not None and (not topic.arc_key or not th.get("arc_key")
+                               or topic.arc_key == th.get("arc_key")):
+            self._thread = None
+        # 完遂した弧の復帰予約がスタックに残っていたら一緒に捨てる
+        if topic.arc_key:
+            self._stack = [e for e in self._stack
+                           if e.get("arc_key") != topic.arc_key]
+        logger.info("topic arc completed", kind=topic.kind,
+                    speeches=speeches, label=(topic.label or "")[:40])
 
     # ── 保留回答キュー（Phase 3）──────────────────────────────
     # その場で答えられなかった事実質問（同期検索の空振り／間隔ゲート）を
@@ -500,6 +724,8 @@ class TopicPlanner:
         """
         now = time.time()
         self._purge_expired_answers(now)
+        # 視聴者への反応として差し込む発話なので意図は react（Phase 3）
+        react = "react" if self._planner_enabled else ""
         for e in self._pending_answers:
             if e["state"] == "ready":
                 logger.info("pending answer planned",
@@ -509,7 +735,8 @@ class TopicPlanner:
                              query=e.get("question") or "",
                              documents=list(e.get("documents") or []),
                              pending_id=e["id"],
-                             author=e.get("author") or "")
+                             author=e.get("author") or "",
+                             intent=react)
             if e["state"] == "failed":
                 logger.info("pending answer planned (not found)",
                             question=(e.get("question") or "")[:40])
@@ -521,7 +748,8 @@ class TopicPlanner:
                              query=e.get("question") or "",
                              documents=[doc],
                              pending_id=e["id"],
-                             author=e.get("author") or "")
+                             author=e.get("author") or "",
+                             intent=react)
         return None
 
     def commit(self, topic: Topic) -> None:
@@ -546,9 +774,21 @@ class TopicPlanner:
             "query": topic.query,
             "title": topic.documents[0].title if topic.documents else "",
             "at": now,
+            "intent": topic.intent,
+            "arc_stage": topic.arc_stage,
         })
-        # 会話の流れ管理：新しいWeb話題はスレッドを開き、それ以外は閉じる。
-        # 続報・続き（resumed）の commit ではスレッドを維持する。
+        if topic.kind == "memory" and topic.documents:
+            # 話題化した記憶を記録する。L3 常駐注入のサンプリング側が
+            # この台帳を見て、同じ記憶の再浮上をクールダウン中は避ける
+            # （STUDY §3-C3 の最小形：二経路の重複を断つ）
+            key = self._memory_text_key(topic.documents[0].snippet)
+            if key:
+                self._topic_memory_used_at[key] = now
+                self._topic_memory_used_at = {
+                    k: at for k, at in self._topic_memory_used_at.items()
+                    if now - at < _TOPIC_MEMORY_COOLDOWN_SEC * 4}
+        # 会話の流れ管理：新しいWeb話題はスレッド（弧）を開き、それ以外は
+        # 閉じる。続報・続き（resumed）の commit では弧を前進させる。
         # 質問への回答（answer）は割り込みとして扱い、スレッドは開かず
         # 進行中のものも消さない（回答で会話を閉じるのが役割。Phase 3）
         if topic.kind == "answer":
@@ -560,7 +800,28 @@ class TopicPlanner:
                 "query": topic.query,
                 "at": now,
                 "continuations": 0,
+                # 弧の状態（Phase 3）：導入を1発話目として数え始める
+                "stage": "introduce",
+                "speeches": 1,
+                "started_at": now,
+                "closing": False,
+                "arc_key": topic.arc_key or self._arc_key_for(
+                    topic.documents[0].title if topic.documents else "",
+                    topic.query),
+                "topic_id": topic.topic_id,
             }
+        elif topic.kind in ("news", "curiosity"):
+            # 継続・続報の commit：弧の所在を同期する。「締め」の発話が
+            # 実際に喋れたら、ここで初めて弧を解放する（ADDENDUM：
+            # 話題の解放は締め到達時か上限超過のときだけ）
+            th = self._thread
+            if th is not None and (not topic.arc_key
+                                   or not th.get("arc_key")
+                                   or topic.arc_key == th.get("arc_key")):
+                th["topic_id"] = topic.topic_id
+                th["at"] = now
+            if self._planner_enabled and topic.arc_stage == "close":
+                self._complete_arc(topic, now)
         elif topic.kind not in ("news", "curiosity"):
             self._thread = None
         self._save_state()
@@ -571,6 +832,47 @@ class TopicPlanner:
         # 次回の plan() で再び差し込まれるようにする（Phase 3）
         if topic.kind == "news" and topic.documents:
             self._reserved.pop(topic.documents[0].key, None)
+        # 「締め」として計画した発話が失敗したら、締め予定を取り消して
+        # 弧は開いたままにする（完遂は commit された締め発話でのみ成立）
+        th = self._thread
+        if th is not None and topic.arc_stage == "close" \
+                and th.get("closing") \
+                and (not topic.arc_key or not th.get("arc_key")
+                     or topic.arc_key == th.get("arc_key")):
+            th["closing"] = False
+
+    # ── 話題化した記憶の台帳（L3注入との共有）と占有率 ──────
+
+    @staticmethod
+    def _memory_text_key(text: str) -> str:
+        """記憶テキストの同一判定キー（Orchestrator の種キーと同じ先頭80字）"""
+        return (text or "").strip()[:80]
+
+    def is_topic_memory_recent(self, text: str) -> bool:
+        """この記憶が最近（クールダウン内）話題として使われたか。
+
+        L3 常駐注入（CharacterAgent.build_idle_memory）のサンプリング側が、
+        話題化したばかりの記憶をプロンプトへ再浮上させないために使う。
+        """
+        key = self._memory_text_key(text)
+        if not key:
+            return False
+        now = time.time()
+        for used_key, at in self._topic_memory_used_at.items():
+            if now - at >= _TOPIC_MEMORY_COOLDOWN_SEC:
+                continue
+            if used_key == key or key.startswith(used_key) \
+                    or used_key.startswith(key):
+                return True
+        return False
+
+    def memory_share(self, window: int | None = None) -> float:
+        """直近ウィンドウでの memory 話題の占有率（0..1）。台帳が空なら0"""
+        n = window or self._memory_cap_window
+        entries = list(self._ledger)[-n:]
+        if not entries:
+            return 0.0
+        return sum(1 for e in entries if e.get("kind") == "memory") / len(entries)
 
     # ── 種類のUtilityスコア ─────────────────────────────────
 
@@ -642,6 +944,22 @@ class TopicPlanner:
         scores = self._score_kinds(allow_web, context)
         for k in (exclude or set()):
             scores[k] = 0.0
+        # 占有率ハードキャップ（STUDY §3-C1）：直近ウィンドウで memory が
+        # 支配的なら、材料のある他候補が残っている間は memory を候補から
+        # 外す。重み調整ではなく quota として効かせるのが要点で、台帳の
+        # サンプルが少ないうちは誤爆を避けるため効かせない
+        if scores.get("memory", 0.0) > 0 \
+                and any(v > 0 for k, v in scores.items() if k != "memory"):
+            window_entries = list(self._ledger)[-self._memory_cap_window:]
+            if len(window_entries) >= _MEMORY_CAP_MIN_SAMPLES:
+                share = sum(1 for e in window_entries
+                            if e.get("kind") == "memory") / len(window_entries)
+                if share >= self._memory_cap_ratio:
+                    scores["memory"] = 0.0
+                    logger.info("memory share cap applied",
+                                share=round(share, 2),
+                                cap=self._memory_cap_ratio,
+                                window=len(window_entries))
         self._last_utilities = scores
         kinds = [k for k, v in scores.items() if v > 0]
         if not kinds:
@@ -698,7 +1016,8 @@ class TopicPlanner:
                           source="comment", site="ライブチャット")
         logger.info("comment woven into talk", author=author, text=text[:30])
         return Topic(kind="comment", label=f"コメントから: {author}",
-                     query=text, documents=[doc])
+                     query=text, documents=[doc],
+                     intent="react" if self._planner_enabled else "")
 
     # ── 話題の継続（スレッド） ──────────────────────────────
 
@@ -714,22 +1033,39 @@ class TopicPlanner:
             return None
         now = time.time()
         if now - float(th.get("at") or 0) > 600:
-            self._thread = None
+            # 最終発話から10分空いたら弧は自然消滅（期限切れとして数える）
+            self._expire_thread("inactive")
             return None
-        if int(th.get("continuations") or 0) >= 2:
+        started_at = float(th.get("started_at") or th.get("at") or now)
+        if self._planner_enabled and now - started_at > self._arc_max_sec:
+            # 弧の開始からの上限時間を超えたら、締め切れなくても解放する
+            # （弧が永遠に続かないための上限。ADDENDUM の完遂条件の片方）
+            self._expire_thread("arc_max_sec")
+            return None
+        if int(th.get("continuations") or 0) >= self._arc_max_continuations:
             return None
         if random.random() > 0.6:
             return None
         kind = th.get("kind")
+        # 弧の段階と次発言の意図はルールで決める（Phase 3 / STUDY §6-(a1)）。
+        # 継続上限・発話数上限に達する回が「締め」、展開の一部は「問いかけ」
+        speeches = int(th.get("speeches")
+                       or int(th.get("continuations") or 0) + 1)
+        stage, intent = self._decide_arc(
+            speeches, int(th.get("continuations") or 0), now)
+        arc_key = th.get("arc_key") or self._arc_key_for(
+            th.get("title") or "", th.get("query") or "")
         if kind == "news":
             doc = self._pick_followup_doc(th)
             if doc is None:
                 return None
-            th["continuations"] = int(th.get("continuations") or 0) + 1
-            th["at"] = now
+            self._advance_thread(th, now, stage, arc_key, started_at,
+                                 speeches)
             logger.info("topic continue", kind="news", title=doc.title[:40])
             return Topic(kind="news", label=f"続き: {doc.title[:30]}",
-                         query=doc.title, documents=[doc], resumed=True)
+                         query=doc.title, documents=[doc], resumed=True,
+                         arc_stage=stage, prev_speech=self._last_speech_text,
+                         intent=intent, arc_key=arc_key)
         if kind == "curiosity":
             seed = self._seed_from_query(th.get("query") or "")
             if not seed or self._search is None:
@@ -740,12 +1076,14 @@ class TopicPlanner:
             docs = await self._search.search(q, limit=self.max_documents)
             if not docs:
                 return None
-            th["continuations"] = int(th.get("continuations") or 0) + 1
-            th["at"] = now
+            self._advance_thread(th, now, stage, arc_key, started_at,
+                                 speeches)
             logger.info("topic continue", kind="curiosity", query=q[:40])
             return Topic(kind="curiosity", label=f"続き: {q[:30]}",
                          query=q, documents=docs[: self.max_documents],
-                         resumed=True)
+                         resumed=True, arc_stage=stage,
+                         prev_speech=self._last_speech_text,
+                         intent=intent, arc_key=arc_key)
         return None
 
     @staticmethod
@@ -772,6 +1110,29 @@ class TopicPlanner:
             return None
         if age > 240 and random.random() < 0.5:
             return None   # 時間が経っていたら半分は見送り（スタックは残す）
+        # 弧の状態（_suspend_current が退避したスナップショット）を取り出す。
+        # 弧はコメント割り込みではリセットされず、復帰は弧の続きとして
+        # 数える（ADDENDUM）。スナップショットが無い旧形式のエントリは
+        # 導入済みの1発話として扱う
+        speeches = int(top.get("arc_speeches") or 1)
+        continuations = int(top.get("continuations") or 0)
+        started_at = float(top.get("arc_started_at")
+                           or top.get("suspended_at") or now)
+        arc_key = top.get("arc_key") or self._arc_key_for(
+            top.get("title") or "", top.get("query") or "")
+        if self._planner_enabled and now - started_at > self._arc_max_sec:
+            # 中断が長引いて弧の上限時間を超えたら、復帰させず解放する。
+            # 同じ弧がスレッド側にも残っていれば一緒に捨て、二重に
+            # 期限切れを数えないようにする
+            self._stack.pop()
+            self._arc_stats["expired"] = \
+                int(self._arc_stats.get("expired") or 0) + 1
+            th = self._thread
+            if th is not None and arc_key and th.get("arc_key") == arc_key:
+                self._thread = None
+            logger.info("topic arc expired on resume", kind=top.get("kind"))
+            return None
+        stage, intent = self._decide_arc(speeches, continuations, now)
         kind = top.get("kind")
         if kind == "news":
             doc = self._pick_followup_doc(top)
@@ -779,9 +1140,15 @@ class TopicPlanner:
                 self._stack.pop()
                 return None
             self._stack.pop()
+            if self._planner_enabled:
+                self._restore_thread(top, now, stage, arc_key, started_at,
+                                     speeches, continuations)
             logger.info("topic resume", kind="news", title=doc.title[:40])
             return Topic(kind="news", label=f"続報: {doc.title[:30]}",
-                         query=doc.title, documents=[doc], resumed=True)
+                         query=doc.title, documents=[doc], resumed=True,
+                         arc_stage=stage,
+                         prev_speech=self._last_speech_text,
+                         intent=intent, arc_key=arc_key)
         if kind == "curiosity":
             q = (top.get("query") or "").strip()
             if not q or self._search is None:
@@ -792,10 +1159,15 @@ class TopicPlanner:
                 self._stack.pop()
                 return None
             self._stack.pop()
+            if self._planner_enabled:
+                self._restore_thread(top, now, stage, arc_key, started_at,
+                                     speeches, continuations)
             logger.info("topic resume", kind="curiosity", query=q[:40])
             return Topic(kind="curiosity", label=f"続報: {q[:30]}",
                          query=q, documents=docs[: self.max_documents],
-                         resumed=True)
+                         resumed=True, arc_stage=stage,
+                         prev_speech=self._last_speech_text,
+                         intent=intent, arc_key=arc_key)
         self._stack.pop()
         return None
 
@@ -1000,9 +1372,19 @@ class TopicPlanner:
             topic = await self._plan_curiosity(query)
 
         if topic is None:
-            topic = self._plan_memory() or Topic(kind="memory",
-                                                 label="記憶からの話題")
+            topic = self._plan_memory()
+            if topic is None and self._filler_enabled:
+                # フォールバック終端の多様化（STUDY §3-C2）：記憶の材料も
+                # 無いときは、材料なしの memory 話題で黙り込まず定番小噺へ
+                # 落とす。全経路の終端が memory になる構造を断つ
+                topic = self._plan_filler()
+                logger.info("fallback to filler topic", label=topic.label)
+            if topic is None:
+                topic = Topic(kind="memory", label="記憶からの話題")
 
+        if self._planner_enabled and not topic.intent:
+            # 記憶・小噺など単発の話題は「導入」の意図で記録する
+            topic.intent = "introduce"
         self._seq += 1
         topic.topic_id = f"t{int(time.time())}-{self._seq}"
         self.last_topic = topic
@@ -1054,6 +1436,19 @@ class TopicPlanner:
         return Topic(kind="memory", label=f"思い出: {text[:24]}",
                      documents=[doc])
 
+    def _plan_filler(self) -> Topic:
+        """定番小噺から1つ選ぶ。直近に使った小噺は避ける（台帳で判定）"""
+        recent_labels = [e.get("label") or ""
+                         for e in list(self._ledger)[-4:]]
+        pool = [(t, s) for t, s in _FILLER_TOPICS
+                if not any(t in lbl for lbl in recent_labels)]
+        if not pool:
+            pool = list(_FILLER_TOPICS)
+        title, snippet = random.choice(pool)
+        doc = WebDocument(title=title, snippet=snippet,
+                          source="filler", site="定番の小噺")
+        return Topic(kind="filler", label=f"小噺: {title}", documents=[doc])
+
     def _plan_news(self) -> Topic | None:
         doc = self._pick_news_doc()
         if doc is None:
@@ -1063,6 +1458,9 @@ class TopicPlanner:
             label=f"ニュース: {doc.title[:30]}",
             query=doc.title,
             documents=[doc],
+            arc_stage="introduce",
+            intent=self._fresh_intent(),
+            arc_key=self._arc_key_for(doc.title, doc.title),
         )
 
     async def _plan_curiosity(self, query: str = "") -> Topic | None:
@@ -1085,6 +1483,9 @@ class TopicPlanner:
             label=f"検索: {q[:30]}",
             query=q,
             documents=docs[: self.max_documents],
+            arc_stage="introduce",
+            intent=self._fresh_intent(),
+            arc_key=self._arc_key_for("", q),
         )
 
     def status(self) -> dict:
@@ -1113,6 +1514,17 @@ class TopicPlanner:
             "ledger": list(self._ledger)[-10:],
             "kind_counts": {
                 k: sum(1 for e in self._ledger if e.get("kind") == k)
-                for k in ("memory", "news", "curiosity")
+                for k in ("memory", "news", "curiosity", "filler")
             },
+            "memory_share": round(self.memory_share(), 2),
+            "memory_cap": {"ratio": self._memory_cap_ratio,
+                           "window": self._memory_cap_window},
+            "filler_enabled": self._filler_enabled,
+            "planner_enabled": self._planner_enabled,
+            "arc": ({"kind": self._thread.get("kind"),
+                     "stage": self._thread.get("stage"),
+                     "speeches": self._thread.get("speeches"),
+                     "closing": bool(self._thread.get("closing"))}
+                    if self._thread else None),
+            "arc_stats": dict(self._arc_stats),
         }

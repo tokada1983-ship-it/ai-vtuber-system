@@ -621,4 +621,4 @@ def test_saturation_word_ignores_character_name_fragments():
     orch._recent_speech_norms = [Orchestrator._normalize_speech(s) for s in speeches]
     word = orch._saturation_word()
     assert word  # 内容語が拾える
-    assert word not in ("Character2", "ター2も", "2も調")
+    assert word not in ("んこも", "Character2", "こも調", "んこ調")

@@ -15,7 +15,7 @@
 *   **`backend/config.py` & `config.yaml`**:
     *   `world` 設定（`enabled`, `model_path`, `spawn_point` 等）のモデルとデフォルト値を定義。
 
-### 2. Unity用 C# スクリプトの生成と配置 (backend\studio_unity\)
+### 2. Unity用 C# スクリプトの生成と配置 (e:\ai-vtuber\backend\studio_unity\)
 - **`UnityWebSocketClient.cs`**:  
   Unity標準の `System.Net.WebSockets` ライブラリ（外部アセット不要）を使用し、PythonのサーバーとWebSocketで常時接続。受信したJSON形式のコマンドをスレッドセーフなキューに蓄積し、Unityのメインスレッド上でアバター制御スクリプトへディスパッチする。
 - **`AvatarController.cs`**:  
@@ -24,7 +24,7 @@
   アバター（VRM）のリップシンク（口の開閉量 A, I, U, E, O / aa）を制御する。VRM 0.x (`VRMBlendShapeProxy`) および VRM 1.0 (`VRM10Instance`) の両規格をリフレクションを用いて動的に判別して動作する。音声がない場合は発話時間から口パクをシミュレートする機能付き。
 
 ### 3. ドキュメントの整備
-- **[unity_setup_guide.md](unity_setup_guide.md)**:  
+- **[unity_setup_guide.md](file:///e:/ai-vtuber/docs/vrchat_world_integration/unity_setup_guide.md)**:  
   Unity Hubでのプロジェクト新規作成から、UniVRMパッケージの導入、床のNavMeshのベイク、3Dワールド配置、アバターへの提供C#スクリプトの適用、Animator Controllerのパラメータ設定までの全手順を解説した詳細なガイドを作成。
 
 ### 3. 自動セットアップツール (新規追加)

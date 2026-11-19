@@ -84,6 +84,10 @@ class HybridLLMConfig(BaseModel):
 class LLMConfig(BaseModel):
     primary: str = "lmstudio"
     fallback: str = "ollama"
+    # 出力プロトコル: "json"（従来のJSON方式）| "tag"（タグ方式・Phase 5）。
+    # プロンプトのフォーマット節・パーサ・計測が一体で切り替わる。
+    # "json" に戻せば従来動作に完全復帰する（ロールバック経路）
+    protocol: str = "json"
     backends: dict[str, LLMBackendConfig] = Field(default_factory=dict)
     hybrid: HybridLLMConfig = Field(default_factory=HybridLLMConfig)
 
@@ -151,6 +155,78 @@ class CharacterLLMConfig(BaseModel):
     model: str = ""                  # そのバックエンドでのモデル名（キャラ専用モデルなど）
 
 
+class EffectEntryConfig(BaseModel):
+    """エフェクトカタログの1エントリ"""
+    file: str = ""    # cutin / se 用のファイル（作業フォルダ相対。cutin は models/ 以下に置くと /models で配信される）
+    text: str = ""    # flip 用の定型文
+    label: str = ""   # プロンプト・画面に出す短い説明
+
+
+class SystemEffectsConfig(BaseModel):
+    """システム発火エフェクト（無音・材料なし時間帯の自動演出）の設定
+
+    モデルの自発発火とは別経路だが、全体クールダウン（EffectsConfig.
+    cooldown_sec）は自発発火と共有し、連発しない。さらにシステム発火
+    どうしの間隔（cooldown_sec）も空ける。
+    """
+    enabled: bool = True
+    cooldown_sec: float = 300.0          # システム発火どうしの最小間隔
+    silence_threshold_sec: float = 180.0  # 無音がこの秒数を超えたら発火を試みる
+    cutin_probability: float = 0.15      # カットインを混ぜる確率（残りはSE/フリップ）
+
+
+class EffectsConfig(BaseModel):
+    """演出エフェクト（カットイン動画・効果音・フリップ表示）の設定"""
+    enabled: bool = True
+    cooldown_sec: float = 90.0      # 自発エフェクト全体の最小間隔（手動発火は無視）
+    flip_duration_sec: float = 5.0  # フリップの表示時間
+    flip_max_chars: int = 30        # フリップ自由文の上限文字数
+    cutin: dict[str, EffectEntryConfig] = Field(default_factory=dict)
+    se: dict[str, EffectEntryConfig] = Field(default_factory=dict)
+    flip: dict[str, EffectEntryConfig] = Field(default_factory=dict)
+    system: SystemEffectsConfig = Field(default_factory=SystemEffectsConfig)
+
+
+class CharacterEffectsConfig(BaseModel):
+    """キャラクターごとのエフェクト上書き（None・空の項目は全体設定を使う）"""
+    enabled: Optional[bool] = None
+    cooldown_sec: Optional[float] = None
+    flip_duration_sec: Optional[float] = None
+    flip_max_chars: Optional[int] = None
+    cutin: dict[str, EffectEntryConfig] = Field(default_factory=dict)
+    se: dict[str, EffectEntryConfig] = Field(default_factory=dict)
+    flip: dict[str, EffectEntryConfig] = Field(default_factory=dict)
+
+
+class ThoughtsConfig(BaseModel):
+    """内心（inner thoughts）の設定。声には出さず、画面の小さい吹き出しにだけ出す"""
+    enabled: bool = True
+    max_chars: int = 30          # 内心の上限文字数（検証で切り詰める）
+    cooldown_sec: float = 20.0   # 内心表示の最小間隔（thought専用。effectとは別時計）
+
+
+class CharacterThoughtsConfig(BaseModel):
+    """キャラクターごとの内心設定の上書き（Noneの項目は全体設定を使う）"""
+    enabled: Optional[bool] = None
+    max_chars: Optional[int] = None
+    cooldown_sec: Optional[float] = None
+
+
+class ElythMemoryConfig(BaseModel):
+    """ELYTH会話エピソードの記憶取り込み（PC側）の設定。
+
+    VM側 cron が Google Drive `Muse連携/elyth-episodes/` へ置く日次
+    エピソード（ELYTH-EP-*.md）を、アプリ起動時＋定期的に走査して
+    character（既定 Character1）の MemoryStore へだけ取り込む。
+    Character2は ELYTH に参加していないため対象外（個体分離）。
+    episodes_dir が空、または enabled=false で取り込みは止まる。
+    """
+    enabled: bool = True
+    episodes_dir: str = ""            # Drive ローカルコピーの elyth-episodes フォルダ
+    character: str = "Character1"         # 取り込み先キャラの id
+    scan_interval_sec: float = 3600.0  # 定期走査の間隔（起動時にも1回走る）
+
+
 class CharacterConfig(BaseModel):
     """
     出演キャラクター1体ぶんの設定。
@@ -158,7 +234,7 @@ class CharacterConfig(BaseModel):
     掛け合い配信では config.yaml の characters に複数並べる。
     声・アバター・LLM はキャラごとに上書きでき、書かなければ全体設定を使う。
     """
-    name: str = "Character1"
+    name: str = "Character2"
     # アバター画面の ?char= や WebSocket のメッセージで使う識別子（空なら name）
     id: str = ""
     enabled: bool = True
@@ -176,6 +252,8 @@ class CharacterConfig(BaseModel):
     # 生成が反復ブロック等で詰まったときにそのまま喋る定型の繋ぎ台詞。
     # 話題に依存しない汎用文だけを置く（事実の主張・数値は入れない）
     fallback_lines: list[str] = Field(default_factory=list)
+    effects: CharacterEffectsConfig = Field(default_factory=CharacterEffectsConfig)
+    thoughts: CharacterThoughtsConfig = Field(default_factory=CharacterThoughtsConfig)
 
     @property
     def key(self) -> str:
@@ -338,6 +416,58 @@ class SafetyConfig(BaseModel):
     ng_words: list[str] = Field(default_factory=list)
 
 
+class CommentFilterConfig(BaseModel):
+    """コメント選別（トリアージ）の設定。
+
+    配信コメントのうち「応答するもの」だけをキューへ進める段の設定。
+    記録（StreamArchiver）と視聴者プロフィールは選別結果に依らず更新される。
+    enabled=false でこの段は素通りし、従来動作（全件キュー投入）に戻る。
+    必ず拾う条件（スパチャ／キャラ名の呼びかけ／質問形／初コメ）と、
+    落とす条件（NGワード／重複／連打／リアクションのみ）はコード側の
+    ルールで、ここでは確率・閾値・NGワードだけを調整できるようにする。
+    """
+    enabled: bool = True
+    ng_words: list[str] = Field(default_factory=list)  # 含むコメントは応答しない
+    # 混雑度ごとの「通常コメントを拾う確率」（キュー滞留で下がる）
+    base_pickup_probability: float = 1.0        # 通常時
+    congested_pickup_probability: float = 0.5   # 滞留時
+    saturated_pickup_probability: float = 0.2   # 飽和時
+    congested_queue_size: int = 5    # キューがこの件数以上で「滞留」
+    saturated_queue_size: int = 15   # キューがこの件数以上で「飽和」
+    saturated_min_score: float = 3.0  # 飽和時、これ未満のスコアは確率判定なしで落とす
+    duplicate_window_sec: int = 60   # 同一ユーザーの同一文を重複とみなす間隔（秒）
+    spam_repeat_min_length: int = 6  # 連打判定を始める最小文字数
+    spam_repeat_ratio: float = 0.8   # 最頻文字がこの割合以上なら連打とみなす
+
+
+class ViewerPointsConfig(BaseModel):
+    """視聴者ポイント（Phase 4 / 組み込み検討書 §5 第1段）の設定。
+
+    視聴者ごとのポイント台帳と、累積ポイントによる親密度レベル移行。
+    加算は基本点＋レート制限つきルールで、同一イベントの連打では
+    稼げないようにする。enabled=false でポイント加算は止まり、
+    レベルは従来の来訪回数ベースに戻る。
+    """
+    enabled: bool = True
+    # 基本点
+    visit_points: int = 10            # 来訪（1配信セッションにつき1回だけ）
+    comment_points: int = 2           # 実質のあるコメント1件
+    reaction_points: int = 1          # リアクションのみのコメント1件
+    picked_points: int = 3            # コメントに応答してもらえたときの上乗せ
+    superchat_base_points: int = 10   # スパチャ基本点
+    superchat_per_1000_points: int = 1  # スパチャ1,000円ごとの上乗せ
+    superchat_bonus_cap: int = 10     # スパチャ金額上乗せの上限
+    attendance_milestone_every: int = 5    # 参加配信数がこの倍数に達するたび
+    attendance_milestone_points: int = 20  # 継続参加ボーナス
+    # レート制限（直近1時間の加算回数上限）
+    comment_max_per_hour: int = 10
+    reaction_max_per_hour: int = 5
+    picked_max_per_hour: int = 20
+    session_point_cap: int = 150      # 1セッションで稼げる上限（スパチャ分は除く）
+    # レベル閾値（Lv1..Lv5 の開始ポイント）
+    level_thresholds: list[int] = Field(default_factory=lambda: [0, 50, 200, 500, 1000])
+
+
 class WebSearchConfig(BaseModel):
     """Web検索（知識の仕入れ）の設定"""
     provider: str = "auto"          # auto / google_cse / brave / duckduckgo / google_news
@@ -379,6 +509,16 @@ class AutonomousTopicConfig(BaseModel):
     min_web_interval_sec: int = 120   # Webネタはこの間隔以上あける（API節約・話題の偏り防止）
     max_documents: int = 3            # プロンプトに入れる記事数の上限
     remember: bool = True             # 話したネタをエピソード記憶に残す
+    # Phase 1（組み込み検討書 §3-C1/C2）: プランナーの穴埋め
+    memory_share_cap: float = 0.45    # 直近ウィンドウで memory 話題がこの占有率以上なら、他候補がある間は memory を選ばない
+    memory_share_window: int = 20     # 占有率を測る直近の話題数
+    filler_enabled: bool = False      # 材料が全て尽きたとき、定番小噺へフォールバックする（本番は config.yaml で有効化）
+    # Phase 3（次発言プランニング / STUDY §6-(a1)）: ルール版プランナー
+    planner_enabled: bool = True      # 次発言の意図決定と弧の完遂判定（無効で Phase 2 までの動作）
+    arc_max_speeches: int = 4         # 1つの話題の弧で許す発話数の上限（導入を含む）
+    arc_max_continuations: int = 2    # 弧の継続回数の上限（Phase 1 までの固定値2を設定化）
+    arc_max_sec: float = 900.0        # 弧の開始からの上限時間（秒）。超えたら弧を解放する
+    arc_ask_probability: float = 0.25 # 展開の発話で「問いかけ」の意図を選ぶ確率
 
 
 class AnswerWithSearchConfig(BaseModel):
@@ -475,6 +615,11 @@ class AppConfig(BaseModel):
     audio_output: AudioOutputConfig = Field(default_factory=AudioOutputConfig)
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
+    comment_filter: CommentFilterConfig = Field(default_factory=CommentFilterConfig)
+    viewer_points: ViewerPointsConfig = Field(default_factory=ViewerPointsConfig)
+    effects: EffectsConfig = Field(default_factory=EffectsConfig)
+    thoughts: ThoughtsConfig = Field(default_factory=ThoughtsConfig)
+    elyth_memory: ElythMemoryConfig = Field(default_factory=ElythMemoryConfig)
     knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
     local_chat: LocalChatConfig = Field(default_factory=LocalChatConfig)
     stt: STTConfig = Field(default_factory=STTConfig)

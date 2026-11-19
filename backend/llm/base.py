@@ -5,6 +5,7 @@ import json
 from abc import ABC, abstractmethod
 from typing import AsyncIterator
 
+from backend.llm.parser import render_tag_output
 from backend.models import ChatMessage, LLMResponse
 
 
@@ -13,6 +14,11 @@ class LLMBackend(ABC):
     route: 応答の種別（"respond"=即応が要る応答 / "idle"=待機系）。
     ハイブリッド振り分け（HybridRouter）だけが使う。他のバックエンドは無視してよい。
     """
+
+    # 出力プロトコル（"json" | "tag"）。factory が config.llm.protocol を
+    # スタンプする。バックエンド側のパーサ選択と、Ollama の format:json
+    # 抑制に使う（Phase 5 Stage D）
+    protocol: str = "json"
 
     @abstractmethod
     async def generate(
@@ -48,7 +54,12 @@ class LLMBackend(ABC):
         result = await self.generate(system_prompt, messages, route=route,
                                      temperature=temperature)
         if result.raw:
-            yield json.dumps(result.raw, ensure_ascii=False)
+            if isinstance(result.raw, dict) \
+                    and result.raw.get("protocol") == "tag":
+                # タグ方式では下流の TagSpeechStreamParser が読める形で流す
+                yield render_tag_output(result)
+            else:
+                yield json.dumps(result.raw, ensure_ascii=False)
         elif result.speech:
             yield json.dumps({
                 "speech": result.speech,

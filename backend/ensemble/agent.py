@@ -148,7 +148,9 @@ class CharacterAgent:
         )
         self.mind_store = MindStore(db_path=char_dir / "memories.db")
         self.refresh_mind()
-        self.viewer_store = ViewerProfileStore(db_path=char_dir / "viewer_profiles.db")
+        self.viewer_store = ViewerProfileStore(
+            db_path=char_dir / "viewer_profiles.db",
+            points_cfg=self.app.viewer_points)
         self.chat_history = ChatHistory(
             name, prompts_dir=data_dir,
             max_entries=self.app.local_chat.history_max_entries,
@@ -267,7 +269,25 @@ class CharacterAgent:
             limit = orch.idle_core_memory_chars
             parts.append(core if len(core) <= limit else core[:limit] + "\n…")
         if self.memory_store is not None:
-            recent = self.memory_store.sample_recent(limit=orch.idle_episodic_entries)
+            limit = orch.idle_episodic_entries
+            recent = self.memory_store.sample_recent(limit=limit)
+            # 話題化したばかりの記憶は L3 にも出さない（Phase 1 / STUDY
+            # §3-C3 の最小形）。プランナーのクールダウン台帳を共有し、
+            # 「話題として話した記憶」と「常駐注入される記憶」の二経路で
+            # 同じエピソードが繰り返される（お菓子ループの温床）を断つ。
+            # 除外で枠が空く場合は、少し広く引いて別の記憶で埋める
+            planner = getattr(orch, "_planner", None)
+            if planner is not None and recent:
+                try:
+                    fresh = [e for e in recent
+                             if not planner.is_topic_memory_recent(e.text)]
+                    if len(fresh) < limit:
+                        wider = self.memory_store.sample_recent(limit=limit * 3)
+                        fresh = [e for e in wider
+                                 if not planner.is_topic_memory_recent(e.text)]
+                    recent = fresh[:limit]
+                except Exception:
+                    pass
             if recent:
                 parts.append("\n".join(["## 最近おぼえたこと"] + [f"- {e.text}" for e in recent]))
         if extra:

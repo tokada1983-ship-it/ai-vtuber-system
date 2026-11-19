@@ -19,7 +19,7 @@ _SAMPLE_COMMENTS = [
     {"author": "ユーザーB", "message": "今日も元気そうで良かった"},
     {"author": "ユーザーC", "message": "最近どんなゲームやってるの？"},
     {"author": "ユーザーD", "message": "プログラミングって難しいですか？"},
-    {"author": "ユーザーE", "message": "Character1ちゃん大好きー！"},
+    {"author": "ユーザーE", "message": "Character2ちゃん大好きー！"},
     {"author": "ユーザーF", "message": "このシステムどうやって作ったの？"},
     {"author": "ユーザーG", "message": "配信いつも楽しみにしてます"},
     {"author": "ユーザーH", "message": "今日の天気どう思う？"},

@@ -3,11 +3,44 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 
 from backend.logger import get_logger
 from backend.models import Emotion, LLMResponse, Motion
 
 logger = get_logger(__name__)
+
+
+# ── パース結果の計測（Phase 1: no_json の致命/非致命の分離） ──────
+# 3時間テストで「No JSON object found」が203回出たが、その大半が
+# 「ストリーム側で発話が成立していた（非致命）」のか「ターンが丸ごと
+# 消えた（致命）」のか区別できなかった。parse_llm_output の結果を
+# 3分類して数え、長時間テストで内訳を追えるようにする。
+PARSE_OUTCOME_OK = "ok"
+PARSE_OUTCOME_SALVAGED = "no_json_salvaged"
+PARSE_OUTCOME_FATAL = "no_json_fatal"
+_parse_outcomes: dict[str, int] = {
+    PARSE_OUTCOME_OK: 0,
+    PARSE_OUTCOME_SALVAGED: 0,
+    PARSE_OUTCOME_FATAL: 0,
+}
+
+
+def parse_outcome_stats(protocol: str = "json") -> dict[str, int]:
+    """パース結果の累計（ok / no_json_salvaged / no_json_fatal）。
+
+    protocol="tag" のときはタグ方式の計測（ok / degraded / fatal）を返す。
+    knowledge_status は config の protocol に応じて片方だけを出す。
+    """
+    if str(protocol or "json").lower() == "tag":
+        return tag_parse_outcome_stats()
+    return dict(_parse_outcomes)
+
+
+def record_parse_outcome(outcome: str) -> None:
+    """パース結果を1件数える（streaming 側の分類からも使う）"""
+    if outcome in _parse_outcomes:
+        _parse_outcomes[outcome] += 1
 
 
 # ── メタ漏れ（推論・ターン記号）検出と同一文の繰り返し除去 ──────
@@ -197,7 +230,154 @@ def strip_greeting_template(text: str) -> str:
     return prefix + stripped
 
 
-def parse_llm_output(raw_text: str) -> LLMResponse:
+# ── 切断JSONからのサルベージ（Phase 1: 消費側の堅牢化） ──────────
+# 生成が途中で切れると JSON としては壊れるが、speech の値は途中まで
+# （あるいは全部）届いていることが多い。全文パースの失敗だけを理由に
+# 発話を捨てると回復リトライが連鎖するため、speech/emotion/motion を
+# 個別に拾って発話として成立させる。救う基準は控えめにする：
+# 「あらら」のような未完の断片（06:41:08 の回帰）はここでも救わない。
+_SPEECH_VALUE_RE = re.compile(r'"speech"\s*:\s*"')
+_SKIP_TRUE_RE = re.compile(r'"skip"\s*:\s*true')
+_SENTENCE_END_CHARS = "。．！？!?…"
+
+_STRING_ESCAPES = {
+    "n": "\n", "t": " ", "r": "", '"': '"', "\\": "\\", "/": "/",
+    "b": "", "f": "",
+}
+
+
+def _decode_json_string_prefix(text: str, start: int) -> tuple[str, bool]:
+    """JSON文字列リテラルの中身を start から読み取る（streaming と同仕様）。
+
+    Returns: (デコード済み文字列, 閉じ引用符に到達したか)
+    """
+    buf: list[str] = []
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            if i + 1 >= n:
+                break  # エスケープ対象がまだ届いていない（切断）
+            nxt = text[i + 1]
+            if nxt == "u":
+                if i + 6 > n:
+                    break  # \uXXXX が未完（切断）
+                try:
+                    buf.append(chr(int(text[i + 2:i + 6], 16)))
+                except ValueError:
+                    pass
+                i += 6
+                continue
+            buf.append(_STRING_ESCAPES.get(nxt, nxt))
+            i += 2
+            continue
+        if ch == '"':
+            return "".join(buf), True
+        buf.append(ch)
+        i += 1
+    return "".join(buf), False
+
+
+def _peek_string_value(text: str, key: str) -> str:
+    """壊れたJSONからでも、完結している文字列キーの値を拾う"""
+    m = re.search(rf'"{key}"\s*:\s*"([^"]*)"', text)
+    return m.group(1) if m else ""
+
+
+def _extract_effect_object(text: str) -> dict | None:
+    """末尾の "effect" オブジェクトを括弧バランスで取り出す（streaming と同方式）"""
+    m = re.search(r'"effect"\s*:\s*\{', text)
+    if not m:
+        return None
+    start = m.end() - 1
+    depth = 0
+    in_str = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    obj = json.loads(text[start:i + 1])
+                except ValueError:
+                    return None
+                return obj if isinstance(obj, dict) else None
+    return None
+
+
+def salvage_broken_json(text: str) -> LLMResponse | None:
+    """壊れたJSONから発話を救済する。救えなければ None。
+
+    救済するのは「発話として確定している」と言えるものだけ：
+      - speech の文字列が閉じている、または
+      - 文末記号を含む（文が完結している）、または
+      - 正規化8字以上の長さがある（文の途中で切れても内容が成立）
+    明示的な skip:true と、安全性チェック（タグ断片・メタ漏れ）に
+    掛かるものは救済しない（通常経路と同じ基準）。
+    """
+    if not text or _SKIP_TRUE_RE.search(text):
+        return None
+    m = _SPEECH_VALUE_RE.search(text)
+    if not m:
+        return None
+    value, closed = _decode_json_string_prefix(text, m.end())
+    speech = value.strip()
+    if not speech:
+        return None
+    normalized = re.sub(r"[\s、。，．！？!?'\"“”‘’]", "", speech)
+    if not closed and len(normalized) < 8 \
+            and not any(c in speech for c in _SENTENCE_END_CHARS):
+        # 未完の断片（「あらら」等）は発話として確定していないので救わない
+        return None
+    if re.search(r"<\s*(emotion|motion|speech)\s*:|<\|[^>]*\|>", speech):
+        return None
+    if contains_meta_leak(speech):
+        return None
+    speech = dedupe_repeated_sentences(speech)
+    if not speech:
+        return None
+    try:
+        emotion = Emotion(_peek_string_value(text, "emotion"))
+    except ValueError:
+        emotion = Emotion.NEUTRAL
+    try:
+        motion = Motion(_peek_string_value(text, "motion"))
+    except ValueError:
+        motion = Motion.IDLE
+    return LLMResponse(
+        speech=speech,
+        emotion=emotion,
+        motion=motion,
+        skip=False,
+        raw={"salvaged": True},
+        effect=_extract_effect_object(text),
+        # 内心も完結していれば拾う（エスケープを含む場合は途切れうるが、
+        # サルベージ用途として許容し、最終検証は配送側で行う）
+        thought=_peek_string_value(text, "thought"),
+    )
+
+
+def _looks_like_json_attempt(text: str) -> bool:
+    """JSONを返そうとした形跡があるか（プレーンテキスト出力と区別する）"""
+    t = (text or "").lstrip()
+    return t.startswith("{") or '"speech"' in t
+
+
+def parse_llm_output(raw_text: str, _count: bool = True) -> LLMResponse:
     """
     LLMが返したテキストからJSONを抽出してLLMResponseに変換する。
     以下のパターンに対応:
@@ -224,6 +404,17 @@ def parse_llm_output(raw_text: str) -> LLMResponse:
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1:
+        # JSONとしては壊れているが、speech が確定していれば救済する
+        # （Phase 1: 全文パース失敗だけを理由に発話を捨てない）
+        salvaged = salvage_broken_json(text)
+        if salvaged is not None:
+            if _count:
+                record_parse_outcome(PARSE_OUTCOME_SALVAGED)
+            logger.warning("No JSON object found; speech salvaged",
+                           speech=salvaged.speech[:40])
+            return salvaged
+        if _count and _looks_like_json_attempt(text):
+            record_parse_outcome(PARSE_OUTCOME_FATAL)
         logger.warning("No JSON object found in LLM output",
                        raw_preview=raw_text[:300],
                        after_strip=text[:300])
@@ -234,8 +425,20 @@ def parse_llm_output(raw_text: str) -> LLMResponse:
     try:
         data = json.loads(json_str)
     except json.JSONDecodeError as e:
+        salvaged = salvage_broken_json(text)
+        if salvaged is not None:
+            if _count:
+                record_parse_outcome(PARSE_OUTCOME_SALVAGED)
+            logger.warning("JSON parse error; speech salvaged",
+                           error=str(e), speech=salvaged.speech[:40])
+            return salvaged
+        if _count:
+            record_parse_outcome(PARSE_OUTCOME_FATAL)
         logger.warning("JSON parse error", error=str(e), raw=json_str[:300])
         return LLMResponse(speech="", skip=True)
+
+    if _count:
+        record_parse_outcome(PARSE_OUTCOME_OK)
 
     # skip フラグ
     if data.get("skip", False):
@@ -271,6 +474,18 @@ def parse_llm_output(raw_text: str) -> LLMResponse:
     except ValueError:
         motion = Motion.IDLE
 
+    # 演出エフェクト（任意）。ここでは dict であることだけを確認し、
+    # カタログ照合などの検証は配送側（backend.effects）が行う
+    effect = data.get("effect")
+    if not isinstance(effect, dict):
+        effect = None
+
+    # 内心（任意）。文字列であることだけを確認し、長さ・内容の検証は
+    # 配送側（backend.effects）が行う。声には絶対に出さない
+    thought = data.get("thought")
+    if not isinstance(thought, str):
+        thought = ""
+
     return LLMResponse(
         speech=speech,
         emotion=emotion,
@@ -278,4 +493,275 @@ def parse_llm_output(raw_text: str) -> LLMResponse:
         target_comment_id=data.get("target_comment_id"),
         skip=False,
         raw=data,
+        effect=effect,
+        thought=thought.strip(),
     )
+
+
+# ── タグ方式パーサ（Phase 5 Stage D） ─────────────────────────
+# PROTOCOL.md の文法 `[emo:][mot:]発話[fx:][th:]` を解釈する。
+# JSON 方式と違い、タグが欠落・破損しても発話本文は成立させる。
+# 計測は ok / degraded / fatal の3区分（PROTOCOL §4-5）で、JSON 側の
+# parse_outcomes とは別カウンタに分ける（knowledge_status は
+# protocol に応じて片方だけを出す）。
+
+TAG_OUTCOME_OK = "ok"
+TAG_OUTCOME_DEGRADED = "degraded"
+TAG_OUTCOME_FATAL = "fatal"
+_tag_parse_outcomes: dict[str, int] = {
+    TAG_OUTCOME_OK: 0,
+    TAG_OUTCOME_DEGRADED: 0,
+    TAG_OUTCOME_FATAL: 0,
+}
+
+
+def tag_parse_outcome_stats() -> dict[str, int]:
+    """タグ方式パース結果の累計（ok / degraded / fatal）"""
+    return dict(_tag_parse_outcomes)
+
+
+def record_tag_parse_outcome(outcome: str) -> None:
+    """タグ方式のパース結果を1件数える"""
+    if outcome in _tag_parse_outcomes:
+        _tag_parse_outcomes[outcome] += 1
+
+
+_TAG_TOKEN_RE = re.compile(r"\[(emo|mot|fx|th):([^\[\]]*)\]")
+# 未完タグの判定（'[' の後ろがタグ名の途中までで途切れている形）
+_TAG_PARTIAL_RE = re.compile(r"\[(?:e|em|emo|m|mo|mot|f|fx|t|th)?(?::[^\[\]]*)?")
+_TAG_HEAD_RE = re.compile(r"\[(?:emo|mot|fx|th):")
+# 角括弧断片の最大長（PROTOCOL §4-2 の保留上限）
+_TAG_FRAG_MAX = 64
+
+_EMOTION_VALUES = {e.value for e in Emotion}
+_MOTION_VALUES = {m.value for m in Motion}
+
+
+@dataclass
+class TagScan:
+    """タグ走査の結果。emotion/motion は検証前の生値（"" は未出現）"""
+    speech: str = ""
+    emotion_raw: str = ""
+    motion_raw: str = ""
+    effect: dict | None = None
+    thought: str = ""
+    issues: set[str] = field(default_factory=set)
+    held_from: int | None = None  # 保留中の未完断片の開始位置（final=False のみ）
+
+
+def _parse_fx_value(val: str, flip_names: set, issues: set) -> dict | None:
+    """[fx:<type>:<value>] の値を配送側（validate_effect）の形に変換する。
+
+    cutin/se は name、flip は「定型文の名前なら name、それ以外は text」
+    として渡す（名前→定型文の解決は validate_effect が行う）。
+    """
+    if ":" not in val:
+        issues.add("fx_broken")
+        return None
+    ftype, fval = val.split(":", 1)
+    ftype = ftype.strip().lower()
+    fval = fval.strip()
+    if ftype in ("cutin", "se"):
+        if not fval:
+            issues.add("fx_broken")
+            return None
+        return {"type": ftype, "name": fval}
+    if ftype == "flip":
+        if not fval:
+            issues.add("fx_broken")
+            return None
+        if fval in flip_names:
+            return {"type": "flip", "name": fval}
+        return {"type": "flip", "text": fval}
+    issues.add("fx_broken")
+    return None
+
+
+def scan_tag_output(text: str, *, final: bool = True,
+                    flip_names=None) -> TagScan:
+    """タグ付き出力を走査して発話・タグ・劣化要因に分解する。
+
+    final=False（ストリーミング途中）では、末尾の未完の '[' 断片を
+    保留し（held_from に位置を返す）、発話にもタグにも数えない。
+    final=True では未完断片は破棄し、劣化として記録する。
+    角括弧断片はタグ文法に一致するものだけを制御タグとして扱い、
+    一致しない断片も発話からは除去する（PROTOCOL §4-1）。
+    入力は思考タグ除去済みのテキストを想定する。
+    """
+    scan = TagScan()
+    flip_name_set = set(flip_names or ())
+    parts: list[str] = []
+    speech_started = False
+    fx_seen = False
+    th_seen = False
+    i = 0
+    n = len(text)
+    while i < n:
+        j = text.find("[", i)
+        if j == -1:
+            seg = text[i:]
+            if "]" in seg:
+                scan.issues.add("stray_bracket")
+                seg = seg.replace("]", "")
+            parts.append(seg)
+            if seg.strip():
+                speech_started = True
+            break
+        if j > i:
+            seg = text[i:j]
+            if "]" in seg:
+                scan.issues.add("stray_bracket")
+                seg = seg.replace("]", "")
+            parts.append(seg)
+            if seg.strip():
+                speech_started = True
+            i = j
+        # text[i] == "["
+        k = text.find("]", i + 1, i + _TAG_FRAG_MAX)
+        if k == -1:
+            rest = text[i:]
+            if not final and len(rest) <= _TAG_FRAG_MAX \
+                    and _TAG_PARTIAL_RE.fullmatch(rest):
+                # 未完のタグかもしれないので保留する（次の断片で確定する）
+                scan.held_from = i
+                break
+            k2 = text.find("]", i + 1)
+            if k2 != -1:
+                # 長すぎる角括弧断片はタグではないが発話にも混ぜない
+                scan.issues.add("unknown_fragment")
+                i = k2 + 1
+                continue
+            # 末尾まで完結しない断片は破棄する
+            if _TAG_HEAD_RE.match(rest) or _TAG_PARTIAL_RE.fullmatch(rest):
+                scan.issues.add("partial_dropped")
+            else:
+                scan.issues.add("stray_bracket")
+            break
+        frag = text[i:k + 1]
+        m = _TAG_TOKEN_RE.fullmatch(frag)
+        if m is None:
+            # 未知の角括弧断片は読み上げ防止のため発話から除去する
+            scan.issues.add("unknown_fragment")
+            i = k + 1
+            continue
+        kind, val = m.group(1), m.group(2).strip()
+        if kind == "emo":
+            if scan.emotion_raw:
+                scan.issues.add("extra_tag")
+            else:
+                scan.emotion_raw = val
+                if speech_started:
+                    scan.issues.add("emo_not_leading")
+                if val not in _EMOTION_VALUES:
+                    scan.issues.add("emo_invalid")
+        elif kind == "mot":
+            if scan.motion_raw:
+                scan.issues.add("extra_tag")
+            else:
+                scan.motion_raw = val
+                if speech_started:
+                    scan.issues.add("mot_not_leading")
+                if val not in _MOTION_VALUES:
+                    scan.issues.add("mot_invalid")
+        elif kind == "fx":
+            if fx_seen:
+                scan.issues.add("fx_extra")
+            else:
+                fx_seen = True
+                scan.effect = _parse_fx_value(val, flip_name_set, scan.issues)
+        elif kind == "th":
+            if th_seen:
+                scan.issues.add("extra_tag")
+            else:
+                th_seen = True
+                scan.thought = val
+        i = k + 1
+    scan.speech = "".join(parts)
+    if final:
+        if not scan.emotion_raw:
+            scan.issues.add("emo_missing")
+        if not scan.motion_raw:
+            scan.issues.add("mot_missing")
+    return scan
+
+
+def parse_tag_output(raw_text: str, _count: bool = True,
+                     flip_names=None) -> LLMResponse:
+    """タグ方式の全文パース（非ストリーミング経路用）。
+
+    JSON 方式の parse_llm_output と同じ安全基準（思考タグ除去・
+    メタ漏れ遮断・同一文の繰り返し除去）を適用し、タグが壊れて
+    いても発話が成立すれば返す。失敗時は skip=True（例外は投げない）。
+    """
+    text = (raw_text or "").strip()
+    logger.debug("LLM raw output (tag)", preview=text[:200])
+    text = strip_think_tags(text).strip()
+    text = re.sub(r"```(?:json|text)?\s*", "", text)
+    text = re.sub(r"```", "", text).strip()
+
+    scan = scan_tag_output(text, final=True, flip_names=flip_names)
+    speech = scan.speech.strip()
+
+    if not speech:
+        # タグだけの出力は skip の意思表示（PROTOCOL §3）。JSON 方式で
+        # skip:true が ok に数えられるのと揃え、致命にはしない
+        if scan.emotion_raw and scan.motion_raw:
+            if _count:
+                record_tag_parse_outcome(
+                    TAG_OUTCOME_DEGRADED if scan.issues else TAG_OUTCOME_OK)
+            return LLMResponse(speech="", skip=True, raw={"protocol": "tag"})
+        if _count:
+            record_tag_parse_outcome(TAG_OUTCOME_FATAL)
+        logger.warning("No speech in tag output", raw_preview=text[:300])
+        return LLMResponse(speech="", skip=True)
+
+    if _count:
+        record_tag_parse_outcome(
+            TAG_OUTCOME_DEGRADED if scan.issues else TAG_OUTCOME_OK)
+
+    # 安全基準は JSON 方式と同一（メタ漏れは喋らせない）
+    if contains_meta_leak(speech):
+        logger.warning("Meta leak in speech (tag), skipping",
+                       speech=speech[:120])
+        return LLMResponse(speech="", skip=True, raw={"protocol": "tag"})
+    speech = dedupe_repeated_sentences(speech)
+    if not speech:
+        return LLMResponse(speech="", skip=True, raw={"protocol": "tag"})
+
+    try:
+        emotion = Emotion(scan.emotion_raw)
+    except ValueError:
+        emotion = Emotion.NEUTRAL
+    try:
+        motion = Motion(scan.motion_raw)
+    except ValueError:
+        motion = Motion.IDLE
+    return LLMResponse(
+        speech=speech,
+        emotion=emotion,
+        motion=motion,
+        skip=False,
+        raw={"protocol": "tag"},
+        effect=scan.effect,
+        thought=scan.thought.strip(),
+    )
+
+
+def render_tag_output(resp: LLMResponse) -> str:
+    """LLMResponse をタグ形式テキストに戻す。
+
+    非ストリーミングバックエンドの generate_stream 既定実装が、
+    JSON ではなくタグ形式で下流（TagSpeechStreamParser）へ流すために使う。
+    """
+    out = f"[emo:{resp.emotion.value}][mot:{resp.motion.value}]{resp.speech}"
+    if resp.effect:
+        etype = str(resp.effect.get("type", "")).strip()
+        if etype in ("cutin", "se"):
+            out += f"[fx:{etype}:{resp.effect.get('name', '')}]"
+        elif etype == "flip":
+            val = str(resp.effect.get("text") or resp.effect.get("name") or "")
+            if val:
+                out += f"[fx:flip:{val}]"
+    if resp.thought:
+        out += f"[th:{resp.thought}]"
+    return out

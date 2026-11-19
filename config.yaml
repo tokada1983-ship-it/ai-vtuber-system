@@ -17,6 +17,9 @@ twitch:
 llm:
   primary: lmstudio
   fallback: ollama
+  # 発話フォーマット。tag = タグ方式（現行。人格QLoRAのタグ形式学習と対）
+  # json = 従来のJSON方式（ロールバック用に残置）
+  protocol: tag
   backends:
     lmstudio:
       base_url: http://localhost:1234/v1
@@ -117,6 +120,13 @@ characters:
     llm:
       backend: ''          # 空なら llm.primary / fallback を使う
       model: ''            # キャラ専用モデル（人格QLoRAの登録名など）を使うときだけ指定
+    # キャラ固有のエフェクト上書き（任意。書かなければ全体設定の effects を使う）
+    effects:
+      cutin:
+        solo:
+          file: models/effects/cutin/Character1.mp4
+          text: ''
+          label: カットイン
     # 生成が反復ブロック等で詰まったときにそのまま喋る繋ぎ台詞。
     # 話題に依存しない汎用文だけを置く（事実の主張・数値は入れない）
     fallback_lines:
@@ -205,6 +215,36 @@ orchestrator:
 safety:
   enabled: true
   ng_words: []
+# コメント選別（応答キューの手前で「応答するか」を判定する）
+comment_filter:
+  enabled: true
+  ng_words: []
+  base_pickup_probability: 1.0
+  congested_pickup_probability: 0.5
+  saturated_pickup_probability: 0.2
+  congested_queue_size: 5
+  saturated_queue_size: 15
+  saturated_min_score: 3.0
+  duplicate_window_sec: 60
+  spam_repeat_min_length: 6
+  spam_repeat_ratio: 0.8
+# 視聴者ポイント（来訪・コメント・拾われた等で貯まる台帳とレベル）
+viewer_points:
+  enabled: true
+  visit_points: 10
+  comment_points: 2
+  reaction_points: 1
+  picked_points: 3
+  superchat_base_points: 10
+  superchat_per_1000_points: 1
+  superchat_bonus_cap: 10
+  attendance_milestone_every: 5
+  attendance_milestone_points: 20
+  comment_max_per_hour: 10
+  reaction_max_per_hour: 5
+  picked_max_per_hour: 20
+  session_point_cap: 150
+  level_thresholds: [0, 50, 200, 500, 1000]
 knowledge:
   enabled: true
   blocked_domains: []
@@ -240,6 +280,17 @@ knowledge:
     min_web_interval_sec: 120
     max_documents: 3
     remember: true
+    # 話題プランナ（Phase 3）: 話題の弧（導入→深掘り→締め）の管理
+    planner_enabled: true
+    arc_max_speeches: 4
+    arc_max_continuations: 2
+    arc_max_sec: 900.0
+    arc_ask_probability: 0.25
+    # 記憶話題の占有率キャップ（直近の話題が記憶ばかりになるのを防ぐ）
+    memory_share_cap: 0.45
+    memory_share_window: 20
+    # 材料が無いときの繋ぎ小噺
+    filler_enabled: true
   answer_with_search:
     enabled: true
     trigger_words:
@@ -380,6 +431,73 @@ ollama:
   auto_pull: false
   startup_timeout_sec: 30.0
   stop_on_exit: true
+# 内心（thought）表示: 発話に付随する短い内心を専用チャネルへ流す（TTSには混ぜない）
+thoughts:
+  enabled: true
+  max_chars: 30
+  cooldown_sec: 20.0
+# ELYTH（AI専用SNS）の日次エピソードを対象キャラの記憶へ取り込む
+# episodes_dir はエピソードファイル（ELYTH-EP-YYYYMMDD.md）のローカルコピー置き場
+elyth_memory:
+  enabled: true
+  episodes_dir: elyth-episodes
+  character: Character1
+  scan_interval_sec: 3600.0
+# 自発エフェクト（カットイン / SE / フリップボード）
+# SE の音声ファイル等のアセットは各自で配置する（このパッケージには含まれない）
+effects:
+  enabled: true
+  cooldown_sec: 90.0
+  flip_duration_sec: 5.0
+  flip_max_chars: 30
+  system:
+    enabled: true
+    cooldown_sec: 300.0
+    silence_threshold_sec: 180.0
+    cutin_probability: 0.15
+  cutin:
+    duo:
+      file: models/effects/cutin/duo.mp4
+      text: ''
+      label: 二人のカットイン
+  se:
+    sparkle:
+      file: assets/effects/se/sparkle.wav
+      text: ''
+      label: キラキラ
+    drumroll:
+      file: assets/effects/se/drumroll.wav
+      text: ''
+      label: ドラムロール
+    applause:
+      file: assets/effects/se/applause.wav
+      text: ''
+      label: 拍手
+    don:
+      file: assets/effects/se/don.wav
+      text: ''
+      label: ドン
+    chime:
+      file: assets/effects/se/chime.wav
+      text: ''
+      label: ピンポーン
+    whoosh:
+      file: assets/effects/se/whoosh.wav
+      text: ''
+      label: 風切り
+  flip:
+    announcement:
+      file: ''
+      text: 重大発表！
+      label: 重大発表
+    question:
+      file: ''
+      text: 質問コーナー
+      label: 質問コーナー
+    point:
+      file: ''
+      text: ここ、大事！
+      label: ここ、大事
 server:
   host: 127.0.0.1
   port: 9000

@@ -64,6 +64,8 @@ class LLMResponse:
     target_comment_id: str | None = None
     skip: bool = False
     raw: dict = field(default_factory=dict)
+    effect: dict | None = None   # 演出エフェクト（未検証の生dict。検証は配送側）
+    thought: str = ""            # 内心（声に出さない。表示専用チャネル。検証は配送側）
 
 
 @dataclass

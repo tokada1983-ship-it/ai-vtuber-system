@@ -9,6 +9,7 @@ from typing import Optional
 import yaml
 
 from backend.config import AppConfig, CharacterConfig
+from backend.effects import catalog_lines, resolve_effects, resolve_thoughts
 from backend.memory.mind_store import MindSnapshot
 
 _RESPONSE_FORMAT = """
@@ -23,7 +24,25 @@ _RESPONSE_FORMAT = """
 - 反応しないほうがよい場合（スパム・不適切な内容）だけ、speech を空文字 "" にすること
 
 **キーは必ず emotion → motion → speech の順で出力すること。**
-**上記の3キー以外は出力しないこと。JSONオブジェクト1つだけを出力すること。**
+**上記の3キー以外は出力しないこと。ただし「演出エフェクト」の節がある場合は末尾に effect キーを、「内心」の節がある場合は末尾に thought キーを、それぞれ1つだけ追加してよい。JSONオブジェクト1つだけを出力すること。**
+"""
+
+# タグ方式（Phase 5）のフォーマット節。文面は学習データ変換
+# （convert_dataset.py の TAG_FORMAT_SECTION = PROTOCOL.md §6 正文）と
+# 一字一句そろえる。学習側が「40文字以内」で固定されているため、
+# JSON 方式で行っているキャラ別上限（60字）への置換はタグ方式では
+# 行わない（学習時と実行時のプロンプト一致を優先する）。
+_RESPONSE_FORMAT_TAG = """
+## 【必須】出力フォーマット
+**タグ付きの発話テキストだけを出力すること。JSON・説明文・マークダウン・コードブロック・改行を前後に入れないこと。**
+
+[emo:happy][mot:wave]発話テキスト
+
+- 文頭に [emo:感情] と [mot:モーション] のタグを、この順で付けること
+- emo: neutral / happy / sad / angry / surprised / relaxed のいずれか1つ
+- mot: idle / nod / wave / tilt / jump / bow / shake_head / think / excited / shy / point / clap / stretch / lean_forward / dance / none のいずれか1つ
+- タグの直後に発話テキストを続けること（40文字以内の日本語）。発話テキストの中では [ と ] を使わないこと
+- 反応しないほうがよい場合（スパム・不適切な内容）だけ、発話テキストを空にすること（タグだけを出力する）
 """
 
 _INJECTION_GUARD = """
@@ -57,6 +76,95 @@ _NO_THINK = "/no_think"
 # その他のキャラは従来どおり40字。プロンプト内の「40文字以内」指定をキャラ別に差し替える。
 _SPEECH_LIMIT_BY_ID = {"Character1": 60}
 _DEFAULT_SPEECH_LIMIT = 40
+
+
+def _effects_section(config: AppConfig, char_cfg: CharacterConfig,
+                     protocol: str = "json") -> str:
+    """演出エフェクト（カットイン・効果音・フリップ）の案内。
+
+    そのキャラが使えるカタログが無い・無効な場合は節自体を出さない。
+    protocol="tag" のときは、付与方法の説明だけをタグ記法に置き換える
+    （カタログ・頻度の指示は JSON 方式と同一）。
+    """
+    resolved = resolve_effects(config, char_cfg)
+    if not resolved.enabled:
+        return ""
+    lines = catalog_lines(resolved)
+    if not lines:
+        return ""
+    tag = str(protocol or "json").lower() == "tag"
+    example = ""
+    for kind, catalog in (("flip", resolved.flip), ("se", resolved.se),
+                          ("cutin", resolved.cutin)):
+        if catalog:
+            name = next(iter(catalog))
+            example = (f"[fx:{kind}:{name}]" if tag
+                       else f'{{"type":"{kind}","name":"{name}"}}')
+            break
+    if tag:
+        howto = [
+            '使うときは発話テキストの後ろに fx タグを1つだけ追加します:',
+            '- カットイン動画: [fx:cutin:<名前>]',
+            '- 効果音: [fx:se:<名前>]',
+            '- フリップ（大きな文字のボード）: [fx:flip:<短い一言>]'
+            '（定型文を使うときは [fx:flip:<名前>]）',
+        ]
+        example_line = f"付け方の例: {example}" if example else ""
+    else:
+        howto = [
+            '使うときは JSON の末尾（speech の後ろ）に "effect" キーを1つだけ追加します:',
+            '- カットイン動画: {"type":"cutin","name":"<名前>"}',
+            '- 効果音: {"type":"se","name":"<名前>"}',
+            '- フリップ（大きな文字のボード）: {"type":"flip","text":"<短い一言>"}'
+            '（定型文を使うときは {"type":"flip","name":"<名前>"}）',
+        ]
+        example_line = f"付け方の例: \"effect\":{example}" if example else ""
+    body = [
+        "## 演出エフェクト（任意・たまにだけ）",
+        "発話に合わせて、画面や音の演出を1つだけ付けられます。挨拶・決め台詞・"
+        "重大な発表・話題の転換など「ここぞ」という場面でだけ、控えめに使って"
+        "ください。毎回付けたり、短い間隔で繰り返したりしないでください。",
+        *howto,
+        "使える名前:",
+        *lines,
+    ]
+    if example_line:
+        body.append(example_line)
+    return "\n".join(body)
+
+
+def _thoughts_section(config: AppConfig, char_cfg: CharacterConfig,
+                      protocol: str = "json") -> str:
+    """内心（inner thoughts）の案内。無効な場合は節自体を出さない。
+
+    内心は声に出さない「心の声」なので、発話の繰り返しや要約ではなく、
+    本音・感想・次に気になることを短く書くよう指示する。頻度は控えめに。
+    protocol="tag" のときは、付与方法の説明だけをタグ記法に置き換える。
+    """
+    resolved = resolve_thoughts(config, char_cfg)
+    if not resolved.enabled:
+        return ""
+    limit = max(1, int(resolved.max_chars))
+    tag = str(protocol or "json").lower() == "tag"
+    if tag:
+        howto = [
+            '使うときは発話テキストの後ろに th タグを追加します:',
+            '付け方の例: [th:つい笑っちゃった]',
+        ]
+    else:
+        howto = [
+            '使うときは JSON の末尾（speech の後ろ）に "thought" キーを追加します:',
+            '付け方の例: "thought":"つい笑っちゃった"',
+        ]
+    body = [
+        "## 内心（任意・たまにだけ）",
+        "声には出さない、心の中のつぶやきを付けられます。本音・感想・"
+        "次に気になることなど、発話とは違う一言を短く（"
+        f"{limit}字以内）。発話の繰り返しや要約はしないでください。"
+        "毎回付けたりせず、思わず心の声が漏れるような場面でだけ、控えめに。",
+        *howto,
+    ]
+    return "\n".join(body)
 
 
 def _speech_limit(character: CharacterConfig | None) -> int:
@@ -243,11 +351,19 @@ def build_system_prompt(
             anchor_lines.append(f"- 徹底すべき口調: {personality.strip()[:100]}")
         parts.append("\n".join(anchor_lines))
 
-    _fmt = _RESPONSE_FORMAT.strip()
+    protocol = str(getattr(config.llm, "protocol", "json") or "json").lower()
+    _fmt = (_RESPONSE_FORMAT_TAG if protocol == "tag"
+            else _RESPONSE_FORMAT).strip()
     _limit = _speech_limit(char_cfg)
-    if _limit != _DEFAULT_SPEECH_LIMIT:
+    if protocol != "tag" and _limit != _DEFAULT_SPEECH_LIMIT:
         _fmt = _fmt.replace("40文字以内", f"{_limit}文字以内")
     parts.append(_fmt)
+    effects_section = _effects_section(config, char_cfg, protocol)
+    if effects_section:
+        parts.append(effects_section)
+    thoughts_section = _thoughts_section(config, char_cfg, protocol)
+    if thoughts_section:
+        parts.append(thoughts_section)
     parts.append(_INJECTION_GUARD.strip())
     parts.append(_OPINION_RULE.strip())
     if cast_note:
@@ -537,6 +653,10 @@ def build_topic_prompt(
     mind: MindSnapshot | None = None,
     question_author: str = "",
     recent_own_speeches: list[str] | None = None,
+    resumed: bool = False,
+    arc_stage: str = "",
+    prev_speech: str = "",
+    intent: str = "",
 ) -> str:
     """
     自律トーク用プロンプト。ニュース/検索で仕入れた資料をお題として渡す。
@@ -548,6 +668,22 @@ def build_topic_prompt(
                     query が元の質問文、question_author が質問者名。
                     資料が「answer_failed」のプレースホルダだけなら
                     分からなかったことを正直に伝える締めにする
+        filler    … 材料が尽きたときの定番小噺（Phase 1）。資料ではなく
+                    お題として渡し、事実の断定や予定の創作を禁じる
+
+    resumed / arc_stage / prev_speech:
+        話題の継続フレーミング（Phase 1）。resumed=True のとき「さっきの
+        話の続き」として生成させる。prev_speech は直前の自分の発話の実文、
+        arc_stage="close" のときは話題の締めを指示する。従来は
+        Topic.resumed がプロンプトに届いておらず、続きの話題でも新規と
+        同じ指示になっていた（STUDY §6.1 の断絶 (a)）。
+
+    intent:
+        次発言の意図（Phase 3 / STUDY §6-(a1)）。プランナーがルールで
+        決めた発話の役割を1行指示として描画する。ask=視聴者や相方への
+        問いかけ、transition=完遂した弧の後の話題転換。deepen /
+        introduce / react は既存の指示（継続フレーミング・種別ごとの
+        導入文）が役割を担うため、追加の行は出さない。
     """
     base = build_system_prompt(config, long_term_memory_text, slim_persona=slim_persona,
                                character=character, cast_note=cast_note, mind=mind,
@@ -581,6 +717,23 @@ def build_topic_prompt(
         )
         return base + extra
 
+    if kind == "filler" and documents:
+        # 定番小噺は「資料」ではないので <web_result> には入れず、お題として
+        # 直接渡す（Web資料ガードでお題が無効化されるのを避ける）
+        doc = documents[0]
+        title = getattr(doc, "title", "") or "小噺"
+        seed = getattr(doc, "snippet", "") or ""
+        extra = (
+            "\n\n## 自律トークモード（小噺）\n"
+            "少し間が空きました。次のお題で、軽い雑談をしてください。\n"
+            f"お題: {title}" + (f" — {seed}" if seed else "") + "\n\n"
+            f"- {_speech_limit(character or config.character)}文字以内の自然な話し言葉で\n"
+            "- 事実の断定や、実在しない予定・出来事の創作はしない\n"
+            "- target_comment_id は null\n"
+            "- skip は必ず false（必ず話すこと）"
+        )
+        return base + extra
+
     block = _format_documents(documents)
     if not block:
         # 資料が無いなら通常の独り言にフォールバックする
@@ -605,9 +758,40 @@ def build_topic_prompt(
         intro = "配信中に最新ニュースをチェックしました。"
         instruction = f"{random.choice(_NEWS_OPENERS)}、視聴者に話題を振ってください。"
 
+    # 継続フレーミング（Phase 1）：続きの話題では「さっきの話」を明示し、
+    # 弧の最終回では締めを指示する。従来は resumed が届かず、新規話題と
+    # 同じ指示になっていたため、続き物が独立した一発発話に聞こえていた
+    framing = ""
+    if intent == "transition":
+        # 弧の完遂直後の新規話題（Phase 3）：転換を明示し、前の話題の
+        # 締めと地続きの一発に聞こえないようにする
+        framing = ("さっきの話題は締めくくりました。"
+                   "ここからは新しい話題です。\n")
+    if resumed:
+        if prev_speech:
+            framing = (
+                "これは、さっき自分が話した話題の続きです。"
+                f"さっきは『{_escape_tag(prev_speech)}』と話しました。"
+                "その内容を受けて、別の角度から深掘りしてください。"
+                "同じ言い回しの繰り返しは避けてください。\n")
+        else:
+            framing = (
+                "これは、さっき話していた話題の続き（続報）です。"
+                "話の流れを受けて、続きとして自然に話してください。\n")
+    if intent == "ask":
+        # 問いかけの意図（Phase 3）：展開の途中で聞き手にボールを渡す
+        framing += (
+            "この発話では、話の流れから自然に、視聴者や相方へ短く"
+            "問いかけてください（最後は問いかけで終える）。\n")
+    if arc_stage == "close":
+        framing += (
+            "この発話で、この話題はいったん締めくくってください。"
+            "新しい話題や質問は振らず、短くまとめて終えてください。\n")
+
     extra = (
         "\n\n## 自律トークモード（資料あり）\n"
         f"{intro}\n"
+        f"{framing}"
         f"{block}\n\n"
         f"{instruction}\n"
         f"- {_speech_limit(character or config.character)}文字以内の自然な話し言葉で\n"

@@ -22,12 +22,59 @@
     position: fixed; top: 10px; right: 10px; font-size: 11px;
     color: rgba(255,255,255,0.4); font-family: monospace;
   }
+
+  /* ── 演出エフェクト（カットイン・フリップ） ─────────────── */
+  #cutin {
+    position: fixed; inset: 0; width: 100%; height: 100%;
+    object-fit: contain; background: transparent;
+    opacity: 0; pointer-events: none; transition: opacity 0.15s linear; z-index: 40;
+  }
+  #cutin.visible { opacity: 1; }
+  #flip {
+    position: fixed; inset: 0; display: none;
+    align-items: center; justify-content: center; z-index: 41; pointer-events: none;
+  }
+  #flip.visible { display: flex; }
+  #flip-board {
+    background: #fff; color: #222; border: 6px solid #333; border-radius: 18px;
+    padding: 28px 44px; max-width: 86%; text-align: center;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+    transform: rotate(-2deg);
+  }
+  #flip-label { font-size: 20px; font-weight: bold; color: #c0392b; margin-bottom: 6px; }
+  #flip-text { font-size: 54px; font-weight: 900; line-height: 1.25; letter-spacing: 0.02em; }
+
+  /* ── 内心（声に出さない心の声。小さい吹き出しで弱く出す） ── */
+  #thought {
+    position: fixed; left: 50%; bottom: 10%; transform: translateX(-50%);
+    display: none; max-width: 72%; z-index: 39; pointer-events: none;
+  }
+  #thought.visible { display: block; }
+  #thought-bubble {
+    position: relative;
+    background: rgba(255,255,255,0.88); color: #555;
+    border: 2px solid rgba(130,130,130,0.55); border-radius: 16px;
+    padding: 8px 18px; font-size: 17px; font-style: italic; line-height: 1.45;
+    text-align: center; box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+  }
+  #thought-bubble::before,
+  #thought-bubble::after {
+    content: ''; position: absolute; left: 50%; border-radius: 50%;
+    background: rgba(255,255,255,0.88); border: 2px solid rgba(130,130,130,0.55);
+  }
+  #thought-bubble::before { bottom: -13px; margin-left: -4px; width: 9px; height: 9px; }
+  #thought-bubble::after { bottom: -24px; margin-left: -2px; width: 5px; height: 5px; }
+  #thought-speaker { font-style: normal; font-weight: bold; font-size: 13px; color: #888; margin-right: 0.5em; }
 </style>
 </head>
 <body>
 <div id="canvas-container"></div>
 <div id="subtitle-overlay"></div>
 <div id="status-indicator">connecting...</div>
+<video id="cutin" muted playsinline preload="auto"></video>
+<div id="flip"><div id="flip-board"><div id="flip-label"></div><div id="flip-text"></div></div></div>
+<div id="thought"><div id="thought-bubble"><span id="thought-speaker"></span><span id="thought-text"></span></div></div>
+
 
 <script type="importmap">
 { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.module.js" } }
@@ -832,6 +879,8 @@ function connectWS() {
       }
     }
     if (msg.type === 'calibration_update') calibration = { ...calibration, ...msg.calibration };
+    if (msg.type === 'effect') handleEffect(msg);
+    if (msg.type === 'thought') showThought(msg);
     if (msg.type === 'test_motion') triggerMotion(msg.motion || 'wave');
     if (msg.type === 'speech_start') {
       setEmotion(msg.emotion || 'neutral');
@@ -851,6 +900,63 @@ function connectWS() {
       subtitleTimer = setTimeout(() => subtitle.classList.remove('visible'), 1500);
     }
   };
+}
+
+
+// ── 演出エフェクト（カットイン・フリップ。効果音はアプリ側で鳴る） ──
+const cutinEl = document.getElementById('cutin');
+const flipEl = document.getElementById('flip');
+const flipLabel = document.getElementById('flip-label');
+const flipText = document.getElementById('flip-text');
+let flipTimer = null;
+
+function showCutin(url) {
+  if (!url) return;
+  cutinEl.src = url;
+  cutinEl.classList.add('visible');
+  const p = cutinEl.play();
+  if (p) p.catch(() => hideCutin());
+}
+function hideCutin() {
+  cutinEl.classList.remove('visible');
+  try { cutinEl.pause(); } catch (e) {}
+  cutinEl.removeAttribute('src');
+  cutinEl.load();
+}
+cutinEl.addEventListener('ended', hideCutin);
+cutinEl.addEventListener('error', hideCutin);
+
+function showFlip(msg) {
+  flipLabel.textContent = msg.speaker || msg.label || '';
+  flipLabel.style.display = flipLabel.textContent ? 'block' : 'none';
+  flipText.textContent = msg.text || '';
+  flipEl.classList.add('visible');
+  clearTimeout(flipTimer);
+  const sec = Math.min(15, Math.max(1, msg.duration_sec || 5));
+  flipTimer = setTimeout(() => flipEl.classList.remove('visible'), sec * 1000);
+}
+
+function handleEffect(msg) {
+  if (msg.effect_type === 'cutin') showCutin(msg.url);
+  else if (msg.effect_type === 'flip') showFlip(msg);
+  // se はアプリ側の音声出力で鳴るので画面では何もしない
+}
+
+// ── 内心（声に出さない心の声を、小さい吹き出しで表示する） ────
+const thoughtEl = document.getElementById('thought');
+const thoughtSpeaker = document.getElementById('thought-speaker');
+const thoughtText = document.getElementById('thought-text');
+let thoughtTimer = null;
+
+function showThought(msg) {
+  thoughtSpeaker.textContent = msg.speaker || '';
+  thoughtSpeaker.style.display = thoughtSpeaker.textContent ? 'inline' : 'none';
+  thoughtText.textContent = msg.text || '';
+  thoughtEl.classList.add('visible');
+  clearTimeout(thoughtTimer);
+  // 表示時間は字幕と同じ方式（約5文字/秒＋余韻、2.5〜14秒）
+  const ms = Math.min(14000, Math.max(2500, (msg.text || '').length * 200 + 800));
+  thoughtTimer = setTimeout(() => thoughtEl.classList.remove('visible'), ms);
 }
 
 function setStatus(msg) { document.getElementById('status-indicator').textContent = msg; }

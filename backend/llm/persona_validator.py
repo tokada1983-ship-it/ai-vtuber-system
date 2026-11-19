@@ -52,8 +52,8 @@ class PersonaValidator:
 
         # 3. 代表的なキャラクター固有のプリセット補正（Character1等）
         if character_name == "Character1" or "Character1" in character_name:
-            repaired, modified_character1 = self._repair_character1(repaired)
-            was_modified = was_modified or modified_character1
+            repaired, modified_Character1 = self._repair_Character1(repaired)
+            was_modified = was_modified or modified_Character1
 
         if was_modified:
             logger.info("PersonaValidator: repaired speech text",
@@ -64,7 +64,7 @@ class PersonaValidator:
         return repaired, was_modified
 
     @staticmethod
-    def _repair_character1(text: str) -> tuple[str, bool]:
+    def _repair_Character1(text: str) -> tuple[str, bool]:
         """Character1（九尾の妖狐、一人称: わらわ、語尾: 〜じゃ）のペルソナ補正"""
         modified = False
         repaired = text

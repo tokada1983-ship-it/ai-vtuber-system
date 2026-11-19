@@ -70,7 +70,7 @@ class TestLLMParser:
 class TestCommentSelector:
     def setup_method(self):
         cfg = load_config("config.yaml")
-        self.sel = CommentSelector(cfg.orchestrator, "Character1")
+        self.sel = CommentSelector(cfg.orchestrator, "Character2")
 
     def test_normal_comment(self):
         c = make_comment("普通のコメント")
@@ -85,7 +85,7 @@ class TestCommentSelector:
         assert self.sel.score(c) > 2.0
 
     def test_character_name_mention(self):
-        c = make_comment("Character1ちゃんかわいい！")
+        c = make_comment("Character2ちゃんかわいい！")
         assert self.sel.score(c) > 2.0
 
     def test_too_long_comment_filtered(self):

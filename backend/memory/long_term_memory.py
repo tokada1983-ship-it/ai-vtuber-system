@@ -3,7 +3,7 @@
 ファイル配置:
   backend/llm/prompts/memory_{キャラ名}.md
 
-例: backend/llm/prompts/memory_Character1.md
+例: backend/llm/prompts/memory_Character2.md
 
 このファイルの内容はシステムプロンプトに「長期記憶」セクションとして挿入される。
 記憶の内容はAIVtuber管理者が手動で編集・更新する。
