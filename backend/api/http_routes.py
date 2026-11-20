@@ -24,6 +24,11 @@ from backend.runtime import (
     monitor,
     orchestrator,
 )
+from backend.stream_state import (
+    clear_stream_state,
+    mark_stream_stopping,
+    write_stream_state,
+)
 from backend.tts.audio_router import AudioRouter
 
 logger = get_logger(__name__)
@@ -177,12 +182,46 @@ async def api_live2d_model_info(path: str = ""):
 async def api_start(body: dict):
     video_id = body.get("video_id", "")
     await orchestrator.start(video_id)
+    # 配信中であることを外部ウォッチドッグへ伝える状態ファイルを作成
+    write_stream_state(video_id)
     return {"ok": True, "video_id": video_id}
+
+# /api/stop の応答上限（秒）。停止処理は段階別タイムアウト付きだが、
+# それでも終わらない場合は応答だけ先に返し、処理は裏で継続させる。
+# 2026-11-19 にこのエンドポイントが120秒応答しなかった事象への対策。
+API_STOP_TIMEOUT_SEC = 25.0
+
 
 @router.post("/api/stop")
 async def api_stop():
-    await orchestrator.stop()
-    return {"ok": True}
+    # 停止の意図を最初に状態ファイルへ記録する。停止処理が長引いたり
+    # 途中でアプリが落とされても、ウォッチドッグが「意図した停止」を
+    # 落下と誤認して自動復旧しないようにするため（stop-fix）。
+    mark_stream_stopping()
+    stop_task = asyncio.create_task(orchestrator.stop())
+
+    def _log_stop_failure(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("Orchestrator stop failed", error=str(exc))
+
+    stop_task.add_done_callback(_log_stop_failure)
+    in_background = False
+    try:
+        # shield: タイムアウトしても停止処理そのものは裏で継続する
+        await asyncio.wait_for(asyncio.shield(stop_task),
+                               timeout=API_STOP_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        in_background = True
+        logger.warning(
+            "/api/stop: stop still in progress; responding anyway",
+            timeout_sec=API_STOP_TIMEOUT_SEC)
+    finally:
+        # 停止の成否によらず、監視を止めるために状態ファイルを消す
+        clear_stream_state()
+    return {"ok": True, "stop_in_background": in_background}
 
 @router.post("/api/effects/trigger")
 async def api_effects_trigger(body: dict):

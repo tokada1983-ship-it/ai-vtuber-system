@@ -223,6 +223,13 @@ orchestrator:
   enable_reflection: true
   max_diary_entries: 5
   enable_persona_validation: true
+  loop_guard:
+    enabled: true
+    window_speeches: 16
+    dup_threshold: 0.45
+    dup_min_count: 6
+    cooldown_sec: 600
+    escalate_window_sec: 1800
 safety:
   enabled: true
   ng_words: []
@@ -411,6 +418,7 @@ stt:
   priority: 9.0
   min_duration_ms: 400
   warmup_on_start: true
+  isolation: inprocess  # inprocess / process（STT を別プロセスで動かす）
 persona:
   enabled: false
   adapter: ''

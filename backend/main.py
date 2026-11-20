@@ -16,6 +16,7 @@ from backend.llm import ollama_service
 from backend.tts import irodori_service
 from backend.logger import get_logger
 from backend.runtime import AUDIO_CACHE, FRONTEND, MODELS_DIR, config, monitor, orchestrator, persona
+from backend.stream_state import clear_stream_state
 
 logger = get_logger(__name__)
 
@@ -23,6 +24,10 @@ logger = get_logger(__name__)
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     logger.info("AI Vtuber backend started", port=config.server.port)
+    # 起動直後のプロセスに対応する配信セッションは存在しないため、
+    # 前プロセスの残留状態ファイルがあれば掃除する（ウォッチドッグの
+    # 誤復活防止。復旧フローではこの後に /api/start が作り直す）
+    clear_stream_state()
     # video_idが明示的に設定されている場合のみ自動スタート（Mockモードは自動起動しない）
     if config.youtube.video_id and config.youtube.video_id != "mock":
         logger.info("Auto-starting with configured video_id", video_id=config.youtube.video_id)
@@ -47,6 +52,9 @@ async def _lifespan(app: FastAPI):
     elyth_task.cancel()
     await monitor.stop()
     await orchestrator.stop()
+    # 正常終了時はウォッチドッグの監視対象から外す（クラッシュ時は
+    # ここへ到達しないため状態ファイルが残り、復旧対象になる）
+    clear_stream_state()
     # stop() は後処理を背景化したので、アプリ終了時は完了まで待つ
     # （終了で post-stop の記録が失われないように。Phase 4.5）
     await orchestrator.await_post_stop()

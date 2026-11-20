@@ -54,6 +54,7 @@ from backend.llm.parser import (TAG_OUTCOME_FATAL, TAG_OUTCOME_NO_SPEECH,
                                 strip_greeting_template,
                                 tag_parse_outcome_stats)
 from backend.logger import get_logger
+from backend.loop_guard import SpeechLoopGuard
 from backend.memory.reflection_engine import ReflectionEngine
 from backend.mind.mind_loop import (MindLoop, find_relevant_opinions,
                                     format_opinion_context,
@@ -76,6 +77,13 @@ logger = get_logger(__name__)
 
 # 制御タグの断片（生成崩れの兆候）。発話文に混ざっていたら読み上げない
 _TAG_FRAGMENT_RE = re.compile(r"<\s*(emotion|motion|speech)\s*:|<\|[^>]*\|>")
+
+# 停止処理の段階別タイムアウト（秒）。/api/stop が有界時間で応答する
+# ための上限で、合計しても http_routes 側の応答上限（25秒）に収まる。
+# 2026-11-19 に /api/stop が120秒応答しなかった事象への対策（stop-fix）。
+STOP_LOOPS_TIMEOUT_SEC = 12.0    # ループ群のキャンセル待ち
+STOP_SOURCE_TIMEOUT_SEC = 8.0    # コメントソースの停止待ち
+STOP_BGM_TIMEOUT_SEC = 3.0       # BGM の停止待ち
 
 
 @dataclasses.dataclass
@@ -266,6 +274,19 @@ class Orchestrator:
         self._theme_hint_fired: dict[str, float] = {}  # テーマ名 → 最後にヒントを出した時刻
         self._theme_hint_gram: dict[str, str] = {}  # テーマ名 → 代表gram（テーマban用）
         self._force_switch_pending: bool = False  # 次回idleの話題を強制切替（案C）
+        # 発話ループ検出（言い換えレベルの反復。backend/loop_guard.py）:
+        # 直近発話の再演率を見て、会話全体がループに入ったら介入する
+        _lg = config.orchestrator.loop_guard
+        self._loop_guard = SpeechLoopGuard(
+            enabled=_lg.enabled,
+            window_speeches=_lg.window_speeches,
+            dup_threshold=_lg.dup_threshold,
+            dup_min_count=_lg.dup_min_count,
+            cooldown_sec=_lg.cooldown_sec,
+            escalate_window_sec=_lg.escalate_window_sec,
+        )
+        self._loop_hint_pending: bool = False  # 次回生成へ立て直し指示を付ける
+        self._loop_hint_word: str = ""         # ループの代表語（ヒント文用）
         # 反復ブロックの回復フロー（Phase 2）: 連続ブロック数・話者クールダウン・
         # 回復ヒント・フォールバック台詞のローテーション位置
         self._block_streak: dict[str, int] = {}
@@ -762,6 +783,7 @@ class Orchestrator:
                 agent.key: agent.llm.context_status()
                 for agent in self._agents if agent.llm is not None
             },
+            "loop_guard": self._loop_guard.stats(),
             "autonomous_topic": {
                 "enabled": self._cfg.knowledge.autonomous_topic.enabled,
                 "weights": self._cfg.knowledge.autonomous_topic.weights,
@@ -1385,14 +1407,37 @@ class Orchestrator:
 
     # ── 開始・停止 ────────────────────────────────────────────
 
-    async def _cancel_tasks(self) -> None:
-        """実行中のループを止めて完全に終了するまで待つ"""
+    async def _cancel_tasks(
+            self, timeout: float = STOP_LOOPS_TIMEOUT_SEC) -> None:
+        """実行中のループを止める（上限時間まで待つ）
+
+        従来は gather で無制限に待っており、to_thread 実行中など
+        キャンセル不能なタスクがあると停止全体が固まっていた
+        （2026-11-19 の /api/stop 120秒タイムアウトの一因）。
+        上限を超えたら待ちを打ち切り、未完了のタスクは self._tasks に
+        残す（次回 start 時の _cancel_tasks で再度畳む）。
+        """
         if not self._tasks:
             return
         for t in self._tasks:
             t.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks = []
+        # asyncio.wait はタイムアウトしても子タスクを追加でキャンセル
+        # しないため、未完了分を正確に保持できる（wait_for+gather は
+        # タイムアウト時に gather 経由で再キャンセルしてしまう）
+        _done, pending = await asyncio.wait(self._tasks, timeout=timeout)
+        for t in _done:
+            # 例外を回収する（従来の gather(return_exceptions=True) 相当。
+            # 回収しないと "exception was never retrieved" 警告になる）
+            if not t.cancelled():
+                t.exception()
+        if pending:
+            logger.warning(
+                "Loop cancel timed out; tasks left for next start",
+                timeout_sec=timeout,
+                remaining=[t.get_name() for t in pending])
+            self._tasks = list(pending)
+        else:
+            self._tasks = []
 
     async def start(self, video_id: str | None = None) -> None:
         # 前セッションの post-stop 処理（背景）が残っていたら先に終わらせる
@@ -1462,19 +1507,37 @@ class Orchestrator:
         logger.info("Orchestrator started", tasks=len(self._tasks))
 
     async def stop(self) -> None:
+        # 停止は段階ごとに上限時間を設け、各段階の所要時間をログに残す
+        # （従来は無界待ちがあり、詰まった段階も特定できなかった）
+        t0 = time.monotonic()
         self._running = False
+        logger.info("Stop: begin")
         # 先行生成タスクは _tasks に入っていないので個別に止める（P1-C）
         if self._prefetch_task is not None and not self._prefetch_task.done():
             self._prefetch_task.cancel()
         self._prefetched = None
         await self._cancel_tasks()
+        logger.info("Stop: loops handled",
+                    elapsed_sec=round(time.monotonic() - t0, 2),
+                    remaining_tasks=len(self._tasks))
         if self._source:
-            await self._source.stop()
+            try:
+                await asyncio.wait_for(
+                    self._source.stop(), timeout=STOP_SOURCE_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                logger.warning("Stop: source stop timed out",
+                               timeout_sec=STOP_SOURCE_TIMEOUT_SEC)
+            except Exception as e:
+                logger.warning("Stop: source stop failed", error=str(e))
+            logger.info("Stop: source handled",
+                        elapsed_sec=round(time.monotonic() - t0, 2))
         try:
-            await self._bgm.stop()
+            await asyncio.wait_for(
+                self._bgm.stop(), timeout=STOP_BGM_TIMEOUT_SEC)
         except Exception:
             pass
-        logger.info("Orchestrator stopped")
+        logger.info("Orchestrator stopped",
+                    elapsed_sec=round(time.monotonic() - t0, 2))
         # 停止後の重い処理（記憶整理・日記・エピソード化・マインドの
         # post-stop サイクル）は、応答をブロックしないよう背景で実行する
         # （Phase 4.5: /api/chat/stop の応答が35〜185秒掛かっていた対処）。
@@ -2402,6 +2465,52 @@ class Orchestrator:
             + extra
         )
 
+    def _note_loop_guard(self, text: str) -> None:
+        """発話ループ検出へ発話を渡し、発火したら次発話への介入を積む。
+
+        初回は強めの切り替えヒント＋話題の強制切替（テーマ反復の案Cと
+        同じ経路）。クールダウン明けの再発は、既存の文脈リセット
+        （吸着時の最終手段）へ昇格させる。ブロック連続数のように
+        「成功した発話でリセットされる」数え方はしないため、言い換えを
+        挟みながら続くループでも昇格に届く。
+        """
+        try:
+            event = self._loop_guard.note_speech(text)
+        except Exception as e:
+            logger.warning("loop guard failed", error=str(e))
+            return
+        if event is None:
+            return
+        logger.warning("speech loop detected", level=event.level,
+                       dup_count=event.dup_count, window=event.window,
+                       max_similarity=round(event.max_similarity, 2),
+                       word=event.word)
+        self._loop_hint_pending = True
+        self._loop_hint_word = event.word
+        self._force_switch_pending = True
+        if event.level >= 2:
+            self._reset_saturated_context(event.word
+                                          or self._saturation_word())
+
+    def _consume_loop_hint(self, system_prompt: str) -> str:
+        """ループ検出時の立て直し指示を次の発話のプロンプトへ1回だけ付ける"""
+        if not self._loop_hint_pending:
+            return system_prompt
+        self._loop_hint_pending = False
+        word = self._loop_hint_word
+        self._loop_hint_word = ""
+        logger.info("loop break hint injected", word=word)
+        extra = ""
+        if word:
+            extra = f"特に「{word}」を含む言い回しは使わないでください。"
+        return system_prompt + (
+            "\n\n## 会話の立て直し\n"
+            "直近の会話は、言い回しを変えながら同じ内容を繰り返すループに"
+            "なっています。今回は話題も文の構成も完全に変えて、具体的な"
+            "新しい内容を話してください。直近の発話への相づちや感想の"
+            "繰り返しで終えないでください。" + extra
+        )
+
     def _consume_recovery_hint(self, system_prompt: str,
                                agent: CharacterAgent) -> str:
         """反復ブロック・文型反復の直後の再生成にだけ付ける回復ヒントを消費する。
@@ -2467,6 +2576,7 @@ class Orchestrator:
             self._theme_hint_consumed_gram = ""
         else:
             self._note_theme_repetition(response.speech)
+            self._note_loop_guard(response.speech)
         if repeat:
             logger.warning("repeat speech: history feedback suppressed",
                            character=agent.name, speech=response.speech[:40])
@@ -3137,6 +3247,7 @@ class Orchestrator:
         agent.speech_route = "idle"
         system_prompt = self._consume_theme_hint(system_prompt)
         system_prompt = self._consume_recovery_hint(system_prompt, agent)
+        system_prompt = self._consume_loop_hint(system_prompt)
         allow_intro = agent.speak_count == 0
         messages = agent.log.get_messages()
         gen_extra = {"temperature": temperature} \
@@ -3269,6 +3380,7 @@ class Orchestrator:
         system_prompt = self._consume_theme_hint(system_prompt)
         # 反復ブロック・文型反復の直後なら、回復ヒントも付ける（Phase 2）
         system_prompt = self._consume_recovery_hint(system_prompt, agent)
+        system_prompt = self._consume_loop_hint(system_prompt)
         # セッション開始からそのキャラの最初の発話だけ、挨拶・自己紹介
         # テンプレを正規の開始挨拶として許容する（2026-11-16 P0改修）。
         # speak_count は _after_speech で発話完了時に加算されるため、

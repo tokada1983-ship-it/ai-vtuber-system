@@ -285,6 +285,17 @@ def build_stt(config: AppConfig) -> STTBackend | None:
     if cfg.backend != "faster_whisper":
         logger.warning("Unknown STT backend, disabling voice input", backend=cfg.backend)
         return None
+    if cfg.isolation == "process":
+        from backend.stt.whisper_process_backend import WhisperProcessBackend
+        return WhisperProcessBackend(
+            model_size=cfg.model,
+            device=cfg.device,
+            language=cfg.language,
+            compute_type=cfg.compute_type,
+            port=cfg.worker_port,
+            startup_timeout=cfg.worker_startup_timeout_sec,
+            request_timeout=cfg.worker_request_timeout_sec,
+        )
     from backend.stt.whisper_backend import FasterWhisperBackend
     return FasterWhisperBackend(
         model_size=cfg.model,

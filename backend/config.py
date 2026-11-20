@@ -252,7 +252,7 @@ class CharacterConfig(BaseModel):
     掛け合い配信では config.yaml の characters に複数並べる。
     声・アバター・LLM はキャラごとに上書きでき、書かなければ全体設定を使う。
     """
-    name: str = "Character2"
+    name: str = "ミライ"
     # アバター画面の ?char= や WebSocket のメッセージで使う識別子（空なら name）
     id: str = ""
     enabled: bool = True
@@ -261,7 +261,7 @@ class CharacterConfig(BaseModel):
     stream_theme: str = ""
     # キャラクターごとの記憶・会話ログ・DBを置く場所（characters/<名前>/ の親）
     data_dir: str = "backend/llm/prompts"
-    # コメントで呼ばれたと判定する別名（例: Character1ちゃん, character1）。name は自動で含まれる
+    # コメントで呼ばれたと判定する別名（例: クロエちゃん, くろえ）。name は自動で含まれる
     aliases: list[str] = Field(default_factory=list)
     voice: CharacterVoiceConfig = Field(default_factory=CharacterVoiceConfig)
     llm: CharacterLLMConfig = Field(default_factory=CharacterLLMConfig)
@@ -399,6 +399,23 @@ class AudioOutputConfig(BaseModel):
     device: Optional[str] = None
 
 
+class LoopGuardConfig(BaseModel):
+    """発話ループ検出（言い換えレベルの反復）の設定。
+
+    完全一致の再演は既存のリピートブロックが、単語レベルの偏りは
+    テーマ反復検知が担当する。こちらは「直近の発話のうち、過去の
+    どの発話とも似ている（再演・言い換え）発話の割合」を見て、
+    会話全体がループに入ったことを検出する最後の段（backend/loop_guard.py）。
+    enabled=false で従来動作に戻る。
+    """
+    enabled: bool = True
+    window_speeches: int = 16      # 直近この件数の発話で再演の割合を判定する
+    dup_threshold: float = 0.45    # trigram Jaccard がこれ以上で「再演」とみなす
+    dup_min_count: int = 6         # 窓の中で再演がこの件数以上でループと判定
+    cooldown_sec: float = 600.0    # 発火後の再発火を抑える間隔
+    escalate_window_sec: float = 1800.0  # この間隔内の再発火で文脈リセットへ昇格
+
+
 class OrchestratorConfig(BaseModel):
     idle_threshold_sec: int = 30
     response_history_turns: int = 20
@@ -426,6 +443,7 @@ class OrchestratorConfig(BaseModel):
     enable_reflection: bool = True          # 配信終了時・定期内省日記の生成
     max_diary_entries: int = 5              # コア記憶に保持する内省日記の件数
     enable_persona_validation: bool = True  # 発話前の一人称・口調の自動補正
+    loop_guard: LoopGuardConfig = Field(default_factory=LoopGuardConfig)
 
 
 class SafetyConfig(BaseModel):
@@ -611,6 +629,11 @@ class STTConfig(BaseModel):
     priority: float = 9.0          # 視聴者コメントより優先させる
     min_duration_ms: int = 400     # これより短い音声は無視（物音対策）
     warmup_on_start: bool = True   # 起動時にモデルをロードしておく
+    # APPCRASH対策 第2段: ctranslate2 をエンジンプロセスから分離する
+    isolation: str = "inprocess"   # inprocess（従来） / process（別プロセス）
+    worker_port: int = 0           # STTワーカーのポート（0なら空きポートを自動選択）
+    worker_startup_timeout_sec: float = 120.0  # ワーカー起動待ちの上限
+    worker_request_timeout_sec: float = 120.0  # 文字起こし要求の上限
 
 
 class ServerConfig(BaseModel):

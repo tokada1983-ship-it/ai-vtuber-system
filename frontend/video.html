@@ -310,6 +310,20 @@ function swapTo(url, { loop = false } = {}) {
   setTimeout(() => { try { cur.pause(); } catch (e) {} }, 300);
   front = 1 - front;
   els[front].onended = onClipEnded;
+  // 切替直後の開始失敗への早期リカバリ（2026-11-21 分析E）：
+  // 実配信の停滞10件が全て「切替直後・paused=true・readyState=4・再生位置ほぼ0」
+  // だったため、6秒ウォッチドッグを待たず、切替1.2秒後に同条件なら play を
+  // 1回だけ打ち直す。正常な切替では paused=false か再生位置が進むため発火しない。
+  const startedEl = els[front];
+  setTimeout(() => {
+    if (health.currentClip !== url || els[front] !== startedEl) return;
+    if (startedEl.paused && !startedEl.ended && startedEl.readyState >= 2 &&
+        (startedEl.currentTime || 0) < 0.05) {
+      sendPageEvent('early_replay', 'clip=' + clipName(url) +
+        ' readyState=' + startedEl.readyState + ' networkState=' + startedEl.networkState);
+      const rp = startedEl.play(); if (rp) rp.catch(() => {});
+    }
+  }, 1200);
 }
 
 function nextIdleUrl() {

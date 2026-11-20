@@ -296,7 +296,7 @@ class OllamaBackend(LLMBackend):
             logger.warning("Ollama: request timed out — model may be loading")
             return LLMResponse(speech="", skip=True)
         except Exception as e:
-            logger.warning("Ollama error", error=str(e))
+            logger.warning("Ollama error", error_type=type(e).__name__, error=repr(e)[:300])
             self._healthy = False
             return LLMResponse(speech="", skip=True)
 
@@ -355,7 +355,7 @@ class OllamaBackend(LLMBackend):
                 self._healthy = False
                 return
             except Exception as e:
-                logger.warning("Ollama stream error", error=str(e))
+                logger.warning("Ollama stream error", error_type=type(e).__name__, error=repr(e)[:300])
                 self._healthy = False
                 return
 

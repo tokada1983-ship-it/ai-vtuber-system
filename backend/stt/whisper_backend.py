@@ -16,6 +16,7 @@ faster-whisper (CTranslate2) を使う。GPUがあれば float16、無ければ 
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 
 import numpy as np
@@ -40,6 +41,11 @@ class FasterWhisperBackend(STTBackend):
         self._device, self._compute_type = self._resolve_device(device, compute_type)
         self._model = None
         self._load_lock = asyncio.Lock()
+        # 推論の直列化用ロック。WhisperModel は同時 transcribe 呼び出しに
+        # スレッド安全でないため、ネイティブ推論は必ず1つずつ実行する。
+        # 推論は asyncio.to_thread のワーカースレッドで走るので
+        # asyncio.Lock ではなく threading.Lock を使う。
+        self._infer_lock = threading.Lock()
         self._load_failed = False
 
     @staticmethod
@@ -104,17 +110,28 @@ class FasterWhisperBackend(STTBackend):
             logger.warning("Whisper warmup failed", error=str(e))
 
     def _run_transcribe(self, audio: np.ndarray) -> tuple[str, str]:
-        """同期の推論本体（to_thread から呼ぶ）"""
-        segments, info = self._model.transcribe(
-            audio,
-            language=self._language,
-            beam_size=5,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 300},
-            condition_on_previous_text=False,  # 幻聴（前文脈の引きずり）を防ぐ
-        )
-        text = "".join(seg.text for seg in segments).strip()
-        return text, getattr(info, "language", "") or ""
+        """同期の推論本体（to_thread から呼ぶ）
+
+        transcribe 本体と warmup の両経路がここを通る。WhisperModel の
+        同時呼び出しはネイティブ状態を壊しうるため、_infer_lock で
+        直列化する（2026-11-20 の APPCRASH 対策 第1段）。
+        """
+        wait_start = time.time()
+        with self._infer_lock:
+            waited_ms = int((time.time() - wait_start) * 1000)
+            if waited_ms >= 100:
+                logger.info("Whisper transcribe serialized (waited for lock)",
+                            waited_ms=waited_ms)
+            segments, info = self._model.transcribe(
+                audio,
+                language=self._language,
+                beam_size=5,
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 300},
+                condition_on_previous_text=False,  # 幻聴（前文脈の引きずり）を防ぐ
+            )
+            text = "".join(seg.text for seg in segments).strip()
+            return text, getattr(info, "language", "") or ""
 
     async def transcribe(self, pcm16: bytes, sample_rate: int = 16000) -> STTResult:
         if not pcm16:
