@@ -315,7 +315,7 @@ class PersonaConfig(BaseModel):
     enabled: bool = False
     adapter: str = ""                # 使うアダプタ名（models/persona/<キャラ>/<名前>）
     backend: str = "ollama"          # 学習済みモデルを載せるLLMバックエンド（llm.backendsのキー）
-    runtime_model: str = ""          # そのバックエンド上でのモデル名（例: Character1-persona）
+    runtime_model: str = ""          # そのバックエンド上でのモデル名（例: chloe-persona）
     prompt_mode: str = "slim"        # slim=キャラ設定を短縮 / full=従来どおり全文
     fallback_to_base: bool = True    # 専用モデルが落ちていたら通常のLLMに戻す
     # ── 学習の既定値（ダッシュボードから上書きできる）───────────
@@ -420,6 +420,7 @@ class OrchestratorConfig(BaseModel):
     idle_threshold_sec: int = 30
     response_history_turns: int = 20
     consolidation_trigger_turns: int = 50  # N ターンごとに長期記憶整理を発火
+    consolidation_interval_min: int = 0  # 定期記憶整理の間隔（分）。0=無効（F8: 以前はWSコマンドでのみ変更でき、再起動で消えた）
     comment_dedupe_window_sec: int = 60
     max_comment_length: int = 200
     max_queue_size: int = 50       # コメントキューの上限（超えた分は破棄）
@@ -436,8 +437,18 @@ class OrchestratorConfig(BaseModel):
     memory_half_life_days: float = 30.0  # 参照されない記憶の重みが半分になる日数
     memory_top_k: int = 3              # 1回の応答で参照する記憶の件数
     memory_min_score: float = 0.25     # これ未満の関連度の記憶はプロンプトに入れない
-    idle_core_memory_chars: int = 1200  # 独り言プロンプトに入れるコア記憶の上限
-    idle_episodic_entries: int = 8      # 独り言プロンプトに混ぜるエピソード記憶の件数
+    idle_core_memory_chars: int = 1200  # 独り言プロンプトへの注入予算: コア記憶の上限文字数
+    idle_episodic_entries: int = 8      # 独り言プロンプトへの注入予算: 混ぜるエピソード記憶の件数
+    # 配信中の記憶整理（2026-11-22 longstream）: 記憶整理の成功サイクルに
+    # 相乗りし、「ここまでの流れ」ダイジェストの更新と、配信中に増えた
+    # エピソードの圧縮を行う。発動間隔は consolidation_trigger_turns と
+    # 共有する。stream_digest_enabled=False で従来動作に戻る
+    stream_digest_enabled: bool = True
+    stream_digest_max_chars: int = 900     # 流れダイジェストの上限文字数
+    stream_digest_input_chars: int = 9000  # 1回の整理で要約に渡す入力の上限文字数
+    stream_episode_cap: int = 40           # 配信中に保持する web/auto エピソードの上限
+    stream_episode_keep_recent: int = 15   # 圧縮時に無条件で残す直近の件数
+    stream_episode_protect_sec: float = 600.0  # この秒数以内に使われた記憶は圧縮しない
     # 長期記憶・人格維持（A: リスナー関係性、B: 自己内省日記、C: 人格死守）
     enable_viewer_profiles: bool = True     # 視聴者ごとの親密度・関係性管理
     enable_reflection: bool = True          # 配信終了時・定期内省日記の生成
@@ -546,8 +557,8 @@ class AutonomousTopicConfig(BaseModel):
     max_documents: int = 3            # プロンプトに入れる記事数の上限
     remember: bool = True             # 話したネタをエピソード記憶に残す
     # Phase 1（組み込み検討書 §3-C1/C2）: プランナーの穴埋め
-    memory_share_cap: float = 0.45    # 直近ウィンドウで memory 話題がこの占有率以上なら、他候補がある間は memory を選ばない
-    memory_share_window: int = 20     # 占有率を測る直近の話題数
+    memory_share_cap: float = 0.45    # 直近ウィンドウで memory 話題がこの話題シェア以上なら、他候補がある間は memory を選ばない
+    memory_share_window: int = 20     # 話題シェアを測る直近の話題数
     filler_enabled: bool = False      # 材料が全て尽きたとき、定番小噺へフォールバックする（本番は config.yaml で有効化）
     # Phase 3（次発言プランニング / STUDY §6-(a1)）: ルール版プランナー
     planner_enabled: bool = True      # 次発言の意図決定と弧の完遂判定（無効で Phase 2 までの動作）
@@ -555,6 +566,19 @@ class AutonomousTopicConfig(BaseModel):
     arc_max_continuations: int = 2    # 弧の継続回数の上限（Phase 1 までの固定値2を設定化）
     arc_max_sec: float = 900.0        # 弧の開始からの上限時間（秒）。超えたら弧を解放する
     arc_ask_probability: float = 0.25 # 展開の発話で「問いかけ」の意図を選ぶ確率
+    # 配信テーマ（2026-11-22 themefix）: stream_theme 設定時、話題決定のうち
+    # テーマ話題が占める目標割合と、話題シェアを測る直近の話題数。0でテーマ枠は無効
+    theme_share_target: float = 0.34
+    theme_share_window: int = 12
+    # 話題の任期（2026-11-22 longstream）: 同じ主題の連なりが長くなり
+    # すぎたら、決定境界で弧を完遂として閉じて次話題へ移行する。
+    # LoopGuard（反復への緊急経路）とは別に、「長さ」への通常経路として
+    # 働く。topic_tenure_enabled=False で従来動作に戻る
+    topic_tenure_enabled: bool = True
+    topic_tenure_speeches: int = 6      # 同一主題チェーンの累計発話数の上限
+    topic_tenure_sec: float = 1200.0    # 同一主題チェーンの経過時間の上限（秒）
+    topic_tenure_cooldown_sec: float = 1800.0  # 移行後、その主題を候補から外す期間（秒）
+    topic_tenure_window_sec: float = 1800.0    # チェーンを数える遡及窓（秒）
 
 
 class AnswerWithSearchConfig(BaseModel):
@@ -643,6 +667,23 @@ class ServerConfig(BaseModel):
 
 # ── ルート設定 ─────────────────────────────────────────
 
+class MindConfig(BaseModel):
+    """自律思考ループ（MindLoop）と睡眠時統合（SleepManager）の調整値。
+
+    以前は環境変数 AIVT_MIND_* / AIVT_SLEEP_* でしか変えられず、
+    config の表面に載らなかった（F8）。既定値は従来のコード既定と
+    一致させる。環境変数が設定されている場合は移行互換のため
+    そちらを優先する。
+    """
+    enabled: bool = True              # 思考ループの有効化（AIVT_MIND_ENABLED）
+    idle_sec: float = 600.0           # 最終発話からこの秒数を超えたら思考可（AIVT_MIND_IDLE_SEC）
+    max_per_hour: int = 3             # 1時間あたりのサイクル上限/キャラ（AIVT_MIND_MAX_PER_HOUR）
+    min_interval_sec: float | None = None  # サイクル間隔の下限（AIVT_MIND_MIN_INTERVAL_SEC）。None なら 3600/max_per_hour
+    poll_sec: float = 20.0            # 背景ループの確認間隔（AIVT_MIND_POLL_SEC）
+    sleep_enabled: bool = True        # 睡眠時統合スケジューラの有効化（AIVT_SLEEP_ENABLED）
+    sleep_poll_sec: float = 60.0      # 睡眠スケジューラのポーリング間隔（AIVT_SLEEP_POLL_SEC）
+
+
 class AppConfig(BaseModel):
     youtube: YouTubeConfig = Field(default_factory=YouTubeConfig)
     twitcasting: TwitcastingConfig = Field(default_factory=TwitcastingConfig)
@@ -658,6 +699,7 @@ class AppConfig(BaseModel):
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
     comment_filter: CommentFilterConfig = Field(default_factory=CommentFilterConfig)
     viewer_points: ViewerPointsConfig = Field(default_factory=ViewerPointsConfig)
+    mind: MindConfig = Field(default_factory=MindConfig)
     effects: EffectsConfig = Field(default_factory=EffectsConfig)
     thoughts: ThoughtsConfig = Field(default_factory=ThoughtsConfig)
     elyth_memory: ElythMemoryConfig = Field(default_factory=ElythMemoryConfig)
@@ -715,6 +757,50 @@ def load_dotenv(path: str | Path = ".env") -> int:
     return loaded
 
 
+def _warn_unknown_keys(data, model_cls, prefix: str = "") -> None:
+    """yaml にモデルの項目でないキーがあれば警告する（F8）。
+
+    Pydantic は未知キーを黙って捨て、save_config の全体書き戻しで
+    ファイルからも消えてしまう。タイプミスが無言で無効になるのを
+    防ぐため、読み込み時にキー単位で可視化する。
+    """
+    if not isinstance(data, dict):
+        return
+    fields = model_cls.model_fields
+    for key, value in data.items():
+        path = f"{prefix}{key}"
+        field = fields.get(key)
+        if field is None:
+            import logging
+            logging.warning(
+                f"config.yaml: unknown key '{path}' is ignored "
+                f"(not a field of {model_cls.__name__})")
+            continue
+        _warn_unknown_in_value(value, field.annotation, path + ".")
+
+
+def _warn_unknown_in_value(value, annotation, prefix: str) -> None:
+    import types as _types
+    import typing
+    if annotation is None:
+        return
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+    if origin in (typing.Union, _types.UnionType):
+        for a in args:
+            _warn_unknown_in_value(value, a, prefix)
+    elif origin is dict and len(args) == 2:
+        if isinstance(value, dict):
+            for v in value.values():
+                _warn_unknown_in_value(v, args[1], prefix)
+    elif origin in (list, set, frozenset, tuple):
+        if args and isinstance(value, (list, tuple)):
+            for item in value:
+                _warn_unknown_in_value(item, args[0], prefix)
+    elif isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        _warn_unknown_keys(value, annotation, prefix)
+
+
 def load_config(path: str | Path = "config.yaml") -> AppConfig:
     path = Path(path)
     if not path.exists():
@@ -747,6 +833,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     raw.setdefault("local_chat", {})
     raw.setdefault("stt", {})
 
+    _warn_unknown_keys(raw, AppConfig)
     try:
         return AppConfig.model_validate(raw)
     except Exception as e:

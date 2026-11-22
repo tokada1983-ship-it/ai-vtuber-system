@@ -109,6 +109,24 @@ async def _handle_ws_cmd(cmd: str, data: dict, ws=None) -> None:
                 pass
 
 
+def _ws_target_agent(data: dict):
+    """WSコマンドの対象キャラを data["character"]（id か名前）で解決する。
+
+    省略時は None を返し、呼び出し側が既定スコープを決める
+    （表示・編集系はリーダー、破壊的なクリア系は全員）。
+    指定されたのに見つからない場合は ValueError（呼び出し側の例外ガードが
+    エラー応答に変換する）。黙ってリーダーに落とすと、操作の表示範囲と
+    実際の適用範囲が食い違うため、解決できない指定は必ず失敗させる。
+    """
+    key = (data.get("character") or "").strip()
+    if not key:
+        return None
+    agent = orchestrator.get_agent(key)
+    if agent is None:
+        raise ValueError(f"キャラクターが見つかりません: {key}")
+    return agent
+
+
 async def _handle_ws_cmd_inner(cmd: str, data: dict, ws=None) -> None:
     """WebSocket経由の設定コマンドを処理する"""
     if cmd == "unity_move":
@@ -298,15 +316,17 @@ async def _handle_ws_cmd_inner(cmd: str, data: dict, ws=None) -> None:
         await hub.send_log("info", f"オーディオデバイス変更: {device or 'デフォルト'} (保存済)")
 
     elif cmd == "save_memory":
+        agent = _ws_target_agent(data) or orchestrator.lead
         content = data.get("content", "")
-        orchestrator._long_term_memory.save(content)
-        orchestrator._long_term_memory.reload()
-        await hub.send_log("info", f"長期記憶更新 ({len(content)}文字)")
+        agent.long_term_memory.save(content)
+        agent.long_term_memory.reload()
+        await hub.send_log("info", f"{agent.name}の長期記憶を更新しました ({len(content)}文字)")
         await hub.broadcast("dashboard", {"type": "config_updated", "section": "memory"})
 
     elif cmd == "reload_memory":
-        orchestrator._long_term_memory.reload()
-        await hub.send_log("info", "長期記憶を再読込しました")
+        agent = _ws_target_agent(data) or orchestrator.lead
+        agent.long_term_memory.reload()
+        await hub.send_log("info", f"{agent.name}の長期記憶を再読込しました")
 
     elif cmd == "reload_avatar":
         payload = _avatar_payload()
@@ -347,17 +367,20 @@ async def _handle_ws_cmd_inner(cmd: str, data: dict, ws=None) -> None:
                 pass
 
     elif cmd == "consolidate_memory":
-        """短期記憶を手動でエピソード記憶に整理する"""
-        if not orchestrator._llm:
+        """短期記憶を手動でエピソード記憶に整理する（character 省略時は全員）"""
+        target = _ws_target_agent(data)
+        targets = [target] if target else list(orchestrator.agents)
+        if not any(a.llm for a in targets):
             await ws.send_json({"type": "consolidation_result",
                                 "request_id": data.get("request_id"),
                                 "ok": False, "error": "LLMが動いていません"})
-        elif not orchestrator._log.get_pending():
+        elif not any(a.log.get_pending() for a in targets):
             await ws.send_json({"type": "consolidation_result",
                                 "request_id": data.get("request_id"),
                                 "ok": False, "error": "整理する会話がありません"})
         else:
-            result = await orchestrator._run_consolidation(triggered_by="manual")
+            result = await orchestrator._run_consolidation(triggered_by="manual",
+                                                           agent=target)
             if result is None:
                 await ws.send_json({"type": "consolidation_result",
                                     "request_id": data.get("request_id"),
@@ -371,57 +394,83 @@ async def _handle_ws_cmd_inner(cmd: str, data: dict, ws=None) -> None:
                 })
 
     elif cmd == "get_episodic_memory":
-        """蓄積されたエピソード記憶の一覧を返す"""
-        store = orchestrator._memory_store
+        """蓄積されたエピソード記憶の一覧を返す（character 省略時はリーダー）"""
+        agent = _ws_target_agent(data) or orchestrator.lead
+        store = agent.memory_store
         entries = store.all() if store else []
         await ws.send_json({
             "type": "episodic_memory",
             "request_id": data.get("request_id"),
+            "character": agent.key,
+            "character_name": agent.name,
             "entries": [e.to_dict() for e in entries],
             "stats": store.stats() if store else {},
-            "pending_turns": orchestrator._log.turns_since_consolidation,
+            "pending_turns": agent.log.turns_since_consolidation,
             "trigger_turns": orchestrator._cfg.orchestrator.consolidation_trigger_turns,
         })
 
     elif cmd == "delete_episodic_memory":
+        agent = _ws_target_agent(data) or orchestrator.lead
         entry_id = int(data.get("id", 0))
-        ok = orchestrator._memory_store.delete(entry_id) if orchestrator._memory_store else False
+        ok = agent.memory_store.delete(entry_id) if agent.memory_store else False
         await ws.send_json({"type": "episodic_memory_deleted",
                             "request_id": data.get("request_id"),
+                            "character": agent.key,
                             "ok": ok, "id": entry_id})
 
     elif cmd == "pin_episodic_memory":
         """ピン留めした記憶は忘却の対象外になる"""
+        agent = _ws_target_agent(data) or orchestrator.lead
         entry_id = int(data.get("id", 0))
         pinned = bool(data.get("pinned", True))
-        ok = (orchestrator._memory_store.set_pinned(entry_id, pinned)
-              if orchestrator._memory_store else False)
+        ok = (agent.memory_store.set_pinned(entry_id, pinned)
+              if agent.memory_store else False)
         await ws.send_json({"type": "episodic_memory_pinned",
                             "request_id": data.get("request_id"),
+                            "character": agent.key,
                             "ok": ok, "id": entry_id, "pinned": pinned})
 
     elif cmd == "add_episodic_memory":
         """手動で記憶を追加する（source=manual は忘却されない）"""
+        agent = _ws_target_agent(data) or orchestrator.lead
         text = (data.get("text") or "").strip()
-        store = orchestrator._memory_store
+        store = agent.memory_store
         entry = store.add(text, source="manual") if (store and text) else None
         await ws.send_json({"type": "episodic_memory_added",
                             "request_id": data.get("request_id"),
+                            "character": agent.key,
                             "ok": entry is not None,
                             "entry": entry.to_dict() if entry else None,
                             "error": "" if entry else "空、または既に似た記憶があります"})
 
     elif cmd == "clear_episodic_memory":
-        n = orchestrator._memory_store.clear() if orchestrator._memory_store else 0
-        await hub.send_log("warn", f"エピソード記憶を全消去しました（{n}件）")
+        """エピソード記憶の全消去。character 省略時は全員に適用する
+        （以前はリーダーだけを消して「全消去」と表示していた）"""
+        target = _ws_target_agent(data)
+        targets = [target] if target else list(orchestrator.agents)
+        per_character = {
+            a.key: (a.memory_store.clear() if a.memory_store else 0) for a in targets
+        }
+        n = sum(per_character.values())
+        if target:
+            msg = f"{target.name}のエピソード記憶を全消去しました（{n}件）"
+        else:
+            detail = "／".join(
+                f"{a.name} {per_character[a.key]}件" for a in targets)
+            msg = f"全員のエピソード記憶を全消去しました（{detail}、計{n}件）"
+        await hub.send_log("warn", msg)
         await ws.send_json({"type": "episodic_memory_cleared",
-                            "request_id": data.get("request_id"), "ok": True, "removed": n})
+                            "request_id": data.get("request_id"), "ok": True,
+                            "removed": n, "per_character": per_character,
+                            "character": target.key if target else ""})
 
     elif cmd == "set_consolidation_interval":
-        """定期整理の間隔を設定する（0=無効）"""
+        """定期整理の間隔を設定する（0=無効）。config へ保存し永続化する（F8）"""
         minutes = int(data.get("minutes", 0))
         orchestrator._consolidation_interval_min = minutes
-        msg = f"定期記憶整理: {'無効' if minutes == 0 else str(minutes) + '分ごと'}"
+        orchestrator._cfg.orchestrator.consolidation_interval_min = minutes
+        save_config(orchestrator._cfg)
+        msg = f"定期記憶整理: {'無効' if minutes == 0 else str(minutes) + '分ごと'}（保存済）"
         await hub.send_log("info", msg)
         await ws.send_json({"type": "consolidation_interval_set",
                             "request_id": data.get("request_id"),
@@ -695,8 +744,9 @@ async def _handle_ws_cmd_inner(cmd: str, data: dict, ws=None) -> None:
         await ws.send_json({"type": "character_saved", "request_id": data.get("request_id"), "ok": True})
 
     elif cmd == "get_short_term_memory":
-        """短期記憶（会話履歴）の内容を返す"""
-        messages = orchestrator._log.get_messages()
+        """短期記憶（会話履歴）の内容を返す（character 省略時はリーダー）"""
+        agent = _ws_target_agent(data) or orchestrator.lead
+        messages = agent.log.get_messages()
         entries = []
         for m in messages:
             entry = {"role": m.role, "content": m.content}
@@ -706,37 +756,54 @@ async def _handle_ws_cmd_inner(cmd: str, data: dict, ws=None) -> None:
         await ws.send_json({
             "type": "short_term_memory_response",
             "request_id": data.get("request_id"),
+            "character": agent.key,
+            "character_name": agent.name,
             "messages": entries,
             "count": len(entries),
             "max_turns": orchestrator._cfg.orchestrator.response_history_turns,
-            "total_turns": orchestrator._log.total_turns,
-            "turns_since_consolidation": orchestrator._log.turns_since_consolidation,
+            "total_turns": agent.log.total_turns,
+            "turns_since_consolidation": agent.log.turns_since_consolidation,
             "consolidation_trigger": orchestrator._cfg.orchestrator.consolidation_trigger_turns,
         })
 
     elif cmd == "clear_short_term_memory":
-        """短期記憶をクリアする"""
-        orchestrator._log.clear()
-        await hub.send_log("info", "短期記憶をクリアしました")
-        await ws.send_json({"type": "short_term_memory_cleared", "request_id": data.get("request_id"), "ok": True})
+        """短期記憶をクリアする。character 省略時は全員に適用する
+        （以前はリーダーだけを消していたため、二人の文脈が非対称になった）"""
+        target = _ws_target_agent(data)
+        targets = [target] if target else list(orchestrator.agents)
+        for a in targets:
+            a.log.clear()
+        if target:
+            msg = f"{target.name}の短期記憶をクリアしました"
+        else:
+            names = "・".join(a.name for a in targets)
+            msg = f"全員（{names}）の短期記憶をクリアしました"
+        await hub.send_log("info", msg)
+        await ws.send_json({"type": "short_term_memory_cleared",
+                            "request_id": data.get("request_id"), "ok": True,
+                            "characters": [a.key for a in targets]})
 
     elif cmd == "rag_search":
         """RAG検索テスト（ダッシュボードから検索できる）"""
+        agent = _ws_target_agent(data) or orchestrator.lead
         query = data.get("query", "")
         top_k = int(data.get("top_k", 3))
         if not query:
-            await ws.send_json({"type": "rag_result", "request_id": data.get("request_id"), "results": []})
+            await ws.send_json({"type": "rag_result", "request_id": data.get("request_id"),
+                                "character": agent.key, "results": []})
         else:
             # インデックスを最新化
-            memory_text = orchestrator._long_term_memory.get_raw()
-            orchestrator._rag.index(memory_text)
-            results = orchestrator._rag.search(query, top_k=top_k)
+            memory_text = agent.long_term_memory.get_raw()
+            agent.rag.index(memory_text)
+            results = agent.rag.search(query, top_k=top_k)
             await ws.send_json({
                 "type": "rag_result",
                 "request_id": data.get("request_id"),
+                "character": agent.key,
+                "character_name": agent.name,
                 "query": query,
-                "mode": orchestrator._rag.mode,
-                "chunks": orchestrator._rag.chunk_count,
+                "mode": agent.rag.mode,
+                "chunks": agent.rag.chunk_count,
                 "results": [
                     {"text": r.text, "section": r.section, "score": round(r.score, 3)}
                     for r in results
@@ -745,13 +812,16 @@ async def _handle_ws_cmd_inner(cmd: str, data: dict, ws=None) -> None:
 
     elif cmd == "get_rag_status":
         """RAGの状態を返す"""
-        memory_text = orchestrator._long_term_memory.get_raw()
-        orchestrator._rag.index(memory_text)
+        agent = _ws_target_agent(data) or orchestrator.lead
+        memory_text = agent.long_term_memory.get_raw()
+        agent.rag.index(memory_text)
         await ws.send_json({
             "type": "rag_status",
             "request_id": data.get("request_id"),
-            "mode": orchestrator._rag.mode,
-            "chunk_count": orchestrator._rag.chunk_count,
+            "character": agent.key,
+            "character_name": agent.name,
+            "mode": agent.rag.mode,
+            "chunk_count": agent.rag.chunk_count,
             "indexed": len(memory_text) > 0,
         })
 
@@ -865,11 +935,13 @@ async def _handle_ws_cmd_inner(cmd: str, data: dict, ws=None) -> None:
         })
 
     elif cmd == "get_memory":
-        mem = orchestrator._long_term_memory
+        agent = _ws_target_agent(data) or orchestrator.lead
+        mem = agent.long_term_memory
         await ws.send_json({
             "type": "memory_response",
             "request_id": data.get("request_id"),
             "character": mem.character_name,
+            "character_key": agent.key,
             "content": mem.get_raw(),
             "path": str(mem.path),
             "is_loaded": mem.is_loaded,

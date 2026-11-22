@@ -497,19 +497,22 @@ class TagSpeechStreamParser(SpeechStreamParser):
         if not speech:
             if scan.emotion_raw and scan.motion_raw:
                 # 両タグ完備＋本文なしは ok と分離して数える（計測是正）
-                record_tag_parse_outcome(TAG_OUTCOME_NO_SPEECH)
+                outcome = TAG_OUTCOME_NO_SPEECH
             else:
-                record_tag_parse_outcome(TAG_OUTCOME_FATAL)
-            return LLMResponse(speech="", skip=True, raw={"protocol": "tag"})
-        record_tag_parse_outcome(
-            TAG_OUTCOME_DEGRADED if scan.issues else TAG_OUTCOME_OK)
+                outcome = TAG_OUTCOME_FATAL
+            record_tag_parse_outcome(outcome)
+            return LLMResponse(
+                speech="", skip=True,
+                raw={"protocol": "tag", "tag_outcome": outcome})
+        outcome = TAG_OUTCOME_DEGRADED if scan.issues else TAG_OUTCOME_OK
+        record_tag_parse_outcome(outcome)
         return LLMResponse(
             speech=speech,
             emotion=_enum_or_default(Emotion, scan.emotion_raw,
                                      Emotion.NEUTRAL),
             motion=_enum_or_default(Motion, scan.motion_raw, Motion.IDLE),
             skip=False,
-            raw={"protocol": "tag"},
+            raw={"protocol": "tag", "tag_outcome": outcome},
             effect=scan.effect,
             thought=scan.thought.strip(),
         )

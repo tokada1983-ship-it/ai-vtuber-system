@@ -315,9 +315,6 @@ class WebSearchClient:
         for key in oldest[: len(self._cache) - max_entries]:
             self._cache.pop(key, None)
 
-    def clear_cache(self) -> None:
-        self._cache.clear()
-
     # ── 各プロバイダ ──────────────────────────────────────────
 
     async def _search_google_cse(self, query: str, limit: int) -> list[WebDocument]:

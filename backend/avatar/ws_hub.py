@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections import deque
 from typing import Any
 
 from fastapi import WebSocket
@@ -18,7 +19,11 @@ class WebSocketHub:
     - "dashboard" : 操作・状態確認用
     - "avatar"    : OBS用アバターレンダラ
     - "subtitle"  : 字幕オーバーレイ
+    - "speechlog" : 配信画面の発言ログ欄（発話と拾ったコメントの履歴）
     """
+
+    # 発言ログ欄に保持する履歴件数（ページ再読込時に接続直後へ再送する）
+    SPEECHLOG_HISTORY_MAX = 30
 
     def __init__(self):
         self._connections: dict[str, list[WebSocket]] = {
@@ -27,7 +32,10 @@ class WebSocketHub:
             "subtitle": [],
             "unity": [],
             "chat": [],      # ローカル1対1チャット画面
+            "speechlog": [],  # 発言ログ欄（右端の縦長欄）
         }
+        self._speechlog_history: deque[dict[str, Any]] = deque(
+            maxlen=self.SPEECHLOG_HISTORY_MAX)
         self._lock = asyncio.Lock()
         # アバターページの生死判定（ページから届くハートビートで更新する。
         # ページは描画・再生が止まっても WS 接続だけ残ることがあるため、
@@ -41,6 +49,16 @@ class WebSocketHub:
         async with self._lock:
             self._connections.setdefault(channel, []).append(ws)
         logger.info("WS connected", channel=channel)
+        if channel == "speechlog" and self._speechlog_history:
+            # 発言ログ欄は OBS のブラウザソースで再読込されやすいため、
+            # 接続直後に保持分の履歴を送って欄が空白に戻らないようにする
+            try:
+                await ws.send_text(json.dumps(
+                    {"type": "speechlog_history",
+                     "items": list(self._speechlog_history)},
+                    ensure_ascii=False))
+            except Exception:
+                pass
 
     async def disconnect(self, ws: WebSocket, channel: str = "dashboard") -> None:
         async with self._lock:
@@ -132,6 +150,16 @@ class WebSocketHub:
 
     async def send_comment(self, comment_data: dict) -> None:
         await self.broadcast("dashboard", {"type": "new_comment", **comment_data})
+        # send_comment の呼び出しは「選別を通過し応答キューへ入った
+        # コメント」に限られる（通常コメント／音声入力／注入テスト）。
+        # 発言ログ欄には「拾ったコメント」として相乗りさせる。
+        await self._emit_speechlog({
+            "type": "picked_comment",
+            "author": comment_data.get("author"),
+            "text": comment_data.get("message"),
+            "is_superchat": bool(comment_data.get("is_superchat")),
+            "is_voice": bool(comment_data.get("is_voice")),
+        })
 
     async def send_chat(self, role: str, text: str, **extra) -> None:
         """
@@ -142,6 +170,22 @@ class WebSocketHub:
         チャット吹き出しが二重にならないよう専用のイベントに分けている。
         """
         await self.broadcast("chat", {"type": "chat", "role": role, "text": text, **extra})
+        if role == "assistant":
+            # キャラの発話は1発話単位でちょうど1回ここを通る（speech_start
+            # と違い音声URL付きの再送がない）ため、発言ログ欄への相乗りは
+            # この経路が正確。extra には _chat_kwargs の author/character が入る。
+            await self._emit_speechlog({
+                "type": "speech_log",
+                "character": extra.get("character"),
+                "speaker": extra.get("author"),
+                "text": text,
+                "emotion": extra.get("emotion"),
+            })
+
+    async def _emit_speechlog(self, event: dict[str, Any]) -> None:
+        """発言ログ欄（speechlog チャネル）へ1件流し、履歴にも残す"""
+        self._speechlog_history.append(event)
+        await self.broadcast("speechlog", event)
 
     async def send_log(self, level: str, message: str) -> None:
         await self.broadcast("dashboard", {"type": "log", "level": level, "message": message})

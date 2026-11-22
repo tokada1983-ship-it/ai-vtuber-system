@@ -115,6 +115,19 @@ class ConversationLog:
         self._max_turns = max_turns
         self._history = deque(self._history, maxlen=max_turns * 2)
 
+    def clear_context(self) -> None:
+        """文脈（履歴）だけを破棄し、整理待ちと整理カウンタは保持する。
+
+        文脈リセット（飽和・LoopGuard 由来）の目的は「LLM に渡す文脈を
+        捨てる」ことであり、まだ長期記憶に整理していない会話
+        （_pending）と整理トリガのカウンタまで消してしまうと、リセット
+        が頻発する配信では整理閾値へ到達できなくなる（2026-11-22
+        5時間検証で実証：リセット約20ターンごとにカウンタが初期化され、
+        閾値50へ構造的に届かなかった）。保持した pending は次の整理
+        サイクルが通常どおり拾う。
+        """
+        self._history.clear()
+
     def clear(self) -> None:
         """会話をすべて破棄する（整理待ちも含む）"""
         self._history.clear()

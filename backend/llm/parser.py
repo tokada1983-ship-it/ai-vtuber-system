@@ -105,6 +105,29 @@ def contains_meta_leak(text: str) -> bool:
     return False
 
 
+# ── 言語混入（中国語）検出 ────────────────────────────────────
+# フォールバック側のモデル（LM Studio 等）が中国語の断片を混ぜることが
+# ある（2026-11-21 BFラン: 「啦，」を含む文がそのまま放送された）。
+# 日本語の通常テキストには現れないマーカーだけを拾う:
+#   ， … 全角コンマ（日本語は「、」を使う）
+#   啦・呢・麼 … 中国語の語気助詞（日本語では使わない）
+#   簡体字のうち日本語の字体とコードポイントが異なる常用字
+_FOREIGN_MARKER_RE = re.compile(
+    r"[，啦呢麼]"
+    r"|[们这么说对还个时为过进远达书车马龙听读语识记讲许论证设访谈诉试该详际观实]")
+
+
+def foreign_contamination_marker(text: str) -> str:
+    """中国語混入のマーカー文字を返し、無ければ空文字を返す。
+
+    発話・日記など「日本語として読み上げ・記録されるテキスト」の
+    品質ゲート用。マーカー自体を返すのは、ログで何が引っかかったかを
+    追えるようにするため。
+    """
+    m = _FOREIGN_MARKER_RE.search(text or "")
+    return m.group(0) if m else ""
+
+
 def truncate_at_meta_leak(text: str) -> str:
     """メタ漏れの開始位置で文を切る。先頭付近なら丸ごと無効（空文字）"""
     t = text or ""
@@ -531,6 +554,26 @@ def record_tag_parse_outcome(outcome: str) -> None:
         _tag_parse_outcomes[outcome] += 1
 
 
+def tag_outcome_of(response) -> str:
+    """応答オブジェクトに刻まれた、その生成のパース区分を返す（F3）。
+
+    パース区分は生成のたびに応答の raw["tag_outcome"] にも刻まれる。
+    失敗の帰属を「モジュール共有カウンタの前後差分」で推測すると、
+    ロック外で並行する生成（プリフェッチ等）の失敗と取り違えるため、
+    制御側の判定はこの生成単位の値を読むこと。グローバルカウンタは
+    表示・集計専用として残す。
+    """
+    raw = getattr(response, "raw", None)
+    if isinstance(raw, dict):
+        return str(raw.get("tag_outcome") or "")
+    return ""
+
+
+def is_tag_failure_outcome(outcome: str) -> bool:
+    """パース区分が no-speech 系の失敗（fatal / no_speech）か"""
+    return outcome in (TAG_OUTCOME_FATAL, TAG_OUTCOME_NO_SPEECH)
+
+
 def tag_no_speech_fields(raw_text: str,
                          gen_meta: dict | None = None) -> dict:
     """no-speech 診断用のログフィールドを組み立てる。
@@ -750,24 +793,29 @@ def parse_tag_output(raw_text: str, _count: bool = True,
         if scan.emotion_raw and scan.motion_raw:
             if _count:
                 record_tag_parse_outcome(TAG_OUTCOME_NO_SPEECH)
-            return LLMResponse(speech="", skip=True, raw={"protocol": "tag"})
+            return LLMResponse(
+                speech="", skip=True,
+                raw={"protocol": "tag", "tag_outcome": TAG_OUTCOME_NO_SPEECH})
         if _count:
             record_tag_parse_outcome(TAG_OUTCOME_FATAL)
         log_tag_no_speech(raw_in, source="non-streaming", gen_meta=gen_meta)
-        return LLMResponse(speech="", skip=True)
+        return LLMResponse(
+            speech="", skip=True,
+            raw={"protocol": "tag", "tag_outcome": TAG_OUTCOME_FATAL})
 
+    outcome = TAG_OUTCOME_DEGRADED if scan.issues else TAG_OUTCOME_OK
     if _count:
-        record_tag_parse_outcome(
-            TAG_OUTCOME_DEGRADED if scan.issues else TAG_OUTCOME_OK)
+        record_tag_parse_outcome(outcome)
+    raw_out = {"protocol": "tag", "tag_outcome": outcome}
 
     # 安全基準は JSON 方式と同一（メタ漏れは喋らせない）
     if contains_meta_leak(speech):
         logger.warning("Meta leak in speech (tag), skipping",
                        speech=speech[:120])
-        return LLMResponse(speech="", skip=True, raw={"protocol": "tag"})
+        return LLMResponse(speech="", skip=True, raw=raw_out)
     speech = dedupe_repeated_sentences(speech)
     if not speech:
-        return LLMResponse(speech="", skip=True, raw={"protocol": "tag"})
+        return LLMResponse(speech="", skip=True, raw=raw_out)
 
     try:
         emotion = Emotion(scan.emotion_raw)
@@ -782,7 +830,7 @@ def parse_tag_output(raw_text: str, _count: bool = True,
         emotion=emotion,
         motion=motion,
         skip=False,
-        raw={"protocol": "tag"},
+        raw=raw_out,
         effect=scan.effect,
         thought=scan.thought.strip(),
     )

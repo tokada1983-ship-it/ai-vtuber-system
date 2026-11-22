@@ -71,6 +71,7 @@ class FakePlanner:
         self.released: list = []
         self.banned: list[tuple[str, float]] = []
         self.reset_thread_calls = 0
+        self.reset_thread_reasons = []
         self.last_comment_speech_at = 0.0
 
     async def plan(self, kind="", query="", allow_web=True, context=None):
@@ -92,8 +93,9 @@ class FakePlanner:
     def banned_words(self):
         return {w for w, _ in self.banned}
 
-    def reset_thread(self):
+    def reset_thread(self, reason="reset"):
         self.reset_thread_calls += 1
+        self.reset_thread_reasons.append(reason)
 
     def note_speech(self, idle=False, text=""):
         pass
@@ -113,11 +115,11 @@ def make_duo_p2(llm_a=None, llm_b=None, fallback_a=(), fallback_b=(),
     cfg.tts.irodori_server.auto_start = False
     cfg.knowledge.enabled = False
     cfg.characters = [
-        CharacterConfig(name="Character1", id="Character1", data_dir=str(tmp),
-                        prompt_file=_write_char(tmp, "Character1"),
-                        aliases=["character1"], fallback_lines=list(fallback_a)),
-        CharacterConfig(name="Character2", id="Character2", data_dir=str(tmp),
-                        prompt_file=_write_char(tmp, "Character2"),
+        CharacterConfig(name="クロエ", id="chloe", data_dir=str(tmp),
+                        prompt_file=_write_char(tmp, "クロエ"),
+                        aliases=["くろえ"], fallback_lines=list(fallback_a)),
+        CharacterConfig(name="ミライ", id="mirai", data_dir=str(tmp),
+                        prompt_file=_write_char(tmp, "ミライ"),
                         fallback_lines=list(fallback_b)),
     ]
     ens = {"turn_gap_sec": 0, "idle_banter_probability": 0.0,
@@ -164,9 +166,9 @@ async def test_retry_with_recovery_hint_and_topic_redraw():
     assert len(planner.plan_calls) == 2                # 話題を引き直した
     assert len(planner.released) == 1                  # 失敗した話題は解放
     assert len(planner.committed) == 1                 # 成功した話題は消費確定
-    assert _speakers(hub) == ["Character1"]
+    assert _speakers(hub) == ["chloe"]
     assert tts_a.calls == ["新しい話題を持ってきたよ。", "今日は天気の話をしよう。"]
-    assert orch._block_streak.get("Character1", 0) == 0     # 成功でリセット
+    assert orch._block_streak.get("chloe", 0) == 0     # 成功でリセット
     assert orch._total_block_streak == 0
 
 
@@ -175,24 +177,24 @@ async def test_second_block_switches_speaker_and_cooldown_applies():
     """2回目のブロックで話者が交代し、クールダウン中は選ばれないこと"""
     llm_a = ScriptedLLM([_json_raw(REPEAT_SPEECH)])
     llm_b = ScriptedLLM([
-        _json_raw("Character2の新しい話題だよ。別の切り口で話すね。"),
-        _json_raw("今度はCharacter2の二つ目の話題だよ。続けていこう。"),
+        _json_raw("ミライの新しい話題だよ。別の切り口で話すね。"),
+        _json_raw("今度はミライの二つ目の話題だよ。続けていこう。"),
     ])
     orch, hub, _, _ = make_duo_p2(llm_a=llm_a, llm_b=llm_b)
     _seed_repeat(orch)
 
     await orch._speak_idle()
 
-    assert _speakers(hub) == ["Character2"]                 # 相方が喋った
-    assert len(llm_a.prompts) == 2                     # Character1は2回試して詰まった
-    assert orch._block_streak.get("Character1") == 2
-    assert orch._speaker_cooldown_until.get("Character1", 0) > time.time() + 100
+    assert _speakers(hub) == ["mirai"]                 # 相方が喋った
+    assert len(llm_a.prompts) == 2                     # クロエは2回試して詰まった
+    assert orch._block_streak.get("chloe") == 2
+    assert orch._speaker_cooldown_until.get("chloe", 0) > time.time() + 100
 
     hub.events.clear()
     await orch._speak_idle()
 
-    # クールダウン中のCharacter1は選ばれず（生成も呼ばれず）、Character2が続ける
-    assert _speakers(hub) == ["Character2"]
+    # クールダウン中のクロエは選ばれず（生成も呼ばれず）、ミライが続ける
+    assert _speakers(hub) == ["mirai"]
     assert len(llm_a.prompts) == 2
 
 
@@ -203,16 +205,16 @@ async def test_fallback_line_spoken_when_all_attempts_fail():
     llm_b = ScriptedLLM([_json_raw(REPEAT_SPEECH)])
     orch, hub, _, tts_b = make_duo_p2(
         llm_a=llm_a, llm_b=llm_b,
-        fallback_a=["Character1の繋ぎ台詞だよ。場を温めるね。"],
-        fallback_b=["Character2の繋ぎ台詞だよ。のんびり行こう。"])
+        fallback_a=["クロエの繋ぎ台詞だよ。場を温めるね。"],
+        fallback_b=["ミライの繋ぎ台詞だよ。のんびり行こう。"])
     _seed_repeat(orch)
 
     await orch._speak_idle()
 
-    # 話者交代後のCharacter2のプールから1本喋り、通常の発話として履歴に残る
-    assert _speakers(hub) == ["Character2"]
-    assert tts_b.calls == ["Character2の繋ぎ台詞だよ。のんびり行こう。"]
-    assert Orchestrator._normalize_speech("Character2の繋ぎ台詞だよ。のんびり行こう。") \
+    # 話者交代後のミライのプールから1本喋り、通常の発話として履歴に残る
+    assert _speakers(hub) == ["mirai"]
+    assert tts_b.calls == ["ミライの繋ぎ台詞だよ。のんびり行こう。"]
+    assert Orchestrator._normalize_speech("ミライの繋ぎ台詞だよ。のんびり行こう。") \
         in orch._recent_speech_norms
 
 
@@ -257,7 +259,7 @@ async def test_formulaic_line_diverted_not_counted_as_block():
 
     assert tts_a.calls == ["新しい話題だよ。", "天気の話をしよう。"]
     assert "言い回しの変更" in llm.prompts[1]
-    assert orch._block_streak.get("Character1", 0) == 0
+    assert orch._block_streak.get("chloe", 0) == 0
     assert orch._total_block_streak == 0
 
 
@@ -352,7 +354,7 @@ async def test_force_switch_forces_news_kind():
     assert planner.reset_thread_calls == 1
     assert planner.plan_calls[0]["kind"] == "news"
     assert orch._force_switch_pending is False
-    assert _speakers(hub) == ["Character1"]
+    assert _speakers(hub) == ["chloe"]
 
 
 @pytest.mark.asyncio

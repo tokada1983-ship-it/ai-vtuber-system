@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Speech Log Panel</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: transparent; overflow: hidden;
+    font-family: 'Hiragino Sans', 'Yu Gothic', 'Noto Sans JP', sans-serif;
+    color: #fff;
+  }
+  /* 右端に置く縦長欄: 新しい発言が下に溜まり、自動で最下部へスクロールする */
+  #log {
+    height: 100vh; overflow-y: auto; scrollbar-width: none;
+    display: flex; flex-direction: column; gap: 8px;
+    padding: 10px;
+  }
+  #log::-webkit-scrollbar { display: none; }
+  .entry {
+    background: rgba(10, 10, 16, 0.62);
+    border-left: 4px solid #888; border-radius: 8px;
+    padding: 7px 10px; flex: none;
+    font-size: 15px; line-height: 1.45;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.9), 0 0 6px rgba(0,0,0,0.6);
+    word-break: break-word;
+    animation: slidein 0.25s ease-out;
+  }
+  @keyframes slidein { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: none; } }
+  .entry .who { display: block; font-size: 12px; font-weight: bold; margin-bottom: 2px; letter-spacing: .04em; }
+  /* キャラ色分け: Character1=金 / Character2=小豆色 */
+  .entry.char-Character1 { border-left-color: #f2b63d; }
+  .entry.char-Character1 .who { color: #ffd97a; }
+  .entry.char-Character2 { border-left-color: #e0657f; }
+  .entry.char-Character2 .who { color: #ff9eb0; }
+  .entry.char-unknown { border-left-color: #9aa3ad; }
+  .entry.char-unknown .who { color: #cfd6dd; }
+  /* コメント欄から拾った発言: ティール系で区別し、視聴者名を出す */
+  .entry.comment { background: rgba(8, 30, 34, 0.66); border-left-color: #37c4b1; }
+  .entry.comment .who { color: #7fe7d8; }
+  .entry.comment .tag {
+    display: inline-block; font-size: 10px; font-weight: bold;
+    background: rgba(55,196,177,0.25); border: 1px solid rgba(55,196,177,0.7);
+    border-radius: 6px; padding: 0 5px; margin-right: 6px; vertical-align: 1px;
+  }
+  .entry.comment.superchat { background: rgba(46, 36, 6, 0.66); border-left-color: #ffc93d; }
+  .entry.comment.superchat .who { color: #ffd94d; }
+  .entry.comment.superchat .tag { background: rgba(255,201,61,0.2); border-color: rgba(255,201,61,0.7); }
+  #demo-badge {
+    position: fixed; top: 6px; right: 8px; z-index: 10;
+    font-size: 11px; font-weight: bold; color: #ffd97a;
+    background: rgba(0,0,0,0.55); border: 1px solid rgba(255,217,122,0.6);
+    border-radius: 6px; padding: 1px 7px; display: none;
+  }
+</style>
+</head>
+<body>
+<div id="demo-badge">DEMO</div>
+<div id="log"></div>
+<script>
+  // 発言ログ欄: バックエンドの speechlog チャネルから
+  //   {type:'speech_log', character, speaker, text}      … キャラの発話
+  //   {type:'picked_comment', author, text, ...}         … 拾ったコメント
+  //   {type:'speechlog_history', items:[...]}            … 接続直後の履歴
+  // を受けて会話ログ形式で表示する。?demo=1 でサンプルを流し込む。
+  const params = new URLSearchParams(location.search);
+  const MAX = Math.max(5, parseInt(params.get('max') || '30', 10) || 30);
+  const DEMO = params.get('demo') === '1';
+  const logEl = document.getElementById('log');
+
+  function addEntry(node) {
+    logEl.appendChild(node);
+    while (logEl.children.length > MAX) logEl.removeChild(logEl.firstChild);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function speechEntry(msg) {
+    const d = document.createElement('div');
+    const key = String(msg.character || '').toLowerCase();
+    d.className = 'entry ' + (key === 'Character1' ? 'char-Character1'
+      : key === 'Character2' ? 'char-Character2' : 'char-unknown');
+    const who = document.createElement('span');
+    who.className = 'who';
+    who.textContent = msg.speaker || msg.character || 'キャラ';
+    d.appendChild(who);
+    d.appendChild(document.createTextNode(msg.text || ''));
+    return d;
+  }
+
+  function commentEntry(msg) {
+    const d = document.createElement('div');
+    d.className = 'entry comment' + (msg.is_superchat ? ' superchat' : '');
+    const who = document.createElement('span');
+    who.className = 'who';
+    const tag = document.createElement('span');
+    tag.className = 'tag';
+    tag.textContent = msg.is_superchat ? 'スパチャ' : (msg.is_voice ? '音声' : 'コメント');
+    who.appendChild(tag);
+    who.appendChild(document.createTextNode(msg.author || '視聴者'));
+    d.appendChild(who);
+    d.appendChild(document.createTextNode(msg.text || ''));
+    return d;
+  }
+
+  function render(msg) {
+    if (!msg || !msg.text) return;
+    if (msg.type === 'speech_log') addEntry(speechEntry(msg));
+    else if (msg.type === 'picked_comment') addEntry(commentEntry(msg));
+  }
+
+  function connect() {
+    const ws = new WebSocket('ws://' + location.host + '/ws/speechlog');
+    ws.onmessage = (e) => {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch (err) { return; }
+      if (msg.type === 'speechlog_history') {
+        logEl.textContent = '';
+        (msg.items || []).forEach(render);
+        logEl.scrollTop = logEl.scrollHeight;
+      } else {
+        render(msg);
+      }
+    };
+    ws.onclose = () => setTimeout(connect, 3000);
+  }
+
+  // ── デモモード（配信なしの表示確認用） ──────────────────────
+  function runDemo() {
+    document.getElementById('demo-badge').style.display = 'block';
+    const samples = [
+      { type: 'speech_log', character: 'Character1', speaker: 'Character1', text: 'みんな来てくれてありがとう！今日も雑談していくよー。' },
+      { type: 'speech_log', character: 'Character2', speaker: 'Character2', text: 'よろしくお願いしますな。お茶でも飲みながらどうぞ。' },
+      { type: 'picked_comment', author: 'テスト視聴者さん', text: 'こんばんは！今日のテーマは何ですか？' },
+      { type: 'speech_log', character: 'Character1', speaker: 'Character1', text: '今日はセールの話！欲しいものリスト、みんなも作ってる？' },
+      { type: 'speech_log', character: 'Character2', speaker: 'Character2', text: 'ボクはまず予算を決める派ですな。衝動買いは禁物ですよ。' },
+      { type: 'picked_comment', author: '常連のたぬきさん', text: 'キーボードが安くなってて迷ってます…', is_superchat: true },
+      { type: 'speech_log', character: 'Character1', speaker: 'Character1', text: '迷うよねー。でも本当に使うものなら、今がチャンスかも！' },
+      { type: 'picked_comment', author: 'マスター', text: '二人とも今日も元気だね', is_voice: true },
+      { type: 'speech_log', character: 'Character2', speaker: 'Character2', text: 'ありがとうございますな。元気が取り柄ですからね。' },
+    ];
+    let i = 0;
+    const push = () => {
+      // 上限（30件）の挙動も見られるよう、サンプルを繰り返して流す
+      render(samples[i % samples.length]);
+      i += 1;
+    };
+    for (let k = 0; k < 5; k++) push();
+    setInterval(push, 900);
+  }
+
+  if (DEMO) runDemo(); else connect();
+</script>
+</body>
+</html>

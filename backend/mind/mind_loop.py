@@ -29,7 +29,7 @@
     パースも JSON → 複数オブジェクト統合 → フィールド救出 → 平文の順に緩めた
     専用パーサ（_parse_thought_output）にした。
 
-設定（環境変数で上書き可。config.yaml は変更しない）:
+設定（config.yaml の mind セクションが正。環境変数があれば移行互換のため優先）:
   AIVT_MIND_ENABLED        "0" で背景ループ無効（既定: 有効）
   AIVT_MIND_IDLE_SEC       最終発話からこの秒数を超えたら思考可（既定: 600）
   AIVT_MIND_MAX_PER_HOUR   1時間あたりのサイクル上限/キャラ（既定: 3）
@@ -84,13 +84,37 @@ _MATERIALS_STATE_KEY = "opinion_materials"
 _SEED_NG = re.compile(
     r"元気な挨拶|定型的なやり取り|自己紹介のテーマ|挨拶を交わ|元気なことをアピール")
 
+# エピソード記憶（MemoryStore）の source 語彙と provenance の対応。
+# source の全量は MemoryStore.add の呼び出し側に散らばっているため、
+# 新しい source を足したら必ずここにも登録すること（未登録だと
+# provenance_for_memory_source が警告を出して inferred に落とす。
+# テストが add 呼び出しの source リテラルとこの写像を突き合わせる）
 _PROV_BY_MEMORY_SOURCE = {
     "stream_episode": "experienced",
     "elyth_episode": "experienced",
+    # 配信中の流れダイジェストは本人の配信エピソードの要約なので体験扱い
+    "stream_digest": "experienced",
     "auto": "experienced",
+    # 旧方式（MD）から引き継いだ自動記憶も本人の蓄積なので体験扱い
+    "imported": "experienced",
     "web": "researched",
     "manual": "told",
 }
+
+
+def provenance_for_memory_source(source: str, *, context: str = "") -> str:
+    """エピソード記憶の source から意見の provenance を引く（F5）。
+
+    未登録の source は黙って inferred に落とさず、警告を残してから
+    inferred を返す（inferred 自体は「出所不明の推論」という意図した
+    受け皿として残す）。
+    """
+    prov = _PROV_BY_MEMORY_SOURCE.get(source or "")
+    if prov is None:
+        logger.warning("unmapped memory source for provenance",
+                       source=source, context=context)
+        return "inferred"
+    return prov
 
 
 def _env_float(name: str, default: float) -> float:
@@ -622,12 +646,22 @@ class MindLoop:
 
     def __init__(self, orchestrator):
         self._orch = orchestrator
-        self.enabled = os.environ.get("AIVT_MIND_ENABLED", "1") != "0"
-        self.idle_sec = _env_float("AIVT_MIND_IDLE_SEC", 600.0)
-        self.max_per_hour = max(1, _env_int("AIVT_MIND_MAX_PER_HOUR", 3))
+        # 調整値は config（mind セクション）を正とし、環境変数があれば
+        # 移行互換のためそちらを優先する（F8）。既定値は従来どおり
+        mind_cfg = getattr(getattr(orchestrator, "_cfg", None), "mind", None)
+        cfg_enabled = True if mind_cfg is None else bool(mind_cfg.enabled)
+        cfg_idle = 600.0 if mind_cfg is None else float(mind_cfg.idle_sec)
+        cfg_max = 3 if mind_cfg is None else int(mind_cfg.max_per_hour)
+        cfg_poll = 20.0 if mind_cfg is None else float(mind_cfg.poll_sec)
+        cfg_interval = None if mind_cfg is None else mind_cfg.min_interval_sec
+        self.enabled = os.environ.get(
+            "AIVT_MIND_ENABLED", "1" if cfg_enabled else "0") != "0"
+        self.idle_sec = _env_float("AIVT_MIND_IDLE_SEC", cfg_idle)
+        self.max_per_hour = max(1, _env_int("AIVT_MIND_MAX_PER_HOUR", cfg_max))
+        default_interval = cfg_interval if cfg_interval             else 3600.0 / self.max_per_hour
         self.min_interval_sec = _env_float(
-            "AIVT_MIND_MIN_INTERVAL_SEC", 3600.0 / self.max_per_hour)
-        self.poll_sec = _env_float("AIVT_MIND_POLL_SEC", 20.0)
+            "AIVT_MIND_MIN_INTERVAL_SEC", default_interval)
+        self.poll_sec = _env_float("AIVT_MIND_POLL_SEC", cfg_poll)
         self._lock = asyncio.Lock()
         self._abort = asyncio.Event()
         self._current: asyncio.Task | None = None
@@ -794,8 +828,8 @@ class MindLoop:
             if any(label and label in text for label in labels):
                 continue
             return {"memory": entry,
-                    "provenance": _PROV_BY_MEMORY_SOURCE.get(
-                        entry.source, "inferred")}
+                    "provenance": provenance_for_memory_source(
+                        entry.source, context="opinion_seed")}
         return None
 
     @staticmethod

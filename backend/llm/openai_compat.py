@@ -10,6 +10,7 @@ LM Studio / OpenAI / llama.cpp server / vLLM は同じAPI形式なので、
 from __future__ import annotations
 
 import os
+import time
 from typing import AsyncIterator
 
 import httpx
@@ -102,6 +103,7 @@ class OpenAICompatBackend(LLMBackend):
 
         payload = self._build_payload(system_prompt, messages, stream=False,
                                       temperature=temperature)
+        started = time.monotonic()
         try:
             resp = await self._get_client().post(self._url, json=payload, headers=self._headers())
             resp.raise_for_status()
@@ -117,9 +119,14 @@ class OpenAICompatBackend(LLMBackend):
                 return LLMResponse(speech="", skip=True)
             result = parse_tag_output(raw_text) \
                 if self.protocol == "tag" else parse_llm_output(raw_text)
+            # 所要時間も残す（プライマリ側の生成レイテンシ観測と対で、
+            # フォールバック滞留中の生成がどれだけ遅いかを追えるように）
             logger.info(f"{self.name} response",
                         speech=result.speech[:40] if result.speech else "skip",
-                        emotion=result.emotion.value if not result.skip else "-")
+                        emotion=result.emotion.value if not result.skip else "-",
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                        prompt_tokens=data.get("usage", {}).get("prompt_tokens"),
+                        completion_tokens=data.get("usage", {}).get("completion_tokens"))
             return result
         except httpx.ConnectError as e:
             logger.warning(f"{self.name}: connection refused — is the server running?",
@@ -151,6 +158,7 @@ class OpenAICompatBackend(LLMBackend):
             return
         payload = self._build_payload(system_prompt, messages, stream=True,
                                       temperature=temperature)
+        started = time.monotonic()
         try:
             async with self._get_client().stream("POST", self._url, json=payload,
                                                  headers=self._headers()) as resp:
@@ -158,6 +166,8 @@ class OpenAICompatBackend(LLMBackend):
                 self._healthy = True
                 async for delta in iter_openai_sse(resp):
                     yield delta
+            logger.info(f"{self.name} stream done",
+                        duration_ms=int((time.monotonic() - started) * 1000))
         except httpx.ConnectError:
             logger.warning(f"{self.name} stream: connection refused", url=self._url)
             self._healthy = False

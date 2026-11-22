@@ -123,7 +123,7 @@ class FakePlannerP4:
     def note_comment(self, author, text):
         pass
 
-    def reset_thread(self):
+    def reset_thread(self, reason="reset"):
         pass
 
     def has_deliverable_answer(self):
@@ -416,8 +416,16 @@ async def test_ollama_probe_success_and_failure():
     backend = OllamaBackend(_ollama_cfg({}))
 
     def ok_handler(request):
-        return httpx.Response(200, json={"message": {"role": "assistant",
-                                                     "content": ""}})
+        # guardfix 以後の probe は実生成（ストリーミング）で健全性を
+        # 見るため、NDJSON のチャンク＋done（eval_count 十分）を返す
+        lines = [
+            json.dumps({"message": {"content": "あ"}}),
+            json.dumps({"done": True, "done_reason": "stop",
+                        "eval_count": 32, "prompt_eval_count": 40,
+                        "total_duration": 1_000_000_000,
+                        "eval_duration": 800_000_000}),
+        ]
+        return httpx.Response(200, content="\n".join(lines))
 
     backend._client = httpx.AsyncClient(transport=httpx.MockTransport(ok_handler))
     assert await backend.probe() is True

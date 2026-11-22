@@ -324,7 +324,7 @@ def build_system_prompt(
     # 配信テーマ
     theme = char_cfg.stream_theme.strip() if char_cfg.stream_theme else ""
     if theme:
-        parts.append(f"## 今回の配信テーマ\n{theme}\n\nこのテーマに関連する話題を積極的に取り上げてください。")
+        parts.append(f"## 今回の配信テーマ\n{theme}\n\nこのテーマに関連する話題を積極的に取り上げてください。テーマと直接関係ない話題を話すときも、無理のない範囲でテーマとの接点（共通点・連想・対比など）に一言触れてください。ただし毎回テーマ名を連呼したり、関係の薄い話題へ不自然にねじ込んだりはしないでください。テーマに沿った話題では、テーマ名を一度自然に口にすること自体は問題ありません。")
 
     # 掛け合い配信の共演者
     if cast_note:
@@ -734,6 +734,24 @@ def build_topic_prompt(
         )
         return base + extra
 
+    if kind == "theme" and documents \
+            and getattr(documents[0], "source", "") == "theme":
+        # テーマのお題（材料なし）は「資料」ではなくお題として直接渡す
+        # （filler と同じ扱い。Web資料ガードでお題が無効化されるのを避ける。
+        # 2026-11-22 themefix）
+        doc = documents[0]
+        seed = getattr(doc, "snippet", "") or ""
+        extra = (
+            "\n\n## 自律トークモード（配信テーマ）\n"
+            f"今回の配信テーマは「{query}」です。このテーマについて話してください。\n"
+            f"発話の中で、配信テーマ「{query}」という名前を一度は自然に口にしてください（毎文で連呼はしないこと）。\n"
+            + (f"{seed}\n" if seed else "")
+            + f"\n- {_speech_limit(character or config.character)}文字以内の自然な話し言葉で\n"
+            "- target_comment_id は null\n"
+            "- skip は必ず false（必ず話すこと）"
+        )
+        return base + extra
+
     block = _format_documents(documents)
     if not block:
         # 資料が無いなら通常の独り言にフォールバックする
@@ -750,6 +768,14 @@ def build_topic_prompt(
         instruction = ("その思い出をきっかけに話してください。「この前の配信で話したけど」のように"
                        "思い出話として自然に切り出し、自分の感想や、その後どうなったか"
                        "気になる点も添えてください。")
+    elif kind == "theme":
+        intro = (f"今回の配信テーマ「{query}」について調べてみました。" if query
+                 else "今回の配信テーマについて調べてみました。")
+        instruction = ("配信テーマに沿って、調べたことをきっかけに話してください。"
+                       "自分の感想や、視聴者に聞いてみたいことも添えてください。"
+                       "発話の中で、配信テーマの名前を自分の言葉で一度は口に"
+                       "してください（記事タイトルをそのまま読み上げる形では"
+                       "なく、話題として触れる形で）。")
     elif kind == "comment":
         intro = "さっき視聴者から、こんなコメントがありました。"
         instruction = ("そのコメントの話題をもう一度拾って会話を広げてください。"
@@ -788,6 +814,16 @@ def build_topic_prompt(
             "この発話で、この話題はいったん締めくくってください。"
             "新しい話題や質問は振らず、短くまとめて終えてください。\n")
 
+    # 配信テーマへの接続（2026-11-22 themefix・案C）：テーマ話題でない
+    # ときも、無理のない範囲でテーマとの接点に触れるよう添える
+    theme_note = ""
+    if kind != "theme":
+        _char_cfg = character or config.character
+        _theme = _char_cfg.stream_theme.strip() if _char_cfg.stream_theme else ""
+        if _theme:
+            theme_note = (f"\n- なお今回の配信テーマは「{_theme}」です。"
+                          "話の流れで無理なく接続できそうなら、テーマとの"
+                          "接点に一言触れてください（無理にねじ込まない）")
     extra = (
         "\n\n## 自律トークモード（資料あり）\n"
         f"{intro}\n"
@@ -795,9 +831,9 @@ def build_topic_prompt(
         f"{block}\n\n"
         f"{instruction}\n"
         f"- {_speech_limit(character or config.character)}文字以内の自然な話し言葉で\n"
-        "- 記事のタイトルをそのまま読み上げず、自分の感想や驚きを一言添える\n"
+        "- 記事のタイトルをそのまま読み上げず、自分の感想や驚きを一言添える（配信テーマの名前を自分の言葉で口にすることは妨げない）\n"
         "- target_comment_id は null\n"
-        "- skip は必ず false（必ず話すこと）\n"
+        f"- skip は必ず false（必ず話すこと）{theme_note}\n"
         + _WEB_GUARD.strip()
     )
     return base + extra

@@ -201,3 +201,53 @@ def test_second_fire_escalates_to_context_reset():
     _speak(orch, LOOP_CORE[:3])
     assert orch._loop_guard.stats()["last_level"] == 2
     assert orch._last_context_reset_at > 0.0
+
+
+# ── 修正3（streamfix）: ログの指標スコープ分離 ────────────────
+
+def test_event_carries_trigger_and_window_similarity():
+    """発火イベントはトリガー単体と窓側の類似度を別々に持つこと"""
+    guard = SpeechLoopGuard()
+    events = _feed(guard, DIVERSE[:8] + LOOP_CORE)
+    assert len(events) == 1
+    _i, ev = events[0]
+    # 窓内には逐語再演（類似度1.0）が含まれるため、窓側の最大は高い
+    assert ev.window_max_similarity >= 0.9
+    assert 0.0 <= ev.trigger_similarity <= 1.0
+
+
+def test_loop_detected_log_has_level_and_both_similarities():
+    """発火ログに level と2種類の類似度が別名で載ること"""
+    from structlog.testing import capture_logs
+    orch, _hub = _make()
+    with capture_logs() as logs:
+        _speak(orch, DIVERSE[:8] + LOOP_CORE)
+    hits = [e for e in logs if e.get("event") == "speech loop detected"]
+    assert hits
+    assert hits[0]["level"] == 1
+    assert "trigger_similarity" in hits[0]
+    assert "window_max_similarity" in hits[0]
+    assert "max_similarity" not in hits[0]  # 旧・混在した名前は使わない
+
+
+def test_context_reset_log_reason_distinguishes_driver():
+    """文脈リセットのログで駆動元（loop_guard／saturation）が分かること"""
+    from structlog.testing import capture_logs
+    orch, _hub = _make()
+    _speak(orch, DIVERSE[:8] + LOOP_CORE)
+    # クールダウンが明けたことにする（昇格窓の中）→ レベル2で文脈リセット
+    orch._loop_guard._last_fire_at = time.time() - 601
+    with capture_logs() as logs:
+        _speak(orch, LOOP_CORE[:3])
+    resets = [e for e in logs
+              if e.get("event") == "context reset (saturation)"]
+    assert resets and resets[-1].get("reason") == "loop_guard"
+    # 飽和側（既定の呼び出し）は reason=saturation。
+    # guardfix でリセットに共有クールダウン（120秒）が入ったため、
+    # ここではクールダウンを明けてから駆動元のラベルだけを検証する
+    orch._last_context_reset_at = 0.0
+    with capture_logs() as logs2:
+        orch._reset_saturated_context("飽和")
+    resets2 = [e for e in logs2
+               if e.get("event") == "context reset (saturation)"]
+    assert resets2 and resets2[0].get("reason") == "saturation"

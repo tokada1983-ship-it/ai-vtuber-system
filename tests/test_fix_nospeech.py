@@ -23,7 +23,9 @@ from backend.config import LLMBackendConfig
 from backend.knowledge.models import WebDocument
 from backend.knowledge.topic_planner import Topic
 from backend.llm.ollama_backend import OllamaBackend
-from backend.llm.parser import (parse_tag_output, tag_no_speech_fields,
+from backend.llm.parser import (TAG_OUTCOME_FATAL, TAG_OUTCOME_NO_SPEECH,
+                                is_tag_failure_outcome, parse_tag_output,
+                                tag_no_speech_fields, tag_outcome_of,
                                 tag_parse_outcome_stats)
 from backend.llm.streaming import TagSpeechStreamParser
 from backend.models import ChatMessage
@@ -231,12 +233,24 @@ class TestRecoveryPolicy:
         orch._gen_budget = None
         assert orch._consume_gen_budget() is True
 
-    async def test_tag_failure_count_switches_with_protocol(self):
+    async def test_tag_outcome_attributed_per_generation(self):
+        # F3: 失敗の帰属は生成単位（応答に刻まれたパース区分）で取る。
+        # 共有カウンタの前後差分は、並行生成の失敗と取り違えるため廃止した
         orch, _hub = make_orchestrator(StubLLM(VALID_TAG), StubTTS())
-        # json 方式では常に0（従来の回復挙動を変えない）
-        assert orch._tag_failure_count() == 0
-        orch._cfg.llm.protocol = "tag"
-        before = orch._tag_failure_count()
-        parse_tag_output(PARTIAL_TAG)
-        parse_tag_output("[emo:neutral][mot:idle]")
-        assert orch._tag_failure_count() == before + 2
+        assert tag_outcome_of(parse_tag_output(PARTIAL_TAG)) \
+            == TAG_OUTCOME_FATAL
+        assert tag_outcome_of(parse_tag_output("[emo:neutral][mot:idle]")) \
+            == TAG_OUTCOME_NO_SPEECH
+        assert tag_outcome_of(parse_tag_output(VALID_TAG)) == "ok"
+        report_a: dict = {}
+        report_b: dict = {}
+        orch._note_gen_outcome(
+            report_a, tag_outcome_of(parse_tag_output(PARTIAL_TAG)))
+        orch._note_gen_outcome(
+            report_a, tag_outcome_of(parse_tag_output(VALID_TAG)))
+        assert report_a.get("tag_failures") == 1
+        # 別の試行の報告先には混ざらない
+        assert report_b.get("tag_failures", 0) == 0
+        assert is_tag_failure_outcome(TAG_OUTCOME_FATAL)
+        assert is_tag_failure_outcome(TAG_OUTCOME_NO_SPEECH)
+        assert not is_tag_failure_outcome("ok")

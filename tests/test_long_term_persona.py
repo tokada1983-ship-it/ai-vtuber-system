@@ -62,9 +62,9 @@ class TestLongTermPersona(unittest.TestCase):
     def test_persona_validator(self):
         validator = PersonaValidator()
 
-        # Character1の一人称逸脱補正 (私 -> わらわ)
+        # クロエの一人称逸脱補正 (私 -> わらわ)
         text1 = "私は九尾の狐ですよ。今日は良い天気ですね。"
-        repaired1, modified1 = validator.validate_and_repair(text1, character_name="Character1")
+        repaired1, modified1 = validator.validate_and_repair(text1, character_name="クロエ")
         self.assertTrue(modified1)
         self.assertIn("わらわは", repaired1)
         self.assertNotIn("私は", repaired1)
@@ -73,14 +73,14 @@ class TestLongTermPersona(unittest.TestCase):
 
         # 僕 -> わらわ
         text2 = "僕の言うことを聞きなさい。"
-        repaired2, modified2 = validator.validate_and_repair(text2, character_name="Character1")
+        repaired2, modified2 = validator.validate_and_repair(text2, character_name="クロエ")
         self.assertTrue(modified2)
         self.assertIn("わらわの", repaired2)
         self.assertNotIn("僕の", repaired2)
 
         # すでに正しい口調の場合は変更フラグが立たない
         text3 = "わらわの力を見るがよい！"
-        repaired3, modified3 = validator.validate_and_repair(text3, character_name="Character1")
+        repaired3, modified3 = validator.validate_and_repair(text3, character_name="クロエ")
         self.assertFalse(modified3)
         self.assertEqual(repaired3, text3)
 
@@ -101,14 +101,15 @@ class TestLongTermPersona(unittest.TestCase):
         store.add("サトウさんは犬を飼っている", source="auto", viewer_name="サトウ")
         store.add("タナカさんは辛いのが得意", source="auto", viewer_name="タナカ")
 
-        # タナカさんのエピソードのみ取得
-        tanaka_mems = store.by_viewer("タナカ")
+        # タナカさんのエピソードのみ取得（F10: by_viewer 削除に伴い
+        # 全件から viewer_name で絞る）
+        tanaka_mems = [m for m in store.all() if m.viewer_name == "タナカ"]
         self.assertEqual(len(tanaka_mems), 2)
         texts = [m.text for m in tanaka_mems]
         self.assertIn("タナカさんはカレーが好き", texts)
         self.assertIn("タナカさんは辛いのが得意", texts)
 
-        satou_mems = store.by_viewer("サトウ")
+        satou_mems = [m for m in store.all() if m.viewer_name == "サトウ"]
         self.assertEqual(len(satou_mems), 1)
 
     # ── 4. ReflectionEngine コア記憶更新テスト ────────────────────
@@ -116,7 +117,7 @@ class TestLongTermPersona(unittest.TestCase):
         engine = ReflectionEngine(max_diary_entries=3)
         prompts_dir = self.base_path / "prompts"
         prompts_dir.mkdir(parents=True)
-        ltm = LongTermMemory("Character1", prompts_dir=prompts_dir)
+        ltm = LongTermMemory("クロエ", prompts_dir=prompts_dir)
 
         # 1回目の日記追加
         entry1 = "### [2026-09-25 10:00] 配信の思い出\nリスナーのみんなと昔話をして楽しかったのじゃ。"

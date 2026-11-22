@@ -135,15 +135,15 @@ class TestNewsFeed:
         ])
         assert [d.title for d in merged] == ["新作ゲームの発表"]
 
-    def test_pick_avoids_used(self):
+    def test_unused_items_avoids_used(self):
+        # F10: 旧 pick/reset_used は削除され、未使用管理は
+        # unused_items / mark_used に一本化された
         feed = NewsFeed(feeds=[])
         feed._items = [_doc("A", "https://a.com/1")]
-        first = feed.pick()
-        assert first is not None
-        feed.mark_used(first)
-        assert feed.pick() is None          # 使い切ったら出さない
-        feed.reset_used()
-        assert feed.pick() is not None
+        unused = feed.unused_items()
+        assert len(unused) == 1
+        feed.mark_used(unused[0])
+        assert feed.unused_items() == []    # 使い切ったら出さない
 
     async def test_refresh_uses_feed_results(self, monkeypatch):
         feed = NewsFeed(feeds=["https://feed.example.com/rss"])
@@ -256,7 +256,7 @@ class TestTopicPlanner:
         topic = await planner.plan()
         assert topic.kind == "news"
         assert topic.documents[0].title == "ニュース見出し"
-        assert feed.pick() is None   # 同じ記事を続けて話さない
+        assert feed.unused_items() == []   # 同じ記事を続けて話さない
 
     async def test_curiosity_uses_search_and_keywords(self, monkeypatch):
         client = WebSearchClient()
@@ -405,7 +405,7 @@ class TestOrchestratorKnowledge:
         # _build_search_query は静的メソッドからインスタンスメソッドに
         # なった。検証内容（依頼表現が落ち、要点が残る）は従来どおり
         orch, _, _ = make_knowledge_orchestrator(tmp_path)
-        q = orch._build_search_query("@Character1 富士山の高さを調べて教えて？")
+        q = orch._build_search_query("@クロエ 富士山の高さを調べて教えて？")
         assert "調べて" not in q and "教えて" not in q
         assert "富士山の高さ" in q
 

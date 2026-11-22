@@ -248,21 +248,10 @@ class NewsFeed:
         return out[: self.max_items]
 
     # ── 話題の取り出し ────────────────────────────────────────
-
-    def pick(self, avoid_used: bool = True) -> WebDocument | None:
-        """
-        まだ話していないニュースを1本選ぶ。
-        新しいものほど選ばれやすいよう、上位のほうに重みを寄せる。
-        """
-        pool = [d for d in self._items if not (avoid_used and d.key in self._used_keys)]
-        if not pool:
-            return None
-        # 先頭（＝新しい記事）ほど重い線形の重み
-        weights = [len(pool) - i for i in range(len(pool))]
-        return random.choices(pool, weights=weights, k=1)[0]
-
-    def is_used(self, doc: WebDocument) -> bool:
-        return doc.key in self._used_keys
+    # 選択は TopicPlanner がスコア制で行うため、フィード側は
+    # 「未使用の一覧」と「使用済みの記録」だけを持つ。
+    # 旧 pick（ランダム抽選）／is_used／reset_used はプランナ移行後に
+    # 呼び出し元が無くなったため削除した（F10）
 
     def unused_items(self) -> list[WebDocument]:
         """まだ話題にしていない記事の一覧（新しい順）"""
@@ -273,6 +262,3 @@ class NewsFeed:
         # 使用済みキーが増えすぎたら、古いぶんは忘れて再度話題にできるようにする
         if len(self._used_keys) > self.max_items * 4:
             self._used_keys = set(list(self._used_keys)[-self.max_items * 2:])
-
-    def reset_used(self) -> None:
-        self._used_keys.clear()

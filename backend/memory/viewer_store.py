@@ -541,3 +541,186 @@ class ViewerProfileStore:
             self._conn.close()
         except Exception:
             pass
+
+
+# ── 旧キャラ別 DB からの移行（F2: 台帳の単一化） ──────────────
+
+MERGE_META_KEY_PREFIX = "merged_legacy:"
+
+
+def _legacy_row_points(store: "ViewerProfileStore", row: sqlite3.Row,
+                       has_points: bool) -> int:
+    """旧 DB の1行が持つ実効ポイント。
+
+    points 列が無い旧スキーマや、ポイント制の初期換算がまだ走っていない
+    行（points=0 かつ visit_count>=2）は、_migrate_legacy_points と同じ
+    換算（現在のレベルの開始ポイント）を適用してから合算する。
+    換算済みの DB では points>0 なので二重にはならない。
+    """
+    points = int(row["points"] or 0) if has_points else 0
+    if points == 0 and int(row["visit_count"] or 0) >= 2:
+        level = max(1, min(5, int(row["familiarity_level"] or 1)))
+        points = store._thresholds()[level - 1]
+    return points
+
+
+def _merge_profile_row(store: "ViewerProfileStore", row: sqlite3.Row,
+                       has_points: bool, has_streams: bool,
+                       has_session: bool) -> None:
+    """旧 DB のプロフィール1行を共有ストアへ合算する（同一トランザクション内）"""
+    conn = store._conn
+    viewer_id = row["viewer_id"]
+    points = _legacy_row_points(store, row, has_points)
+    visits = int(row["visit_count"] or 0)
+    streams = int(row["streams_attended"] or 0) if has_streams else 0
+    session = row["last_visit_session"] if has_session else None
+    existing = conn.execute(
+        "SELECT * FROM viewer_profiles WHERE viewer_id = ?", (viewer_id,)
+    ).fetchone()
+    if existing is None:
+        conn.execute(
+            """
+            INSERT INTO viewer_profiles (
+                viewer_id, display_name, visit_count, first_seen_at,
+                last_seen_at, familiarity_level, notes, custom_nickname,
+                points, streams_attended, last_visit_session
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (viewer_id, row["display_name"], visits, row["first_seen_at"],
+             row["last_seen_at"], row["familiarity_level"], row["notes"] or "",
+             row["custom_nickname"], points, streams, session),
+        )
+        new_points, new_visits = points, visits
+    else:
+        newer = row["last_seen_at"] >= existing["last_seen_at"]
+        notes_lines: list[str] = []
+        for text in (existing["notes"] or "", row["notes"] or ""):
+            for line in text.split("\n"):
+                line = line.strip()
+                if line and line not in notes_lines:
+                    notes_lines.append(line)
+        new_points = int(existing["points"] or 0) + points
+        new_visits = int(existing["visit_count"] or 0) + visits
+        conn.execute(
+            """
+            UPDATE viewer_profiles SET
+                display_name = ?, visit_count = ?, first_seen_at = ?,
+                last_seen_at = ?, notes = ?, custom_nickname = ?,
+                points = ?, streams_attended = ?, last_visit_session = ?
+            WHERE viewer_id = ?
+            """,
+            (
+                row["display_name"] if newer else existing["display_name"],
+                new_visits,
+                min(existing["first_seen_at"], row["first_seen_at"]),
+                max(existing["last_seen_at"], row["last_seen_at"]),
+                "\n".join(notes_lines[-10:]),
+                (row["custom_nickname"] if newer else existing["custom_nickname"])
+                or existing["custom_nickname"] or row["custom_nickname"],
+                new_points,
+                int(existing["streams_attended"] or 0) + streams,
+                session if newer else existing["last_visit_session"],
+                viewer_id,
+            ),
+        )
+    # レベルは合算後の実績から決め直す（台帳が1つになった前提に合わせる）
+    if store.points_enabled:
+        level = store.level_for_points(new_points)
+    else:
+        level = ViewerProfileStore.calc_familiarity(new_visits)
+    conn.execute(
+        "UPDATE viewer_profiles SET familiarity_level = ? WHERE viewer_id = ?",
+        (level, viewer_id),
+    )
+
+
+def merge_legacy_viewer_dbs(store: "ViewerProfileStore",
+                            legacy_paths) -> dict:
+    """旧キャラ別 viewer_profiles.db を共有ストアへ合算マージする。
+
+    設計監査 F2 の移行処理。「視聴者1人＝台帳1つ」に寄せるため、
+    キャラ別に分かれていた実績を失わずに1つの DB へ統合する。
+
+    - プロフィールは viewer_id ごとに合算（points／visit_count／
+      streams_attended は合計、first_seen は最小、last_seen は最大）。
+    - ポイント台帳（viewer_point_events）は全件を時刻・セッション付きで
+      そのまま移す。セッション上限は新しいセッションから数え直しになる。
+    - 旧スキーマ（points 列や台帳テーブルが無い DB）も読める。
+    - マージ済みファイルは共有 DB の store_meta に記録し、再起動や
+      出演者の組み直しで二重に合算しない。
+    - 戻り値に移行前後の件数・ポイント合計を持たせ、照合できるようにする
+      （points_after は points_before と一致するはず）。
+    """
+    summary = {"files": [], "profiles_before": 0, "points_before": 0,
+               "profiles_after": 0, "points_after": 0, "events_copied": 0}
+    conn = store._conn
+    with conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS store_meta "
+            "(key TEXT PRIMARY KEY, value TEXT)")
+        done = {r[0] for r in conn.execute("SELECT key FROM store_meta")}
+        targets: list[tuple[Path, str]] = []
+        for raw in legacy_paths:
+            path = Path(raw)
+            key = MERGE_META_KEY_PREFIX + str(path)
+            if str(path) == str(store._path) or key in done or not path.exists():
+                continue
+            targets.append((path, key))
+        if not targets:
+            return summary
+        row = conn.execute(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(points), 0) AS p "
+            "FROM viewer_profiles").fetchone()
+        total_profiles = int(row["n"])
+        total_points = int(row["p"])
+        for path, key in targets:
+            src = sqlite3.connect(str(path))
+            src.row_factory = sqlite3.Row
+            try:
+                cols = {r[1] for r in src.execute(
+                    "PRAGMA table_info(viewer_profiles)")}
+                if not cols:
+                    continue
+                rows = src.execute("SELECT * FROM viewer_profiles").fetchall()
+                for r in rows:
+                    total_profiles += 1
+                    total_points += _legacy_row_points(
+                        store, r, "points" in cols)
+                    _merge_profile_row(store, r, "points" in cols,
+                                       "streams_attended" in cols,
+                                       "last_visit_session" in cols)
+                has_events = src.execute(
+                    "SELECT count(*) FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'viewer_point_events'"
+                ).fetchone()[0]
+                if has_events:
+                    for ev in src.execute(
+                            "SELECT viewer_id, event, points, session_id, "
+                            "created_at FROM viewer_point_events"):
+                        conn.execute(
+                            "INSERT INTO viewer_point_events "
+                            "(viewer_id, event, points, session_id, created_at) "
+                            "VALUES (?, ?, ?, ?, ?)",
+                            (ev[0], ev[1], ev[2], ev[3], ev[4]))
+                        summary["events_copied"] += 1
+                conn.execute(
+                    "INSERT INTO store_meta (key, value) VALUES (?, ?)",
+                    (key, f"profiles={len(rows)}"))
+                summary["files"].append(str(path))
+            finally:
+                src.close()
+        row = conn.execute(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(points), 0) AS p "
+            "FROM viewer_profiles").fetchone()
+        summary["profiles_before"] = total_profiles
+        summary["points_before"] = total_points
+        summary["profiles_after"] = int(row["n"])
+        summary["points_after"] = int(row["p"])
+    if summary["files"]:
+        logger.info("Viewer store legacy merge completed", **summary)
+        if summary["points_after"] != summary["points_before"]:
+            logger.warning(
+                "Viewer store legacy merge points mismatch",
+                points_before=summary["points_before"],
+                points_after=summary["points_after"])
+    return summary

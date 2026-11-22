@@ -200,16 +200,6 @@ class MemoryStore:
                             use_count=0, importance=importance)
         return entry
 
-    def by_viewer(self, viewer_name: str, limit: int = 5) -> list[MemoryEntry]:
-        """特定の視聴者に紐づくエピソード記憶を取得"""
-        if not viewer_name:
-            return []
-        rows = self._conn.execute(
-            "SELECT * FROM memories WHERE viewer_name = ? ORDER BY created_at DESC LIMIT ?",
-            (viewer_name, limit),
-        ).fetchall()
-        return [self._row_to_entry(r) for r in rows]
-
     def delete(self, entry_id: int) -> bool:
         cur = self._conn.execute("DELETE FROM memories WHERE id = ?", (entry_id,))
         self._conn.commit()

@@ -205,6 +205,14 @@ orchestrator:
   idle_threshold_sec: 30
   response_history_turns: 20
   consolidation_trigger_turns: 50
+  consolidation_interval_min: 0
+  # 配信中の記憶整理（「ここまでの流れ」ダイジェストの更新とエピソード圧縮）
+  stream_digest_enabled: true
+  stream_digest_max_chars: 900
+  stream_digest_input_chars: 9000
+  stream_episode_cap: 40
+  stream_episode_keep_recent: 15
+  stream_episode_protect_sec: 600.0
   comment_dedupe_window_sec: 60
   max_comment_length: 200
   max_queue_size: 50
@@ -307,6 +315,15 @@ knowledge:
     # 記憶話題の占有率キャップ（直近の話題が記憶ばかりになるのを防ぐ）
     memory_share_cap: 0.45
     memory_share_window: 20
+    # 配信テーマの占有率クォータ（テーマ話題が目標シェアに届くよう差し込む）
+    theme_share_target: 0.34
+    theme_share_window: 12
+    # 話題の任期（同一主題が長くなりすぎたら締め発話で完遂し、次へ移る）
+    topic_tenure_enabled: true
+    topic_tenure_speeches: 6
+    topic_tenure_sec: 1200.0
+    topic_tenure_cooldown_sec: 1800.0
+    topic_tenure_window_sec: 1800.0
     # 材料が無いときの繋ぎ小噺
     filler_enabled: true
   answer_with_search:
@@ -419,6 +436,9 @@ stt:
   min_duration_ms: 400
   warmup_on_start: true
   isolation: inprocess  # inprocess / process（STT を別プロセスで動かす）
+  worker_port: 0  # STT ワーカーのポート（0 なら空きポートを自動選択）
+  worker_startup_timeout_sec: 120.0
+  worker_request_timeout_sec: 120.0
 persona:
   enabled: false
   adapter: ''
@@ -462,6 +482,15 @@ elyth_memory:
   episodes_dir: elyth-episodes
   character: Character1
   scan_interval_sec: 3600.0
+# 自律思考（MindLoop）と睡眠サイクルの調整値
+mind:
+  enabled: true
+  idle_sec: 600.0
+  max_per_hour: 3
+  min_interval_sec: null
+  poll_sec: 20.0
+  sleep_enabled: true
+  sleep_poll_sec: 60.0
 # 自発エフェクト（カットイン / SE / フリップボード）
 # SE の音声ファイル等のアセットは各自で配置する（このパッケージには含まれない）
 effects:

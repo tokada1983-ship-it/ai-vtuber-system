@@ -47,12 +47,13 @@ from backend.llm.prompt_builder import (
     _speech_limit,
 )
 from backend.llm.streaming import SpeechStreamParser, TagSpeechStreamParser
-from backend.llm.parser import (TAG_OUTCOME_FATAL, TAG_OUTCOME_NO_SPEECH,
-                                contains_meta_leak,
+from backend.llm.parser import (contains_meta_leak,
                                 dedupe_repeated_sentences,
+                                foreign_contamination_marker,
+                                is_tag_failure_outcome,
                                 parse_outcome_stats,
                                 strip_greeting_template,
-                                tag_parse_outcome_stats)
+                                tag_outcome_of)
 from backend.logger import get_logger
 from backend.loop_guard import SpeechLoopGuard
 from backend.memory.reflection_engine import ReflectionEngine
@@ -61,6 +62,9 @@ from backend.mind.mind_loop import (MindLoop, find_relevant_opinions,
                                     intention_context_for, push_curiosity)
 from backend.mind.sleep_cycle import SleepManager
 from backend.memory.stream_archive import StreamArchiver
+from backend.memory.viewer_store import (ViewerProfileStore,
+                                         merge_legacy_viewer_dbs)
+from backend.memory.stream_digest import StreamDigest
 from backend.memory.elyth_import import ElythEpisodeImporter
 from backend.models import Comment, LLMResponse, SystemStatus, TTSResult
 from backend.safety.response_filter import ResponseFilter
@@ -84,6 +88,17 @@ _TAG_FRAGMENT_RE = re.compile(r"<\s*(emotion|motion|speech)\s*:|<\|[^>]*\|>")
 STOP_LOOPS_TIMEOUT_SEC = 12.0    # ループ群のキャンセル待ち
 STOP_SOURCE_TIMEOUT_SEC = 8.0    # コメントソースの停止待ち
 STOP_BGM_TIMEOUT_SEC = 3.0       # BGM の停止待ち
+STOP_CANCEL_ESCALATE_ROUNDS = 2         # キャンセル待ちの追加ラウンド数
+STOP_CANCEL_ESCALATE_TIMEOUT_SEC = 2.0  # 追加ラウンド1回の待ち時間
+
+
+class PreviousLoopsStuckError(RuntimeError):
+    """前セッションのループタスクがキャンセルし切れなかった。
+
+    この状態で新しいループを作ると、残タスクが発話ロック等の共有
+    状態を掴んだまま新セッションを無言で塞ぐため、start は開始を
+    中止してこの例外を送出する（2026-11-21 の二重 start 事象）。
+    """
 
 
 @dataclasses.dataclass
@@ -94,7 +109,9 @@ class _StreamSpeakResult:
     blocked: str = ""                    # 応答後フィルタで中断した理由
     spoken: list[str] = dataclasses.field(default_factory=list)  # 実際に喋った文
     tag_no_speech: bool = False          # タグ方式で本文なしに終わったか
+    tag_outcome: str = ""                # その生成のパース区分（F3: 生成単位の帰属）
     gen_meta: dict = dataclasses.field(default_factory=dict)  # 生成メタ（done_reason等）
+    stream_error: str = ""               # ストリーム自体が失敗したときの例外型名
 
 
 @dataclasses.dataclass(order=True)
@@ -131,6 +148,7 @@ class Orchestrator:
     # 単発の再演では差し止めず、同一句が短時間に繰り返された場合だけ
     # ブロック対象にする。汎用句のブロックが回復サイクルを消費して
     # 無音を広げるのを防ぐ（2026-11-17 再実施: ブロック19回の多くが短句）
+    _RECENT_SPEECH_NORMS_MAX = 60     # 反復チェックの比較対象に保持する発話数
     _SHORT_PHRASE_MAX_LEN = 15        # 正規化後この字数以下を「短い汎用句」とする
     _SHORT_PHRASE_WINDOW_SEC = 120.0  # 同一句の出現を数える時間窓（秒）
     _SHORT_PHRASE_BLOCK_COUNT = 3     # 窓内でこの回数以上 出たらブロック対象
@@ -148,6 +166,18 @@ class Orchestrator:
         ("douiu_stem", re.compile(r"どういうことなの")),
     )
     _AIZUCHI_COOLDOWN_SEC = 600.0  # 定型相づちを差し止める時間（秒）
+    # 定型相づちの同一文カウンタを保持する時間窓（秒）。以前は
+    # _speak_idle のターン開始でカウンタを消していたため、hint 注入と
+    # 話題再決定を挟んで別ターンに分かれた同一文の反復（2026-11-21
+    # BFラン 21:27 の divert×2）を数えられず、早期話者交代が発火
+    # しなかった。窓内の drop はターン跨ぎで数え続ける
+    _AIZUCHI_DROP_WINDOW_SEC = 120.0
+    # 文脈リセットの共有クールダウン（秒）: 駆動元（saturation /
+    # loop_guard / block streak / 材料なし）が違っても、リセット後は
+    # この間は再リセットしない。44秒間隔の二重リセット（2026-11-21
+    # BFラン）のような無駄な文脈破棄を防ぐ。ヒント注入や話題の
+    # 強制切替はクールダウンの対象外で、従来どおり即時に効く
+    _CONTEXT_RESET_COOLDOWN_SEC = 120.0
     # Phase 4: 回復リトライ1回目だけ生成温度を少し上げて再生成条件を変える
     _RECOVERY_TEMP_RAISE = 0.1     # 温度の上乗せ幅（例: 0.8 → 0.9）
     # 救済時のプロンプト縮小（P1-D）: 回復リトライでは会話文脈を直近
@@ -252,8 +282,14 @@ class Orchestrator:
 
         # 音声認識（マイク入力）。設定で無効なら生成しない
         self._stt: STTBackend | None = factory.build_stt(config)
-        self._consolidation_interval_min: int = 0  # 0=無効、N=N分ごとに自動実行
+        # 定期記憶整理の間隔（分）。0=無効。config が正で、WS コマンドの
+        # 変更も config へ保存される（F8: 以前はメモリ上のみで非永続だった）
+        self._consolidation_interval_min: int = \
+            int(config.orchestrator.consolidation_interval_min or 0)
         self._consolidating: set[str] = set()      # 記憶整理中のキャラ（二重起動防止）
+        # 配信中の記憶整理（2026-11-22 longstream）：キャラごとの流れ
+        # ダイジェスト保持オブジェクト（_stream_digest_for で遅延生成）
+        self._stream_digests: dict[str, StreamDigest] = {}
         self._reflection_engine = ReflectionEngine(
             max_diary_entries=config.orchestrator.max_diary_entries)
 
@@ -295,6 +331,14 @@ class Orchestrator:
         self._recovery_hint_pending: str = ""  # 回復ヒントを付けるキャラkey（""=なし）
         # 定型相づちのクールダウン（P2-A）: パターンID → 差し止め終了時刻
         self._aizuchi_cooldown_until: dict[str, float] = {}
+        # 定型相づちの同一文の差し止め回数（修正2026-11-21 streamfix）:
+        # idle ターン内で同一文が2回差し止められたら話者交代を早める。
+        # ストリーミングでは文が分割されて届くため、同一文の判定は
+        # クラスタ（代表テキストと回数）単位で行う
+        self._aizuchi_drop_clusters: list[list] = []
+        self._aizuchi_drop_norm: str = ""   # 直近に一致したクラスタの代表
+        self._aizuchi_drop_count: int = 0   # そのクラスタの差し止め回数
+        self._aizuchi_early_switch: bool = False
         # 先行生成（P1-C）: 生成済みの次の自律発話と、その生成タスク
         self._prefetched: dict | None = None
         self._prefetch_task: asyncio.Task | None = None
@@ -335,6 +379,50 @@ class Orchestrator:
             for i, ch in enumerate(cast)
         ]
         self._refresh_cast_links()
+        self._install_shared_viewer_store()
+        self._install_topic_planner()
+
+    def _install_shared_viewer_store(self) -> None:
+        """視聴者台帳を会話単位の単一ストアへ寄せる（F2）。
+
+        以前はキャラごとに別 DB で、応答したコメントは応答キャラの、
+        未応答コメントはリーダーのストアへ書かれ、同一視聴者の
+        ポイント・レベル・上限判定が2つの DB に分散していた。
+        共有ストアはプロセスで1つだけ作り、出演者の組み直しでも
+        使い回す（セッションの単位を出演者構成に連動させないため）。
+        初回だけ、旧キャラ別 DB の実績を合算マージして引き継ぐ
+        （マージ済みファイルは台帳側に記録され、二重に足されない）。
+        """
+        store = getattr(self, "_shared_viewer_store", None)
+        if store is None:
+            lead = self._agents[0]
+            shared_path = Path(lead.cfg.data_dir) / "viewer_profiles.db"
+            store = ViewerProfileStore(
+                db_path=shared_path, points_cfg=self._cfg.viewer_points)
+            legacy_paths = [
+                Path(a.cfg.data_dir) / "characters" / a.cfg.name
+                / "viewer_profiles.db"
+                for a in self._agents
+            ]
+            merge_legacy_viewer_dbs(store, legacy_paths)
+            self._shared_viewer_store = store
+        for agent in self._agents:
+            agent.set_shared_viewer_store(store)
+
+    def _install_topic_planner(self) -> None:
+        """話題プランナー（会話単位で共有の1個）を出演者へ差し込む。
+
+        CharacterAgent.build_idle_memory の §3-C3 フィルタが、話題化
+        した記憶のクールダウン台帳を参照するために使う。視聴者台帳の
+        共有と同じ方式で、出演者の組み直し（_build_cast）と知識の
+        構築（_build_knowledge）の双方から呼ぶ。__init__ では
+        _build_cast が _build_knowledge より先に走るため、プランナー
+        未構築の間は None が差し込まれ、構築後に差し直される。
+        knowledge 無効時は None で、フィルタは従来どおり働かない。
+        """
+        planner = getattr(self, "_planner", None)
+        for agent in self._agents:
+            agent.set_topic_planner(planner)
 
     def _refresh_cast_links(self) -> None:
         """共演者の紹介とコメント選別の呼びかけ名を出演者に合わせる"""
@@ -562,6 +650,7 @@ class Orchestrator:
         if not k.enabled:
             self._search = self._news = self._planner = None
             logger.info("Knowledge disabled by config")
+            self._install_topic_planner()
             return
 
         self._search = WebSearchClient(
@@ -606,10 +695,20 @@ class Orchestrator:
             arc_max_continuations=k.autonomous_topic.arc_max_continuations,
             arc_max_sec=k.autonomous_topic.arc_max_sec,
             arc_ask_probability=k.autonomous_topic.arc_ask_probability,
+            theme_share_target=k.autonomous_topic.theme_share_target,
+            theme_share_window=k.autonomous_topic.theme_share_window,
+            topic_tenure_enabled=k.autonomous_topic.topic_tenure_enabled,
+            topic_tenure_speeches=k.autonomous_topic.topic_tenure_speeches,
+            topic_tenure_sec=k.autonomous_topic.topic_tenure_sec,
+            topic_tenure_cooldown_sec=(
+                k.autonomous_topic.topic_tenure_cooldown_sec),
+            topic_tenure_window_sec=k.autonomous_topic.topic_tenure_window_sec,
         )
         logger.info("Knowledge enabled",
                     search=self._search.available_providers(),
                     news_feeds=len(self._news.feeds) if self._news else 0)
+        # 構築したプランナーを出演者へ差し込む（§3-C3 フィルタ用）
+        self._install_topic_planner()
 
     def _topic_keywords(self) -> list[str]:
         """検索クエリの種にする、出演者全員の記憶由来のキーワード"""
@@ -1173,12 +1272,37 @@ class Orchestrator:
             cfg.enabled
             and (time.time() - self._last_web_topic_time) >= cfg.min_web_interval_sec
         )
+        # 配信テーマ設定中は、テーマ話題の検索だけは間隔ゲートの対象外
+        # にする。ゲートは「Webネタ全般の連投防止」が目的だが、テーマ
+        # 話題まで巻き込むと検索なしで材料なしお題に劣化し、テーマが
+        # 発話に表れなくなる（2026-11-22 5時間検証：テーマ話題の過半が
+        # 検索自体をスキップされていた）
+        theme_active = bool((self._cfg.character.stream_theme or "").strip())
+        allow_web_theme = bool(cfg.enabled and theme_active)
         context = {"silence_sec": time.time() - self._last_speech_time}
+        # 新引数は、テーマ検索だけを許可する局面でのみ渡す（それ以外は
+        # 従来の呼び出し形を保ち、plan() の代替実装とも互換に保つ）
+        plan_kwargs = {}
+        if allow_web_theme and not allow_web:
+            plan_kwargs["allow_web_theme"] = True
         topic = await self._planner.plan(kind=kind, query=query, allow_web=allow_web,
-                                         context=context)
+                                         context=context, **plan_kwargs)
         # 間隔の消費は「実際に発話できたとき」だけにする（_speak_idle 側）。
         # ここで消費すると、生成に失敗した回がニュース間隔を食い潰してしまう。
         return topic
+
+    def seed_topic(self, kind: str = "", query: str = "") -> bool:
+        """話題の種まき（force_topic API 用、2026-11-22 themefix）。
+
+        旧実装はその場で1回だけ発話させる fire-and-forget で、テーマを
+        運ぶ力も検証する術もなかった。新実装はプランナの優先キューへ
+        積み、次回以降の話題決定で最優先に消費させる（投入・消費とも
+        プランナ側でログに残る）。
+        """
+        if self._planner is None:
+            return False
+        self._planner.enqueue_forced_topic(kind=kind, query=query)
+        return True
 
     def _remember_topic(self, topic: Topic, agent: CharacterAgent | None = None) -> None:
         """話したWebネタを、話したキャラのエピソード記憶に残す（config で無効化できる）"""
@@ -1407,29 +1531,66 @@ class Orchestrator:
 
     # ── 開始・停止 ────────────────────────────────────────────
 
+    @property
+    def is_running(self) -> bool:
+        """配信セッションが稼働中か（/api/start の冪等化判定に使う）。
+
+        _running フラグだけでなく、ループタスクが実際に生きている
+        ことも条件にする（フラグだけが残った異常状態で、開始が
+        永遠に弾かれる事態を避ける）。
+        """
+        return self._running and any(not t.done() for t in self._tasks)
+
+    async def _cancel_round(
+            self, tasks: list[asyncio.Task],
+            timeout: float) -> list[asyncio.Task]:
+        """タスク群にキャンセルを送り、上限時間まで完了を待つ。
+
+        戻り値は時間内に終わらなかったタスクのリスト。
+        asyncio.wait はタイムアウトしても子タスクを追加でキャンセル
+        しないため、未完了分を正確に保持できる（wait_for+gather は
+        タイムアウト時に gather 経由で再キャンセルしてしまう）。
+        """
+        for t in tasks:
+            t.cancel()
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        for t in done:
+            # 例外を回収する（従来の gather(return_exceptions=True) 相当。
+            # 回収しないと "exception was never retrieved" 警告になる）
+            if not t.cancelled():
+                t.exception()
+        return list(pending)
+
     async def _cancel_tasks(
-            self, timeout: float = STOP_LOOPS_TIMEOUT_SEC) -> None:
+            self, timeout: float | None = None) -> None:
         """実行中のループを止める（上限時間まで待つ）
 
         従来は gather で無制限に待っており、to_thread 実行中など
         キャンセル不能なタスクがあると停止全体が固まっていた
         （2026-11-19 の /api/stop 120秒タイムアウトの一因）。
-        上限を超えたら待ちを打ち切り、未完了のタスクは self._tasks に
-        残す（次回 start 時の _cancel_tasks で再度畳む）。
+        1回目のキャンセルで終わらないタスクには、追加ラウンドで
+        キャンセルを送り直す。生成パイプラインは多層のフォール
+        バックで出来ており、1回の CancelledError を吸収して次の
+        await へ進むタスクがあるため（2026-11-21 の二重 start
+        事象では idle タスクが12秒経っても残留した）。それでも
+        終わらないタスクは self._tasks に残す（次回 start 時の
+        _cancel_tasks で再度畳む。start は残留がある場合に開始を
+        中止するので、残タスクが新セッションを塞ぐことはない）。
         """
+        if timeout is None:
+            timeout = STOP_LOOPS_TIMEOUT_SEC
         if not self._tasks:
             return
-        for t in self._tasks:
-            t.cancel()
-        # asyncio.wait はタイムアウトしても子タスクを追加でキャンセル
-        # しないため、未完了分を正確に保持できる（wait_for+gather は
-        # タイムアウト時に gather 経由で再キャンセルしてしまう）
-        _done, pending = await asyncio.wait(self._tasks, timeout=timeout)
-        for t in _done:
-            # 例外を回収する（従来の gather(return_exceptions=True) 相当。
-            # 回収しないと "exception was never retrieved" 警告になる）
-            if not t.cancelled():
-                t.exception()
+        pending = await self._cancel_round(self._tasks, timeout)
+        rounds = 0
+        while pending and rounds < STOP_CANCEL_ESCALATE_ROUNDS:
+            rounds += 1
+            logger.warning(
+                "Loop cancel retry (escalation)",
+                round=rounds,
+                remaining=[t.get_name() for t in pending])
+            pending = await self._cancel_round(
+                pending, STOP_CANCEL_ESCALATE_TIMEOUT_SEC)
         if pending:
             logger.warning(
                 "Loop cancel timed out; tasks left for next start",
@@ -1454,7 +1615,26 @@ class Orchestrator:
         if self._tasks:
             logger.info("Restarting orchestrator (cancelling previous loops)")
             self._running = False
+            # 先行生成タスクも畳む（stop() と同じ扱い。残すと旧セッション
+            # の生成結果が新セッションの状態へ割り込む）
+            if self._prefetch_task is not None \
+                    and not self._prefetch_task.done():
+                self._prefetch_task.cancel()
+            self._prefetched = None
             await self._cancel_tasks()
+            if self._tasks:
+                # 残タスクが発話ロック等の共有状態を掴んだまま生き残ると、
+                # そのまま新しいループを作っても新セッションが無言で
+                # 塞がれる（2026-11-21 の二重 start 事象）。開始成功を
+                # 返さず、失敗として呼び出し元へ伝える。残タスクは
+                # self._tasks に保持したままなので、次回の start/stop
+                # （またはプロセス再起動）で再度畳む対象になる
+                logger.error(
+                    "Start aborted: previous loops did not stop",
+                    remaining=[t.get_name() for t in self._tasks])
+                raise PreviousLoopsStuckError(
+                    "previous loops did not stop: "
+                    + ", ".join(t.get_name() for t in self._tasks))
             if self._source:
                 try:
                     await self._source.stop()
@@ -1580,8 +1760,18 @@ class Orchestrator:
                 await self._hub.send_log("info", f"配信終了：{agent.name}の短期記憶を整理しています...")
                 await self._consolidate_agent(agent, triggered_by="stop")
 
-            # 配信終了時に自己内省（思い出日記）を生成し、コア記憶を更新する
-            if agent.llm and self._cfg.orchestrator.enable_reflection:
+            # 配信終了時に自己内省（思い出日記）を生成し、コア記憶を更新する。
+            # フォールバック（LM Studio）滞留で終わった回は日記を見送る:
+            # 日記は恒久記憶（memory.md）に残るため、低品質バックエンドの
+            # 出力（文字化け・言語混入を含む）を書き込むリスクを避ける
+            # （生成側の品質ゲートと二重化。2026-11-21 BFラン所見）
+            if agent.llm and self._cfg.orchestrator.enable_reflection \
+                    and agent.on_fallback:
+                await self._hub.send_log(
+                    "info",
+                    f"配信終了：{agent.name}の日記はフォールバック中のため見送りました")
+            if agent.llm and self._cfg.orchestrator.enable_reflection \
+                    and not agent.on_fallback:
                 try:
                     await self._hub.send_log("info", f"配信終了：{agent.name}の今日の思い出・日記を記録しています...")
                     diary = await self._reflection_engine.reflect_and_update(
@@ -1779,8 +1969,8 @@ class Orchestrator:
 
         選別で落としたコメントも、配信アーカイブへの記録と視聴者
         プロフィールの来訪記録は従来どおり行う（記録と応答の分離）。
-        来訪記録はリーダーのストアへ入れる（応答したコメントは
-        _process_comment が担当キャラのストアへ従来どおり入れる）。
+        台帳は会話単位の共有ストア（F2）なので、応答したコメント
+        （_process_comment）と未応答のコメントは同じ台帳へ入る。
 
         ポイント（Phase 4）の扱いは選別カテゴリで分ける:
           - ng_word / duplicate / spam_repeat（悪用・連打系）は0点。
@@ -1891,10 +2081,6 @@ class Orchestrator:
                              error=str(e),
                              traceback=traceback.format_exc())
                 await asyncio.sleep(1.0)
-
-    def _recall(self, query: str) -> str:
-        """リーダーの記憶を引く（1体運用の頃のAPI）"""
-        return self._lead.recall(query)
 
     async def _process_comment(self, comment: Comment) -> None:
         responder = self._director.pick_responder(self._agents, comment)
@@ -2132,6 +2318,13 @@ class Orchestrator:
             if len(prev) <= self._SHORT_PHRASE_MAX_LEN)
         if not short_match:
             return True
+        # 短句の完全一致（verbatim）も段階許可の対象に含める
+        # （2026-11-22 verifyfix での判断）。15字以下の汎用句は会話の
+        # 接着剤であり、相方が同じ句を返す掛け合いは自然な相づち・
+        # 反響として聞こえる。5時間検証で実害になったのは長文の再演
+        # （比較窓の拡大で対策）とリセットによる反復記憶の消去
+        # （保持に変更して対策）であり、短句の2回目までを止める必要は
+        # 薄い。歯止めは従来どおり「120秒窓で3回目からブロック」
         now = time.time()
         count = sum(1 for at, n in self._short_phrase_events
                     if n == norm
@@ -2198,6 +2391,76 @@ class Orchestrator:
             return pid
         return ""
 
+    @staticmethod
+    def _same_speech_text(a: str, b: str) -> bool:
+        """正規化済みテキスト同士が「同じ文」とみなせるか。
+
+        完全一致のほか、包含と高類似（リピートブロックと同じ
+        SequenceMatcher 0.85）も同一とみなす。ストリーミングでは
+        1文が「？」等で分割されて届き、断片と全体文が別々に
+        差し止められるため、包含での一致が必要になる。短すぎる
+        断片の偶然の一致を避けるため、包含は短い側が6字以上の
+        ときだけ認める。
+        """
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+        if len(shorter) >= 6 and shorter in longer:
+            return True
+        return difflib.SequenceMatcher(None, a, b).ratio() >= 0.85
+
+    def _prune_aizuchi_drop_clusters(self) -> None:
+        """時間窓（_AIZUCHI_DROP_WINDOW_SEC）を過ぎた同一文カウンタを捨てる"""
+        now = time.time()
+        self._aizuchi_drop_clusters = [
+            e for e in self._aizuchi_drop_clusters
+            if now - e[2] < self._AIZUCHI_DROP_WINDOW_SEC]
+
+    def _note_aizuchi_drop(self, text: str) -> None:
+        """定型相づちの差し止め（drop／divert）を数える。
+
+        同一文（_same_speech_text で同一とみなせる文）が時間窓
+        （_AIZUCHI_DROP_WINDOW_SEC）の中で2回差し止められたら、
+        それ以上同じ文の再生成に付き合わず、回復フロー（_speak_idle）
+        へ話者交代の早期化を合図する。2026-11-21 の2時間テストで、
+        同一文の再生成×3サイクルに約95秒を消費した事例への対策。
+
+        数え方は窓単位（クラスタごとに最終drop時刻を持つ）。以前は
+        _speak_idle のターン開始でリセットしていたため、hint 注入と
+        話題再決定を挟んで別ターンに分かれた同一文の反復（BFラン
+        21:27 の divert×2）を数え切れず、早期交代が発火しなかった。
+        """
+        norm = self._normalize_speech(text)
+        if not norm:
+            return
+        self._prune_aizuchi_drop_clusters()
+        cluster = None
+        for entry in self._aizuchi_drop_clusters:
+            if self._same_speech_text(entry[0], norm):
+                cluster = entry
+                break
+        if cluster is None:
+            cluster = [norm, 0, 0.0]
+            self._aizuchi_drop_clusters.append(cluster)
+            del self._aizuchi_drop_clusters[:-8]
+        cluster[1] += 1
+        cluster[2] = time.time()
+        if len(norm) > len(cluster[0]):
+            cluster[0] = norm   # より長い形（全体文）を代表にする
+        self._aizuchi_drop_norm = cluster[0]
+        self._aizuchi_drop_count = cluster[1]
+        if cluster[1] >= 2 and not self._aizuchi_early_switch:
+            self._aizuchi_early_switch = True
+            # 早期交代の発火（武装）を専用ログに残す。以前は発火したか
+            # どうかをログから切り分けられなかった（BFラン所見）
+            logger.info("formulaic aizuchi repeated; "
+                        "switching speaker early",
+                        aizuchi_event="early_switch",
+                        text=text[:60], count=cluster[1],
+                        window_sec=self._AIZUCHI_DROP_WINDOW_SEC)
+
     def _note_blocked(self, agent: CharacterAgent) -> None:
         """発話ブロックを数える（回復フローの状態管理。Phase 2）。
 
@@ -2224,7 +2487,15 @@ class Orchestrator:
     }
 
     def _note_saturation(self, word: str) -> None:
-        """吸着ガードの発火を記録し、同じ語で繰り返すようなら文脈リセットへ"""
+        """吸着ガードの発火を記録し、同じ語で繰り返すようなら文脈リセットへ。
+
+        リセット間隔の制御は _reset_saturated_context の共有クールダウン
+        （120秒、全駆動元共通）に一本化する（F4）。以前はここに
+        「前回リセットから600秒」という独自の事前ゲートがあり、
+        LoopGuard 等の別駆動元がリセットした後600秒間は飽和
+        エスカレーションが無言で不発になっていた。抑止は共有側が
+        ログに残すので、ここでは閾値だけを見る。
+        """
         if not word:
             return
         now = time.time()
@@ -2232,24 +2503,47 @@ class Orchestrator:
         self._saturation_events = [(at, w) for at, w in self._saturation_events
                                    if now - at < 900]
         same = sum(1 for _, w in self._saturation_events if w == word)
-        if same >= 4 and now - self._last_context_reset_at > 600:
+        if same >= 4:
             self._reset_saturated_context(word)
 
-    def _reset_saturated_context(self, word: str) -> None:
+    def _reset_saturated_context(self, word: str,
+                                 reason: str = "saturation") -> None:
         """吸着した文脈を捨てる：会話ログ全消去＋反復履歴クリア＋語の禁止
 
         2026-11-14の2時間テストで、記憶の種を除去しても会話ログ内の
         文脈だけで吸着が再形成されたため、エスカレーションとして追加。
+
+        駆動元によらず共有のクールダウンを置く: リセット直後に別の
+        駆動元が重ねて発火しても、文脈は既に捨てたばかりで二重に
+        破棄する意味がない（2026-11-21 BFランで44秒間隔の二重
+        リセットが発生）。クールダウン中はログだけ残して戻る。
         """
         now = time.time()
+        if now - self._last_context_reset_at \
+                < self._CONTEXT_RESET_COOLDOWN_SEC:
+            logger.info("context reset suppressed (cooldown)",
+                        word=word, reason=reason,
+                        since_last_sec=round(
+                            now - self._last_context_reset_at, 1))
+            return
         self._last_context_reset_at = now
         for agent in self._agents:
             try:
-                agent.log.clear()
+                # 文脈だけを捨て、整理待ち（pending）と整理カウンタは
+                # 保持する。clear() で一緒に消すと、リセットが頻発する
+                # 配信では記憶整理の閾値へ到達できなくなる（2026-11-22
+                # 5時間検証）。保持した pending は次の整理が拾う
+                clear_context = getattr(agent.log, "clear_context", None)
+                if clear_context is not None:
+                    clear_context()
+                else:
+                    agent.log.clear()
             except Exception as e:
                 logger.warning("context reset: log clear failed", error=str(e))
-        self._recent_speech_norms.clear()
-        self._short_phrase_events.clear()
+        # 反復記憶（norms・短句イベント）はリセット後も保持する。
+        # 消すと、リセットの引き金になった文そのものが直後に再演される
+        # 実例があった（2026-11-22 5時間検証：リセット64秒後に再演）。
+        # 履歴の要約（文脈）と反復の記憶は別物として扱う
         self._recent_theme_grams.clear()
         self._theme_hint_pending = ""
         if self._planner is not None:
@@ -2260,7 +2554,15 @@ class Orchestrator:
                 logger.warning("context reset: planner reset failed", error=str(e))
         self._materialless_idle_count = 0
         self._last_speech_time = now   # 少し間を空けてから再開する
-        logger.info("context reset (saturation)", word=word)
+        # 捨てた文脈を前提に作られた先行生成は使えない。保持分を捨て、
+        # 生成中なら止める（リセット直後のターンは本生成が先行する）
+        if self._prefetched is not None:
+            self._prefetched = None
+            logger.info("prefetch discarded", reason="context reset")
+        if self._prefetch_task is not None \
+                and not self._prefetch_task.done():
+            self._prefetch_task.cancel()
+        logger.info("context reset (saturation)", word=word, reason=reason)
 
     def _character_name_forms(self) -> list[str]:
         """飽和検出から外す出演者名の表記（名前・愛称・「〜ちゃん」形）。
@@ -2483,14 +2785,17 @@ class Orchestrator:
             return
         logger.warning("speech loop detected", level=event.level,
                        dup_count=event.dup_count, window=event.window,
-                       max_similarity=round(event.max_similarity, 2),
+                       trigger_similarity=round(event.trigger_similarity, 2),
+                       window_max_similarity=round(
+                           event.window_max_similarity, 2),
                        word=event.word)
         self._loop_hint_pending = True
         self._loop_hint_word = event.word
         self._force_switch_pending = True
         if event.level >= 2:
             self._reset_saturated_context(event.word
-                                          or self._saturation_word())
+                                          or self._saturation_word(),
+                                          reason="loop_guard")
 
     def _consume_loop_hint(self, system_prompt: str) -> str:
         """ループ検出時の立て直し指示を次の発話のプロンプトへ1回だけ付ける"""
@@ -2547,7 +2852,9 @@ class Orchestrator:
         repeat = self._is_repeat_speech(response.speech)
         speech_norm = self._normalize_speech(response.speech)
         self._recent_speech_norms.append(speech_norm)
-        del self._recent_speech_norms[:-12]
+        # 比較窓は直近60発話（約55秒間隔で約55分ぶん）。12発話では
+        # 9〜14分間隔の再演が窓外に落ちて漏れた（2026-11-22 5時間検証）
+        del self._recent_speech_norms[:-self._RECENT_SPEECH_NORMS_MAX]
         # 短い汎用句は出現時刻も記録する（P1-B: 窓内の回数で段階判定する）
         if speech_norm and len(speech_norm) <= self._SHORT_PHRASE_MAX_LEN:
             now = time.time()
@@ -2565,7 +2872,8 @@ class Orchestrator:
             until = time.time() + self._AIZUCHI_COOLDOWN_SEC
             for pid, _pat in self._AIZUCHI_PATTERNS:
                 self._aizuchi_cooldown_until[pid] = until
-            logger.info("formulaic aizuchi cooldown armed", pattern=aizuchi,
+            logger.info("formulaic aizuchi cooldown armed",
+                        aizuchi_event="armed", pattern=aizuchi,
                         character=agent.name)
         # テーマ反復の計数（両キャラ合算。反復として弾かれた発話も
         # 実際には発話されているので数える。Phase 4.6）
@@ -2865,7 +3173,8 @@ class Orchestrator:
                 self._force_switch_pending = False
                 if self._planner is not None:
                     try:
-                        self._planner.reset_thread()
+                        # 放棄の理由を分けて数える（F9）
+                        self._planner.reset_thread(reason="force_switch")
                     except Exception as e:
                         logger.warning("force switch reset failed", error=str(e))
                 if not kind:
@@ -2923,6 +3232,14 @@ class Orchestrator:
         # no-speech 系失敗の累計を初期化する
         self._gen_budget = self._IDLE_TURN_GEN_CAP
         no_speech_failures = 0
+        gen_report: dict = {}   # 試行ごとの生成帰属（F3）。試行のたびに作り直す
+        # 定型相づちの同一文カウンタは時間窓で保持する（ターン跨ぎで
+        # 数え続ける）。ここでは窓を過ぎた分を掃除するだけにし、
+        # カウンタ自体は消さない。早期交代フラグはターン開始で落とす
+        # （このターンの attempt 1 で2回目の drop が起きれば
+        # _note_aizuchi_drop がその場で立て直す）
+        self._prune_aizuchi_drop_clusters()
+        self._aizuchi_early_switch = False
         while response is None and attempt < 3:
             attempt += 1
             if attempt > 1:
@@ -2960,10 +3277,10 @@ class Orchestrator:
                             self._cfg, long_term_memory_text=idle_mem,
                             **current.prompt_kwargs())
 
-                    failures_before = self._tag_failure_count()
+                    gen_report: dict = {}
                     response = await self._generate_and_speak(
                         system_prompt, current, route="idle",
-                        compact_retry=attempt >= 2)
+                        compact_retry=attempt >= 2, gen_report=gen_report)
                     if response is not None:
                         idle_repeat = self._after_speech(
                             current, response, idle=True,
@@ -2988,9 +3305,9 @@ class Orchestrator:
             if response is not None:
                 break
             # この試行の失敗が no-speech 系（ヘッダのみ・本文なし）
-            # だったかを数える
-            no_speech_failures += max(
-                0, self._tag_failure_count() - failures_before)
+            # だったかを数える。帰属は生成単位（gen_report）で取る（F3）。
+            # 共有カウンタの差分だと並行生成の失敗と取り違える
+            no_speech_failures += gen_report.get("tag_failures", 0)
             if no_speech_failures >= self._NOSPEECH_TURN_LIMIT:
                 # ヘッダのみの失敗を繰り返しても条件は好転しない。
                 # 生成を打ち切ってフォールバック台詞に委ねる
@@ -2998,7 +3315,17 @@ class Orchestrator:
                             "(no-speech cap)", character=current.name,
                             no_speech_failures=no_speech_failures)
                 break
-            if attempt == 1:
+            early_switch = self._aizuchi_early_switch and attempt == 1
+            if early_switch:
+                # 同一の定型相づち文が繰り返し差し止められた: ヒント付き
+                # 再生成を挟んでも同じ文が戻るだけなので、話者交代
+                # （attempt == 2 の処理）へ早期に合流する
+                logger.info("idle speech recovery: switching speaker early "
+                            "(repeated formulaic aizuchi)",
+                            aizuchi_event="early_switch_applied",
+                            character=current.name)
+                self._aizuchi_early_switch = False
+            if attempt == 1 and not early_switch:
                 # 1回目の失敗: 回復ヒントを積んで同じ話者で再生成する。
                 # 通常は再生成の温度も少し上げて生成条件自体を変える
                 # （Phase 4）が、no-speech 系の失敗では温度上昇が
@@ -3012,7 +3339,7 @@ class Orchestrator:
                     self._arm_recovery_temperature(current)
                     logger.info("idle speech recovery: retry with hint",
                                 character=current.name)
-            elif attempt == 2:
+            elif attempt == 2 or early_switch:
                 # 2回目の失敗: 話者を交代し、詰まった側をしばらく選ばない
                 partner = self._other_agent(current)
                 if partner is None or not partner.llm:
@@ -3055,18 +3382,6 @@ class Orchestrator:
             except (TypeError, ValueError):
                 pass
         return base
-
-    def _tag_failure_count(self) -> int:
-        """タグ方式の失敗系（fatal + no_speech）の累計。json 方式では 0。
-
-        生成の前後で差分を取ることで、その生成の失敗が no-speech 系
-        （ヘッダのみ・本文なし）だったかを判定する。
-        """
-        if str(self._cfg.llm.protocol or "json").lower() != "tag":
-            return 0
-        stats = tag_parse_outcome_stats()
-        return stats.get(TAG_OUTCOME_FATAL, 0) \
-            + stats.get(TAG_OUTCOME_NO_SPEECH, 0)
 
     def _consume_gen_budget(self) -> bool:
         """idle ターンの生成予算を1つ消費する。予算外（None）なら常に True"""
@@ -3185,15 +3500,17 @@ class Orchestrator:
         response: LLMResponse | None = None
         actions: list = []
         for attempt in range(2):
-            failures_before = self._tag_failure_count()
+            gen_report: dict = {}
             response, actions = await self._generate_idle_response(
-                system_prompt, speaker)
+                system_prompt, speaker, gen_report=gen_report)
             if response is not None:
                 break
             if attempt == 0:
                 self._recovery_hint_pending = speaker.key
-                if self._tag_failure_count() > failures_before:
-                    # no-speech 系の失敗では温度を上げない（本経路と同方針）
+                if gen_report.get("tag_failures", 0):
+                    # no-speech 系の失敗では温度を上げない（本経路と同方針）。
+                    # 帰属は生成単位で取る（F3）: プリフェッチはロック外で
+                    # 並行生成と重なりうるため、共有カウンタの差分は使わない
                     logger.info("prefetch recovery: hint only "
                                 "(no temperature raise; no-speech failure)",
                                 character=speaker.name)
@@ -3227,6 +3544,7 @@ class Orchestrator:
 
     async def _generate_idle_response(self, system_prompt: str,
                                       agent: CharacterAgent,
+                                      gen_report: dict | None = None,
                                       ) -> tuple[LLMResponse | None, list]:
         """発話せずに生成だけを行う（P1-C の先行生成用）。
 
@@ -3254,6 +3572,7 @@ class Orchestrator:
             if temperature is not None else {}
         response = await llm.generate(system_prompt, messages, route="idle",
                                       **gen_extra)
+        self._note_gen_outcome(gen_report, tag_outcome_of(response))
         if response.skip or not response.speech:
             return None, []
         clean_speech, unity_actions = self._extract_unity_actions(
@@ -3273,6 +3592,13 @@ class Orchestrator:
         if contains_meta_leak(response.speech):
             logger.warning("Prefetch speech blocked (meta leak)",
                            character=agent.name, speech=response.speech[:60])
+            return None, []
+        _marker = foreign_contamination_marker(response.speech)
+        if _marker:
+            logger.warning(
+                "Prefetch speech blocked (foreign script contamination)",
+                character=agent.name, marker=_marker,
+                speech=response.speech[:60])
             return None, []
         response.speech = dedupe_repeated_sentences(response.speech)
         if not response.speech.strip():
@@ -3306,6 +3632,28 @@ class Orchestrator:
             return None, []
         return response, unity_actions
 
+    def _prefetch_recheck_reason(self, pf: dict) -> str:
+        """プリフェッチ消費直前の品質再検査。問題があれば破棄理由を返す。
+
+        先行生成は「前の発話の再生中」に作られるため、生成時点では
+        直近発話（＝反復判定の基準）にまだ入っていなかった文と完全
+        一致する発話が、消費時点では反復になっていることがある。
+        生成経路で弾けなかった言語混入・Metaリークも含め、消費する
+        直前に通常経路と同じガードで再検査する（2026-11-21 BFランで
+        プリフェッチ経由の同一文3回放送が発生したことへの対策）。
+        """
+        response = pf.get("response")
+        speech = getattr(response, "speech", "") or ""
+        if not speech:
+            return "empty at consumption"
+        if self._should_block_repeat(speech):
+            return "repeat at consumption"
+        if contains_meta_leak(speech):
+            return "meta leak at consumption"
+        if foreign_contamination_marker(speech):
+            return "foreign contamination at consumption"
+        return ""
+
     def _take_prefetched(self, speaker: CharacterAgent) -> dict | None:
         """先行生成を取り出す（P1-C）。使えない場合は破棄して None。
 
@@ -3316,17 +3664,30 @@ class Orchestrator:
         if pf is None:
             return None
         self._prefetched = None
-        usable = (
-            time.time() - pf["at"] < self._PREFETCH_TTL_SEC
-            and pf["agent_key"] == speaker.key
-            and not self._force_switch_pending
-            and not self._saturation_word()
-        )
+        # 破棄理由を特定できるよう、使えない条件を1つずつ判定する
+        # （2026-11-21 の2時間テストで破棄理由がログに無く、生成済み
+        # プリフェッチが使われなかった原因を特定できなかった反省）
+        reason = ""
+        if time.time() - pf["at"] >= self._PREFETCH_TTL_SEC:
+            reason = "expired"
+        elif pf["at"] < self._last_context_reset_at:
+            # リセットで捨てた文脈を前提に作られた先行生成は使えない
+            reason = "context reset"
+        elif pf["agent_key"] != speaker.key:
+            reason = "speaker changed"
+        elif self._force_switch_pending:
+            reason = "topic forced switch"
+        elif self._saturation_word():
+            reason = "topic saturation"
+        usable = not reason
         if usable and self._planner is not None:
             try:
-                usable = not self._planner.has_deliverable_answer()
+                if self._planner.has_deliverable_answer():
+                    usable = False
+                    reason = "pending answer"
             except Exception:
                 usable = False
+                reason = "answer check failed"
         if usable and self._planner is not None:
             # 前提発話の同一性チェック（STUDY §6.4-3）：計画後に別の
             # 発話（コメント応答など）が挟まっていたら、この先行生成は
@@ -3335,7 +3696,23 @@ class Orchestrator:
             if premise and self._planner.last_speech_text != premise:
                 logger.info("prefetch discarded (premise speech changed)")
                 usable = False
+                reason = ""  # この分岐は上の行で記録済み
+        if usable:
+            # 消費直前の品質再検査（反復・言語混入・Metaリーク）。
+            # 生成時点の判定だけでは、生成後に確定した直近発話との
+            # 完全一致を取りこぼすため、ここでも通常経路と同じ
+            # ガードにかける
+            recheck_reason = self._prefetch_recheck_reason(pf)
+            if recheck_reason:
+                usable = False
+                reason = recheck_reason
         if not usable:
+            if reason:
+                logger.info(
+                    "prefetch discarded", reason=reason,
+                    character=speaker.name,
+                    speech=(pf["response"].speech[:40]
+                            if pf.get("response") is not None else ""))
             topic = pf.get("topic")
             if topic is not None and self._planner is not None:
                 try:
@@ -3345,10 +3722,26 @@ class Orchestrator:
             return None
         return pf
 
+    @staticmethod
+    def _note_gen_outcome(gen_report: dict | None, outcome: str) -> None:
+        """生成1回ぶんのパース区分を、その生成専用の報告先へ記録する（F3）。
+
+        失敗の帰属をモジュール共有カウンタの前後差分で推測すると、
+        ロック外で並行する生成（プリフェッチ等）の失敗と取り違える。
+        呼び出し側が試行ごとに用意した gen_report へ、生成自身が刻んだ
+        区分（応答の raw や _StreamSpeakResult.tag_outcome）を積む。
+        """
+        if gen_report is None or not outcome:
+            return
+        gen_report["tag_outcome"] = outcome
+        if is_tag_failure_outcome(outcome):
+            gen_report["tag_failures"] = gen_report.get("tag_failures", 0) + 1
+
     async def _generate_and_speak(self, system_prompt: str,
                                   agent: CharacterAgent | None = None,
                                   route: str = "respond",
-                                  compact_retry: bool = False) -> LLMResponse | None:
+                                  compact_retry: bool = False,
+                                  gen_report: dict | None = None) -> LLMResponse | None:
         """
         agent（省略時はリーダー）として応答を生成して発話する。
         ストリーミング対応バックエンドなら文単位で喋り、
@@ -3412,6 +3805,10 @@ class Orchestrator:
             result = await self._speak_streaming(system_prompt, messages, agent,
                                                  allow_intro=allow_intro,
                                                  temperature=temperature)
+            self._note_gen_outcome(gen_report, result.tag_outcome)
+            if result.response is not None:
+                self._note_gen_outcome(gen_report,
+                                       tag_outcome_of(result.response))
             if result.blocked:
                 await self._hub.send_log("warn", f"発話を中断しました: {result.blocked}")
                 if result.blocked == self._BLOCKED_FORMULAIC:
@@ -3423,6 +3820,17 @@ class Orchestrator:
                 return None
             if result.spoke:
                 return result.response
+            if result.stream_error == "ReadTimeout":
+                # ストリームが読み取りタイムアウトで止まった場合は、
+                # 同じバックエンドでの一括再試行（既定で最大120秒を
+                # 直列に足す）を挟まず、即時フォールバックへ進む
+                logger.warning(
+                    "Streaming timed out; skipping non-streaming retry "
+                    "on the same backend",
+                    character=agent.name,
+                    stream_error=result.stream_error)
+                await self._maybe_immediate_failover(agent, llm)
+                return None
             # 1文も喋れていないので、一括生成でやり直す（二重発話にはならない）
             logger.info("Streaming produced no speech, falling back to non-streaming")
 
@@ -3461,6 +3869,7 @@ class Orchestrator:
                             temperature=lowered)
         response = await llm.generate(system_prompt, messages, route=route,
                                       **gen_extra)
+        self._note_gen_outcome(gen_report, tag_outcome_of(response))
         if response.skip or not response.speech:
             # ストリーミングでも一括でも喋れなかった。バックエンド自体が
             # 落ちている場合（二段とも失敗し、不健全を自己申告している）に
@@ -3487,6 +3896,12 @@ class Orchestrator:
         if contains_meta_leak(response.speech):
             logger.warning("Speech blocked (meta leak)",
                            character=agent.name, speech=response.speech[:60])
+            return None
+        _marker = foreign_contamination_marker(response.speech)
+        if _marker:
+            logger.warning("Speech blocked (foreign script contamination)",
+                           character=agent.name, marker=_marker,
+                           speech=response.speech[:60])
             return None
         response.speech = dedupe_repeated_sentences(response.speech)
         if not response.speech.strip():
@@ -3534,7 +3949,9 @@ class Orchestrator:
         if route == "idle" and self._aizuchi_in_cooldown(response.speech):
             # 定型相づちの再演もブロックとして数えず、回復ヒントで再生成を促す
             logger.info("Speech diverted (formulaic aizuchi, non-streaming)",
+                        aizuchi_event="dropped",
                         character=agent.name, speech=response.speech[:60])
+            self._note_aizuchi_drop(response.speech)
             self._recovery_hint_pending = agent.key
             return None
 
@@ -3635,6 +4052,7 @@ class Orchestrator:
         voice = self._voice_kwargs(agent)
 
         pushed_count = 0
+        pushed_texts: list[str] = []  # 累積反復チェック用（分割配信の検出）
 
         seen_sentences: set[str] = set()  # この応答内で喋った文（繰り返し除去用）
         # 発話上限の実行時検査（保険）用の累計と打ち切りフラグ
@@ -3670,6 +4088,15 @@ class Orchestrator:
                 logger.warning("Streaming sentence dropped (meta leak)",
                                character=agent.name, text=clean[:60])
                 return True
+            # 言語混入（中国語等）の文も落とす。ストリーミングは一括
+            # 経路と同じ品質ガードを通す（フォールバック先で生成された
+            # 文も、経路によらず同じ扱いにする）
+            _marker = foreign_contamination_marker(clean)
+            if _marker:
+                logger.warning(
+                    "Streaming sentence dropped (foreign contamination)",
+                    character=agent.name, marker=_marker, text=clean[:60])
+                return True
             _norm = re.sub(r"[\s、。，．！？!?'\"“”‘’]", "", clean)
             if len(_norm) >= 6:
                 if _norm in seen_sentences:
@@ -3683,6 +4110,18 @@ class Orchestrator:
                 state.blocked = "repeat speech"
                 logger.warning("Streaming speech blocked (repeat)",
                                character=agent.name, text=clean[:60])
+                return False
+            # 2文目以降も、ここまでの累積で反復チェックする。短い
+            # 相づち＋本文の分割配信では1文目チェックをすり抜けて
+            # 完全一致の繰り返しが放送まで届いた（2026-11-21 BFラン）
+            if pushed_count > 0 and agent.speech_route == "idle" \
+                    and pushed_texts \
+                    and self._should_block_repeat(
+                        "".join(pushed_texts) + clean):
+                state.blocked = "repeat speech"
+                logger.warning(
+                    "Streaming speech blocked (repeat, split delivery)",
+                    character=agent.name, text=clean[:60])
                 return False
             # 文型レベルの反復（相づち＋定型賛辞のみ・内容語なし）は
             # 差し止めて回復リトライに回す。ブロックとしては数えない
@@ -3699,7 +4138,9 @@ class Orchestrator:
             if agent.speech_route == "idle" \
                     and self._aizuchi_in_cooldown(clean):
                 logger.info("Streaming sentence dropped (formulaic aizuchi)",
+                            aizuchi_event="dropped",
                             character=agent.name, text=clean[:60])
+                self._note_aizuchi_drop(clean)
                 return True
             # 発話上限の実行時検査（保険）。上限を超える文は喋らず、以降の文も
             # 切り捨てて応答を文境界で終わらせる。1文目自体が上限超えの場合も
@@ -3713,6 +4154,7 @@ class Orchestrator:
                 return True
             spoken_chars += len(clean)
             pushed_count += 1
+            pushed_texts.append(clean)
             verdict = self._filter.check(clean)
             if not verdict.ok:
                 state.blocked = verdict.reason
@@ -3805,10 +4247,11 @@ class Orchestrator:
                 if leftover:
                     leftover[2].cancel()
 
-        if not state.spoke and isinstance(parser, TagSpeechStreamParser):
-            # タグ方式で1文も生まなかったストリームは、計測と診断ログに
-            # 残す（従来はフォールバック先の成否に埋もれて内訳が見えず、
-            # 成功率が実態より良く見えていた。2026-11-19 観測追加）
+        if not state.spoke:
+            # 1文も生まなかったストリームの生成メタを呼び出し側へ渡す。
+            # 経路によらず取る（従来はタグ方式のときだけだったため、
+            # ストリーム自体の失敗＝stream_error が呼び出し側から
+            # 見えず、停滞と空振りを区別できなかった）
             meta: dict = {}
             try:
                 if agent.llm is not None:
@@ -3816,8 +4259,16 @@ class Orchestrator:
             except Exception:
                 meta = {}
             state.gen_meta = meta
-            if parser.report_no_speech(meta):
-                state.tag_no_speech = True
+            state.stream_error = str(meta.get("stream_error") or "")
+            if isinstance(parser, TagSpeechStreamParser):
+                # タグ方式で1文も生まなかったストリームは、計測と診断
+                # ログに残す（従来はフォールバック先の成否に埋もれて
+                # 内訳が見えず、成功率が実態より良く見えていた。
+                # 2026-11-19 観測追加）
+                outcome = parser.report_no_speech(meta)
+                if outcome:
+                    state.tag_no_speech = True
+                    state.tag_outcome = outcome
 
         if state.spoke:
             # エフェクトはJSON末尾にあるため、生成完了が発話消費より遅れた
@@ -4114,6 +4565,9 @@ class Orchestrator:
             "speaking_character": self._speaking_character,
             "theme_hint_count": self._theme_hint_count,
             "characters": self.characters_status(),
+            "stream_digest": {
+                a.key: self.stream_digest_text(a.key) for a in self._agents
+            },
         }
 
     # ── 記憶整理 ──────────────────────────────────────────────
@@ -4178,6 +4632,14 @@ class Orchestrator:
             await self._hub.send_log("warn", f"{label}記憶整理に失敗: {result.reason}")
             return result
 
+        # 配信中の記憶整理（2026-11-22 longstream）：整理で消費される前に
+        # pending の写しを流れダイジェストへ渡す。失敗しても整理本体の
+        # 結果には影響させない（StreamDigest 側でも隔離済み）
+        try:
+            await self._update_stream_digest(agent, log.get_pending())
+        except Exception:
+            logger.exception("stream digest update failed (isolated)",
+                             character=agent.key)
         log.mark_consolidated()
         if result.added > 0:
             msg = f"{label}記憶を {result.added} 件おぼえました"
@@ -4194,6 +4656,49 @@ class Orchestrator:
         if agent.is_lead:
             await self._broadcast_memory_stats()
         return result
+
+    # ── 配信中の記憶整理（2026-11-22 longstream） ─────────────
+
+    def _stream_digest_for(self, agent: CharacterAgent) -> StreamDigest:
+        """キャラごとの StreamDigest を遅延生成する"""
+        digests = getattr(self, "_stream_digests", None)
+        if digests is None:
+            digests = self._stream_digests = {}
+        keeper = digests.get(agent.key)
+        if keeper is None:
+            cfg = self._cfg.orchestrator
+            keeper = StreamDigest(
+                max_chars=cfg.stream_digest_max_chars,
+                input_chars=cfg.stream_digest_input_chars,
+                episode_cap=cfg.stream_episode_cap,
+                episode_keep_recent=cfg.stream_episode_keep_recent,
+                episode_protect_sec=cfg.stream_episode_protect_sec,
+                session_started_at=getattr(self, "_start_time", None),
+            )
+            digests[agent.key] = keeper
+        return keeper
+
+    async def _update_stream_digest(self, agent: CharacterAgent,
+                                    pending: list) -> None:
+        """記憶整理の成功サイクルに相乗りして流れダイジェストを更新する。
+
+        発動間隔は整理の成功サイクルを共有する（整理が成功するたびに
+        1回）。失敗時は次回に再試行され、配信は止めない。
+        """
+        if not self._cfg.orchestrator.stream_digest_enabled:
+            return
+        if agent.llm is None:
+            return
+        keeper = self._stream_digest_for(agent)
+        await keeper.update(messages=pending, llm=agent.llm,
+                            store=agent.memory_store,
+                            character_name=agent.key)
+        agent.stream_digest = keeper.text
+
+    def stream_digest_text(self, character_key: str) -> str:
+        """status 表示用：キャラの流れダイジェストを返す"""
+        keeper = getattr(self, "_stream_digests", {}).get(character_key)
+        return keeper.text if keeper is not None else ""
 
     async def _broadcast_memory_stats(self) -> None:
         lead = self._lead

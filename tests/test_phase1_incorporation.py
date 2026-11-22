@@ -134,8 +134,14 @@ def _bare_agent(store, planner):
     agent = CharacterAgent.__new__(CharacterAgent)
     agent.long_term_memory = None
     agent.memory_store = store
+    agent._topic_planner = None
+    # プランナーは Orchestrator が set_topic_planner で差し込むのが
+    # 本番の配線（c3fix）。実物の OrchestratorConfig には _planner は
+    # 無いので、疑似 config 側に生やすと、本番で死んでいる配線を
+    # テストだけ生かしてしまう。ここでも本番と同じ形に合わせる
+    agent.set_topic_planner(planner)
     orch = SimpleNamespace(idle_episodic_entries=2,
-                           idle_core_memory_chars=4000, _planner=planner)
+                           idle_core_memory_chars=4000)
     agent.app = SimpleNamespace(orchestrator=orch)
     return agent
 

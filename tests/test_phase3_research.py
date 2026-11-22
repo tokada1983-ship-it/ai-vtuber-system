@@ -91,11 +91,11 @@ def make_duo_p3(llm_a=None, llm_b=None):
     cfg.tts.irodori_server.auto_start = False
     cfg.knowledge.enabled = False
     cfg.characters = [
-        CharacterConfig(name="Character1", id="Character1", data_dir=str(tmp),
-                        prompt_file=_write_char(tmp, "Character1"),
-                        aliases=["character1"]),
-        CharacterConfig(name="Character2", id="Character2", data_dir=str(tmp),
-                        prompt_file=_write_char(tmp, "Character2")),
+        CharacterConfig(name="クロエ", id="chloe", data_dir=str(tmp),
+                        prompt_file=_write_char(tmp, "クロエ"),
+                        aliases=["くろえ"]),
+        CharacterConfig(name="ミライ", id="mirai", data_dir=str(tmp),
+                        prompt_file=_write_char(tmp, "ミライ")),
     ]
     cfg.ensemble = EnsembleConfig(turn_gap_sec=0, idle_banter_probability=0.0,
                                   banter_probability=0.0)
@@ -165,7 +165,7 @@ async def test_interval_gate_defers_question_to_queue():
     assert planner._comment_hook is None            # hook に残らない
     # 即応は「依頼済み」プロンプトで生成された（この分岐でのみ宣言が許可される）
     assert any("依頼済み" in p for p in llm.prompts)
-    assert _speakers(hub) == ["Character1"]
+    assert _speakers(hub) == ["chloe"]
 
 
 # ── (3) 保留回答は plan() で comment hook より優先される ────
@@ -444,7 +444,7 @@ class FakePlannerP3:
     def release(self, topic):
         pass
 
-    def reset_thread(self):
+    def reset_thread(self, reason="reset"):
         self.reset_thread_calls += 1
 
     def note_speech(self, idle=False, text=""):
@@ -470,4 +470,4 @@ async def test_speak_idle_pending_answer_overrides_force_switch():
     assert planner.plan_calls[0]["kind"] == ""
     assert planner.reset_thread_calls == 0
     assert orch._force_switch_pending is True
-    assert _speakers(hub) == ["Character1"]
+    assert _speakers(hub) == ["chloe"]

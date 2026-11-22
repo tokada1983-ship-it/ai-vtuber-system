@@ -82,6 +82,27 @@ class ReflectionEngine:
                 logger.warning("ReflectionEngine: empty diary generated")
                 return None
 
+            # 品質ゲート: 日記は長期記憶（memory.md）に残り、以降のランの
+            # 想起材料になるため、発話と同じ基準で汚染を弾く。発話側は
+            # パーサ／オーケストレータが Meta リークを弾くが、日記側には
+            # ゲートが無く、フォールバック生成の文字化け・推論混じりの文が
+            # そのまま書き込まれた（2026-11-21 BFラン）。汚染された日記を
+            # 残すより、書かない方が良い。
+            from backend.llm.parser import (contains_meta_leak,
+                                            foreign_contamination_marker)
+            if contains_meta_leak(diary_text):
+                logger.warning("ReflectionEngine: diary rejected "
+                               "(meta leak)", character=character_name,
+                               preview=diary_text[:50])
+                return None
+            marker = foreign_contamination_marker(diary_text)
+            if marker:
+                logger.warning("ReflectionEngine: diary rejected "
+                               "(foreign script contamination)",
+                               character=character_name, marker=marker,
+                               preview=diary_text[:50])
+                return None
+
             # memory.md の更新
             today_str = datetime.now().strftime("%Y-%m-%d %H:%M")
             entry_header = f"### [{today_str}] 配信の思い出"

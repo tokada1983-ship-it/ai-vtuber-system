@@ -42,7 +42,7 @@
     （各ステップは冪等なので、次回にやり直しても二重に効かない）。
   - MindLoop とは同じロックで直列化する（モデルスワップ回避）。
 
-設定（環境変数。config.yaml は変更しない）:
+設定（config.yaml の mind セクションが正。環境変数があれば移行互換のため優先）:
   AIVT_SLEEP_ENABLED    "0" で背景スケジューラ無効（既定: 有効）
   AIVT_SLEEP_POLL_SEC   ポーリング間隔（既定: 60）
 """
@@ -59,11 +59,12 @@ from backend.logger import get_logger
 from backend.memory.memory_consolidator import MemoryConsolidator
 from backend.memory.mind_store import MindStore
 from backend.mind.mind_loop import (MAX_ACTIVE_INTENTIONS,
-                                    MERGE_REASONS_JACCARD, _PROV_BY_MEMORY_SOURCE,
+                                    MERGE_REASONS_JACCARD,
                                     _TASK_SPECS, _THINK_SYSTEM, _bigrams,
                                     _containment, _get_opinion_materials,
                                     _norm, _parse_thought_output,
-                                    _record_opinion_material, opinion_similarity)
+                                    _record_opinion_material, opinion_similarity,
+                                    provenance_for_memory_source)
 from backend.models import ChatMessage
 
 logger = get_logger(__name__)
@@ -253,7 +254,8 @@ async def _step2_review_opinions(agent, period_start: float,
         reasons = str(raw_op.get("reasons", ""))[:300]
         _, reasons_jac = opinion_similarity(
             op.topic_label, op.reasons, op.topic_label, reasons)
-        provenance = _PROV_BY_MEMORY_SOURCE.get(target.source, "inferred")
+        provenance = provenance_for_memory_source(
+            target.source, context="sleep_opinion_review")
         if stance == op.stance and reasons_jac >= MERGE_REASONS_JACCARD:
             _record_opinion_material(store, op.topic_key, target_ref)
             reviewed.append({"topic": op.topic_label, "action": "keep"})
@@ -562,8 +564,14 @@ class SleepManager:
 
     def __init__(self, orchestrator):
         self._orch = orchestrator
-        self.enabled = os.environ.get("AIVT_SLEEP_ENABLED", "1") != "0"
-        self.poll_sec = _env_float("AIVT_SLEEP_POLL_SEC", 60.0)
+        # 調整値は config（mind セクション）を正とし、環境変数があれば
+        # 移行互換のためそちらを優先する（F8）。既定値は従来どおり
+        mind_cfg = getattr(getattr(orchestrator, "_cfg", None), "mind", None)
+        cfg_enabled = True if mind_cfg is None else bool(mind_cfg.sleep_enabled)
+        cfg_poll = 60.0 if mind_cfg is None else float(mind_cfg.sleep_poll_sec)
+        self.enabled = os.environ.get(
+            "AIVT_SLEEP_ENABLED", "1" if cfg_enabled else "0") != "0"
+        self.poll_sec = _env_float("AIVT_SLEEP_POLL_SEC", cfg_poll)
         self._run_lock = asyncio.Lock()
         self.last_run_at: float = 0.0
         self.last_results: dict[str, dict] = {}

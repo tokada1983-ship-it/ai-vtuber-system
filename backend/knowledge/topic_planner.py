@@ -5,6 +5,8 @@
   memory    … 長期記憶のキーワード（従来の独り言。ネット接続不要）
   news      … RSSで仕入れた最新ニュース
   curiosity … 記憶のキーワードや配信テーマをWeb検索して仕入れた話
+  theme     … 配信テーマ（stream_theme）に沿った話題。テーマ設定中は
+              話題シェア目標（theme_share_target）に応じて定期的に差し込む
 
 【2026-11-14 改修：LLMに依らない決定層】
 話題の選択はLLMではなく、以下の決定的な仕組みで行う（設計メモ
@@ -29,6 +31,7 @@ DESIGN-2026-11-14-autonomous-speech.md 参照）。
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import random
@@ -81,9 +84,13 @@ _SEED_COOLDOWN_SEC = 1800.0
 _THEME_OVERLAP_SEED_MAX = 0.35
 _THEME_OVERLAP_MEMORY_MAX = 0.5
 
-# memory 占有率ハードキャップ（Phase 1 / STUDY §3-C1）。台帳がこの件数
+# memory 話題シェアハードキャップ（Phase 1 / STUDY §3-C1）。台帳がこの件数
 # たまるまでは誤爆を避けるためキャップを効かせない
 _MEMORY_CAP_MIN_SAMPLES = 10
+
+# force_topic 種まきキューの保持上限と有効期限（2026-11-22 themefix）
+_FORCED_TOPIC_MAX = 8
+_FORCED_TOPIC_TTL_SEC = 3600.0
 # 話題化した記憶を L3 常駐注入（build_idle_memory）へ再浮上させない
 # クールダウン（秒。STUDY §3-C3 の最小形：プランナー側の台帳を共有する）
 _TOPIC_MEMORY_COOLDOWN_SEC = 1800.0
@@ -128,7 +135,7 @@ def _jaccard(a: set[str], b: set[str]) -> float:
 @dataclass
 class Topic:
     """次に話す話題1つぶん"""
-    kind: str                                   # "memory" | "news" | "curiosity" | "answer"
+    kind: str                                   # "memory" | "news" | "curiosity" | "answer" | "theme"
     label: str = ""                             # ダッシュボード表示用の短い説明
     query: str = ""                             # 検索に使ったクエリ
     documents: list[WebDocument] = field(default_factory=list)
@@ -187,6 +194,13 @@ class TopicPlanner:
         arc_max_continuations: int = 2,
         arc_max_sec: float = 900.0,
         arc_ask_probability: float = 0.25,
+        theme_share_target: float = 0.34,
+        theme_share_window: int = 12,
+        topic_tenure_enabled: bool = True,
+        topic_tenure_speeches: int = 6,
+        topic_tenure_sec: float = 1200.0,
+        topic_tenure_cooldown_sec: float = 1800.0,
+        topic_tenure_window_sec: float = 1800.0,
     ):
         self._news = news
         self._search = search
@@ -214,10 +228,45 @@ class TopicPlanner:
         self._arc_max_sec = float(arc_max_sec)
         self._arc_ask_probability = min(1.0, max(0.0,
                                                  float(arc_ask_probability)))
+        # 配信テーマ（stream_theme）の話題シェア目標（2026-11-22 themefix）。
+        # テーマ設定中、話題決定のうちこの割合をテーマ話題にする。
+        # 0 以下で無効（従来動作）
+        self._theme_share_target = min(1.0, max(0.0,
+                                                 float(theme_share_target)))
+        self._theme_share_window = max(1, int(theme_share_window))
+        # 話題の任期（topic tenure、2026-11-22 longstream）：同じ主題の
+        # 連なりが長くなりすぎたら、決定境界で弧を「完遂」として閉じ、
+        # その主題を一定期間、次候補から外す（詳細は _try_tenure_transition）
+        self._tenure_enabled = bool(topic_tenure_enabled)
+        self._tenure_speeches = max(1, int(topic_tenure_speeches))
+        self._tenure_sec = float(topic_tenure_sec)
+        self._tenure_cooldown_sec = float(topic_tenure_cooldown_sec)
+        self._tenure_window_sec = float(topic_tenure_window_sec)
+        # 経過時間だけで tenure 到達とみなすのに必要な最小発話数
+        # （2026-11-22 verifyfix）。発話1〜3件のチェーンが、セッション
+        # 跨ぎの壁時計経過だけで移行対象になるのを防ぐための下限で、
+        # 発話数そのものの閾値（_tenure_speeches）より保守的に小さく取る
+        self._tenure_min_speeches_for_time = 3
+        # tenure 除外中の主題（arc_key → {until, title}）。永続化する
+        self._tenure_excluded: dict[str, dict] = {}
+        # tenure 強制クローズを出した弧のキー（commit の完遂処理で参照）
+        self._tenure_closing_key: str = ""
+        # force_topic の種まきキュー（2026-11-22 themefix）。投入順に
+        # 次回以降の自動決定で消費される。プロセス内のみ（永続化しない）
+        self._forced_topics: deque[dict] = deque()
+        # テーマ言及率の計測（2026-11-22 themefix）。テーマ文字列ごとに
+        # 発話数と言及数を数え、テーマが変わったらリセットする
+        self._theme_stats_theme: str = ""
+        self._theme_stat_speeches: int = 0
+        self._theme_stat_mentions: int = 0
         # 弧の計測（完遂／期限切れ／放棄の回数）と、直近の完遂時刻
-        # （完遂直後の新規話題を「転換」の意図にするために使う）
-        self._arc_stats: dict[str, int] = {"completed": 0, "expired": 0,
-                                           "abandoned": 0}
+        # （完遂直後の新規話題を「転換」の意図にするために使う）。
+        # abandoned は合計に加え、理由別（abandoned_reset＝文脈リセット／
+        # abandoned_force_switch＝テーマ反復の強制切替）にも分けて数える
+        # （F9: 経路で意味が混ざると比率の解釈を誤るため）
+        self._arc_stats: dict[str, int] = {
+            "completed": 0, "expired": 0, "abandoned": 0, "tenure": 0,
+            "abandoned_reset": 0, "abandoned_force_switch": 0}
         self._last_arc_end_at: float = 0.0
         # 話題化した記憶の使用台帳（正規化キー → 使用時刻）。L3 常駐注入の
         # サンプリングと共有し、同じ記憶の二経路での繰り返しを断つ（§3-C3）
@@ -293,6 +342,24 @@ class TopicPlanner:
             toks = _title_tokens(text)
             if toks:
                 self._recent_speech_tokens.append(toks)
+        # テーマ言及率の計測（2026-11-22 themefix）：テーマが変わったら
+        # カウンタをリセットし、設定中は発話数と言及数を数える
+        theme = (self._theme_provider() or "").strip()
+        if theme != self._theme_stats_theme:
+            self._theme_stats_theme = theme
+            self._theme_stat_speeches = 0
+            self._theme_stat_mentions = 0
+        if theme and text:
+            self._theme_stat_speeches += 1
+            if theme in text:
+                self._theme_stat_mentions += 1
+                logger.info(
+                    "stream theme mentioned",
+                    theme=theme,
+                    mentions=self._theme_stat_mentions,
+                    speeches=self._theme_stat_speeches,
+                    rate=round(self._theme_stat_mentions
+                               / self._theme_stat_speeches, 3))
         if idle:
             self._energy = min(1.0, self._energy + 0.04)
         else:
@@ -362,6 +429,24 @@ class TopicPlanner:
 
     # ── 状態の永続化 ────────────────────────────────────────
 
+    @staticmethod
+    def _pending_answer_to_dict(e: dict) -> dict:
+        """保留回答1件を JSON 化できる形にする（F7）"""
+        return {
+            "id": e.get("id") or "",
+            "author": e.get("author") or "",
+            "question": e.get("question") or "",
+            "query": e.get("query") or "",
+            "key": e.get("key") or "",
+            "enqueued_at": float(e.get("enqueued_at") or 0),
+            "ttl": float(e.get("ttl") or _PENDING_ANSWER_TTL_SEC),
+            "attempts": int(e.get("attempts") or 0),
+            "state": e.get("state") or "waiting",
+            "documents": [d.to_dict() for d in (e.get("documents") or [])
+                          if hasattr(d, "to_dict")],
+            "next_try_at": float(e.get("next_try_at") or 0),
+        }
+
     def _save_state(self) -> None:
         """台帳・最終話題時刻・energy・スタックをJSONに保存する（commit時に呼ぶ）"""
         if self._state_path is None:
@@ -380,6 +465,15 @@ class TopicPlanner:
                 "seed_used_at": self._seed_used_at,
                 "topic_memory_used_at": self._topic_memory_used_at,
                 "arc_stats": self._arc_stats,
+                # 保留回答も永続化する（F7）。以前は再起動のたびに
+                # 調査済みの回答ごと消え、質問が無言で失われていた
+                "pending_answers": [
+                    self._pending_answer_to_dict(e)
+                    for e in self._pending_answers],
+                "tenure_excluded": {
+                    k: {"until": float(v.get("until") or 0),
+                        "title": v.get("title") or ""}
+                    for k, v in self._tenure_excluded.items()},
             }
             tmp = self._state_path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -423,10 +517,69 @@ class TopicPlanner:
                 self._thread = th
             ast = data.get("arc_stats") or {}
             if isinstance(ast, dict):
-                for k in ("completed", "expired", "abandoned"):
+                for k in ("completed", "expired", "abandoned", "tenure",
+                          "abandoned_reset", "abandoned_force_switch"):
                     if isinstance(ast.get(k), (int, float)):
                         self._arc_stats[k] = int(ast[k])
-            logger.info("planner state loaded", ledger=len(self._ledger))
+            te = data.get("tenure_excluded") or {}
+            if isinstance(te, dict):
+                for k, v in te.items():
+                    if isinstance(v, dict) \
+                            and float(v.get("until") or 0) > now:
+                        self._tenure_excluded[str(k)] = {
+                            "until": float(v.get("until") or 0),
+                            "title": str(v.get("title") or "")}
+            # 保留回答の復元（F7）。TTL を過ぎたものは復元しない
+            # （期限の意味を再起動で延ばさないため）。ID の連番は
+            # 復元分と衝突しないよう最大値に合わせて進める
+            pa = data.get("pending_answers") or []
+            if isinstance(pa, list):
+                for e in pa:
+                    if not isinstance(e, dict) or not e.get("id"):
+                        continue
+                    enqueued_at = float(e.get("enqueued_at") or 0)
+                    ttl = float(e.get("ttl") or _PENDING_ANSWER_TTL_SEC)
+                    if now - enqueued_at > ttl:
+                        continue
+                    state = str(e.get("state") or "waiting")
+                    if state not in ("waiting", "ready", "failed"):
+                        continue
+                    docs = []
+                    for d in e.get("documents") or []:
+                        if isinstance(d, dict) and d.get("title"):
+                            try:
+                                docs.append(WebDocument(
+                                    title=str(d.get("title") or ""),
+                                    url=str(d.get("url") or ""),
+                                    snippet=str(d.get("snippet") or ""),
+                                    source=str(d.get("source") or ""),
+                                    site=str(d.get("site") or ""),
+                                    published_at=d.get("published_at"),
+                                    fetched_at=float(d.get("fetched_at")
+                                                     or now),
+                                ))
+                            except Exception:
+                                continue
+                    self._pending_answers.append({
+                        "id": str(e["id"]),
+                        "author": str(e.get("author") or ""),
+                        "question": str(e.get("question") or ""),
+                        "query": str(e.get("query") or ""),
+                        "key": str(e.get("key") or ""),
+                        "enqueued_at": enqueued_at,
+                        "ttl": ttl,
+                        "attempts": int(e.get("attempts") or 0),
+                        "state": state,
+                        "documents": docs,
+                        "next_try_at": float(e.get("next_try_at") or 0),
+                    })
+                    try:
+                        seq = int(str(e["id"]).rsplit("-", 1)[1])
+                        self._pending_seq = max(self._pending_seq, seq)
+                    except (IndexError, ValueError):
+                        pass
+            logger.info("planner state loaded", ledger=len(self._ledger),
+                        pending_answers=len(self._pending_answers))
         except Exception as e:
             logger.warning("planner state load failed", error=str(e))
 
@@ -446,21 +599,49 @@ class TopicPlanner:
         for k in expired:
             del self._reserved[k]
 
+    def _is_theme_word(self, word: str) -> bool:
+        """その語が配信テーマ自体（またはその一部／全体を含む）か。
+
+        テーマ語を反復抑制（ban）の対象にすると、テーマ会話が始まった
+        途端にテーマ自体が禁止され維持できなくなる（2026-11-21 BFラン
+        分析の主因5）。テーマ語は ban から外し、切り口の反復は類似度
+        ベースの抑制（LoopGuard・話題飽和）に任せる（2026-11-22 themefix）
+        """
+        theme = (self._theme_provider() or "").strip()
+        w = (word or "").strip()
+        if not theme or not w:
+            return False
+        return w == theme or theme in w or (len(w) >= 2 and w in theme)
+
     def ban_word(self, word: str, seconds: float = 1800) -> None:
         """吸着した語をしばらく話題の種にしない（文脈リセットとセットで呼ぶ）"""
         if word:
+            if self._is_theme_word(word):
+                logger.info("ban skipped for stream theme word", word=word)
+                return
             self._banned[word] = time.time() + seconds
 
     def banned_words(self) -> set[str]:
         now = time.time()
         return {w for w, until in self._banned.items() if until > now}
 
-    def reset_thread(self) -> None:
-        """継続中スレッドを破棄する（文脈リセット用）"""
+    def reset_thread(self, reason: str = "reset") -> None:
+        """継続中スレッドを破棄する。
+
+        reason は放棄の経路（F9）: "reset"＝文脈リセット（飽和・ブロック
+        エスカレーション）、"force_switch"＝テーマ反復の強制切替。
+        abandoned の合計と理由別の両方を進める（合計だけだと、強制切替の
+        多発が文脈リセットの多発に見えて比率の解釈を誤る）。
+        """
+        self._tenure_closing_key = ""
         if self._thread is not None and self._planner_enabled:
             # 締めに届かず捨てられた弧として数える（Phase 3 の計測）
             self._arc_stats["abandoned"] = \
                 int(self._arc_stats.get("abandoned") or 0) + 1
+            bucket = ("abandoned_force_switch" if reason == "force_switch"
+                      else "abandoned_reset")
+            self._arc_stats[bucket] = \
+                int(self._arc_stats.get(bucket) or 0) + 1
         self._thread = None
         self._save_state()
 
@@ -585,6 +766,271 @@ class TopicPlanner:
                            if e.get("arc_key") != topic.arc_key]
         logger.info("topic arc completed", kind=topic.kind,
                     speeches=speeches, label=(topic.label or "")[:40])
+        # tenure 強制クローズによる完遂は、移行として数えて主題を除外する
+        if self._tenure_closing_key \
+                and (not topic.arc_key
+                     or topic.arc_key == self._tenure_closing_key):
+            self._arc_stats["tenure"] = \
+                int(self._arc_stats.get("tenure") or 0) + 1
+            title = (th or {}).get("title") \
+                or (topic.documents[0].title if topic.documents else "") \
+                or topic.label or ""
+            self._register_tenure_exclusion(
+                self._tenure_closing_key, title, now)
+            logger.info("topic tenure transition completed",
+                        reason="topic_tenure",
+                        arc_key=self._tenure_closing_key[:40])
+            self._tenure_closing_key = ""
+
+
+    # ── 話題の任期（topic tenure、2026-11-22 longstream） ─────
+    # 同じ主題（弧）が長くなりすぎた場合の「通常経路」の移行機構。
+    # 弧の上限（arc_max_*）は1本の弧の中での締め判定だが、弧が置換・
+    # 失効で静かに消えて同じ主題が別弧として再登場する連なりは数え
+    # られていなかった（BFラン実測：正式な完遂は全ランで1件のみ、
+    # 同じニュース主題が台帳60件中に4回出現）。ここでは台帳ベースで
+    # 主題の連なり（チェーン）を測り、閾値を超えたら決定境界で弧を
+    # 「完遂」として閉じ、その主題を一定期間、次候補から外す。
+    # 役割分担：tenure は「長さ」への通常経路（締め発話で自然に畳む）。
+    # LoopGuard は「言い換えレベルの反復」への緊急経路（発話後検出→
+    # ヒント・強制切替・文脈リセット）で、飽和リセットも緊急側。
+    # 通常は tenure が先に働き、緊急経路の発動自体を減らす想定。
+
+    def _purge_tenure_exclusions(self, now: float) -> None:
+        expired = [k for k, v in self._tenure_excluded.items()
+                   if float(v.get("until") or 0) <= now]
+        for k in expired:
+            del self._tenure_excluded[k]
+
+    def _register_tenure_exclusion(self, arc_key: str, title: str,
+                                   now: float,
+                                   chain: dict | None = None) -> None:
+        """移行した主題をクールダウンの間、次候補から外す"""
+        if not arc_key:
+            return
+        self._tenure_excluded[arc_key] = {
+            "until": now + self._tenure_cooldown_sec,
+            "title": title or "",
+        }
+        logger.info("topic tenure exclusion registered",
+                    reason="topic_tenure", arc_key=arc_key[:40],
+                    title=(title or "")[:40],
+                    cooldown_sec=self._tenure_cooldown_sec,
+                    speeches=(chain or {}).get("speeches"),
+                    elapsed_sec=round(float((chain or {}).get("elapsed")
+                                            or 0), 1))
+        self._save_state()
+
+    def _is_tenure_excluded(self, title: str, query: str) -> bool:
+        """タイトル／クエリが tenure 除外中の主題に当たるか。
+
+        弧キーの完全一致か、タイトル同士の Jaccard が 0.6 以上で判定する。
+        """
+        now = time.time()
+        key = self._arc_key_for(title or "", query or "")
+        ent = self._tenure_excluded.get(key)
+        if ent and float(ent.get("until") or 0) > now:
+            return True
+        toks = _title_tokens(title or query or "")
+        if not toks:
+            return False
+        for ent in self._tenure_excluded.values():
+            if float(ent.get("until") or 0) <= now:
+                continue
+            etoks = _title_tokens(ent.get("title") or "")
+            if etoks and _jaccard(toks, etoks) >= 0.6:
+                return True
+        return False
+
+    def _matches_tenure_exclusion(self, text: str) -> bool:
+        """長いテキスト（記憶文など）が除外中の主題を含むか。
+
+        記憶文はタイトルよりずっと長いため Jaccard では希釈される。
+        _theme_overlap と同じ containment（小さい側に対する共通割合）
+        で測る。
+        """
+        if not self._tenure_excluded:
+            return False
+        toks = _title_tokens(text or "")
+        if not toks:
+            return False
+        now = time.time()
+        for ent in self._tenure_excluded.values():
+            if float(ent.get("until") or 0) <= now:
+                continue
+            etoks = _title_tokens(ent.get("title") or "")
+            if etoks and len(toks & etoks) / min(len(toks), len(etoks)) >= 0.5:
+                return True
+        return False
+
+    def _subject_chain(self, now: float) -> dict | None:
+        """現在の主題チェーン（同一 arc_key の連なり）を台帳から測る。
+
+        対象はスレッド（弧）を開く kind（news/curiosity/theme）のみ。
+        memory 話題はタイトルが常に「覚えていること」で弧キーが潰れる
+        ため対象外（そちらの張り付きは話題シェアキャップと発話テーマの
+        重なり判定が担当する）。
+        """
+        th = self._thread
+        thread_key = ""
+        thread_speeches = 0
+        thread_started = 0.0
+        if th is not None:
+            thread_key = th.get("arc_key") or self._arc_key_for(
+                th.get("title") or "", th.get("query") or "")
+            thread_speeches = int(th.get("speeches") or 0)
+            thread_started = float(th.get("started_at")
+                                   or th.get("at") or 0)
+        cutoff = now - self._tenure_window_sec
+        counts: dict[str, dict] = {}
+        for e in self._ledger:
+            if e.get("kind") not in ("news", "curiosity", "theme"):
+                continue
+            # テーマ×記憶の話題は材料の出所が memory で、タイトルが
+            # 「覚えていること」に潰れて別主題と混ざるため対象外にする
+            # （kind ではなく source で判定する。2026-11-22 verifyfix）
+            if e.get("source") == "memory":
+                continue
+            at = float(e.get("at") or 0)
+            if at < cutoff:
+                continue
+            k = e.get("arc_key") or self._arc_key_for(
+                e.get("title") or "", e.get("query") or "")
+            if not k:
+                continue
+            c = counts.setdefault(k, {"speeches": 0, "first_at": at,
+                                      "title": e.get("title")
+                                      or e.get("query") or ""})
+            c["speeches"] += 1
+            c["first_at"] = min(c["first_at"], at)
+        key = thread_key
+        if not key and self._ledger:
+            last = self._ledger[-1]
+            if last.get("kind") in ("news", "curiosity", "theme"):
+                key = last.get("arc_key") or self._arc_key_for(
+                    last.get("title") or "", last.get("query") or "")
+        if not key:
+            return None
+        c = counts.get(key) or {"speeches": 0, "first_at": 0.0, "title": ""}
+        speeches = max(int(c["speeches"]), thread_speeches)
+        started = thread_started or float(c["first_at"] or 0)
+        if thread_started and c["first_at"]:
+            started = min(thread_started, float(c["first_at"]))
+        # 経過時間はこのセッション（プランナ生成時点）以降でのみ測る。
+        # 永続台帳から復元した前セッション分の開始時刻をそのまま使うと、
+        # エンジン停止中の壁時計まで「経過」に含まれてしまう
+        # （2026-11-22 5時間検証：開始5秒後に elapsed 1742秒で到達）
+        if started:
+            started = max(started, float(getattr(self, "_born_at", 0.0)
+                                         or 0.0))
+        title = ""
+        if th is not None:
+            title = th.get("title") or th.get("query") or ""
+        title = title or c["title"]
+        return {"arc_key": key, "speeches": speeches,
+                "started_at": started,
+                "elapsed": max(0.0, now - started) if started else 0.0,
+                "title": title, "thread_open": th is not None}
+
+    def _tenure_exceeded(self, now: float) -> dict | None:
+        """主題チェーンが tenure 閾値を超えていたらチェーン情報を返す"""
+        if not self._tenure_enabled or not self._planner_enabled:
+            return None
+        chain = self._subject_chain(now)
+        if chain is None:
+            return None
+        ent = self._tenure_excluded.get(chain["arc_key"])
+        if ent and float(ent.get("until") or 0) > now:
+            return None   # 移行済みの主題では再発火しない
+        if chain["speeches"] >= self._tenure_speeches:
+            return chain
+        # 経過時間だけでの到達は、最低限の発話数が伴う場合に限る。
+        # 従来は OR 条件で発話1件でも時間だけで発火していた
+        if chain["speeches"] >= self._tenure_min_speeches_for_time \
+                and chain["elapsed"] >= self._tenure_sec:
+            return chain
+        return None
+
+    def _finish_arc_tenure(self, chain: dict, now: float) -> None:
+        """締め材料が無いまま tenure に達した弧を、完遂として閉じる"""
+        th = self._thread
+        speeches = int((th or {}).get("speeches") or chain["speeches"] or 0)
+        if self._ledger:
+            last = self._ledger[-1]
+            lk = last.get("arc_key") or self._arc_key_for(
+                last.get("title") or "", last.get("query") or "")
+            if lk == chain["arc_key"]:
+                last["arc_completed"] = True
+                if speeches:
+                    last["arc_speeches"] = speeches
+        self._arc_stats["completed"] = \
+            int(self._arc_stats.get("completed") or 0) + 1
+        self._arc_stats["tenure"] = \
+            int(self._arc_stats.get("tenure") or 0) + 1
+        self._last_arc_end_at = now
+        kind = (th or {}).get("kind")
+        self._thread = None
+        if chain["arc_key"]:
+            self._stack = [e for e in self._stack
+                           if e.get("arc_key") != chain["arc_key"]]
+        logger.info("topic arc completed", reason="topic_tenure",
+                    kind=kind, speeches=speeches,
+                    label=(chain["title"] or "")[:40])
+        self._register_tenure_exclusion(chain["arc_key"], chain["title"],
+                                        now, chain)
+        self._save_state()
+
+    async def _try_tenure_transition(self, allow_web: bool) -> Topic | None:
+        """tenure 到達時の移行を試みる（plan の決定境界でのみ呼ばれる）。
+
+        弧が開いていれば、まず「締め」の発話で自然に畳む（強制クローズ）。
+        材料が取れなければ完遂として閉じ、通常の新規選択へ委ねる。
+        弧が開いていない（別弧として再登場を繰り返した）場合は、主題の
+        除外だけを登録する。いずれも発話の途中では割り込まない。
+        """
+        now = time.time()
+        self._purge_tenure_exclusions(now)
+        chain = self._tenure_exceeded(now)
+        if chain is None:
+            return None
+        logger.info("topic tenure reached", reason="topic_tenure",
+                    arc_key=chain["arc_key"][:40],
+                    title=(chain["title"] or "")[:40],
+                    speeches=chain["speeches"],
+                    elapsed_sec=round(chain["elapsed"], 1),
+                    thread_open=chain["thread_open"])
+        th = self._thread
+        if th is not None and th.get("closing"):
+            # 既に締めに入っている弧は自然な完遂を待つ。除外だけ先に
+            # 登録し、締め発話の commit では tenure 完遂として数える
+            self._tenure_closing_key = chain["arc_key"]
+            self._register_tenure_exclusion(chain["arc_key"],
+                                            chain["title"], now, chain)
+            return None
+        if th is not None:
+            topic = await self._try_continue(allow_web, force_close=True)
+            if topic is not None:
+                self._tenure_closing_key = chain["arc_key"]
+                return topic
+            self._finish_arc_tenure(chain, now)
+            return None
+        # 弧が開いていない到達：閉じるべき弧が無いため、従来は除外
+        # 登録だけで終わり完遂の記録が残らなかった。到達と完遂を
+        # 対応付けられるよう、完遂として記録してから除外する
+        self._record_tenure_completion(chain, now)
+        return None
+
+    def _record_tenure_completion(self, chain: dict, now: float) -> None:
+        """弧が開いていないチェーンの tenure 到達を完遂として記録する"""
+        self._arc_stats["tenure"] = \
+            int(self._arc_stats.get("tenure") or 0) + 1
+        self._last_arc_end_at = now
+        logger.info("topic arc completed", reason="topic_tenure",
+                    kind=None, speeches=chain["speeches"],
+                    label=(chain["title"] or "")[:40], thread_open=False)
+        self._register_tenure_exclusion(chain["arc_key"], chain["title"],
+                                        now, chain)
+        self._save_state()
 
     # ── 保留回答キュー（Phase 3）──────────────────────────────
     # その場で答えられなかった事実質問（同期検索の空振り／間隔ゲート）を
@@ -630,20 +1076,26 @@ class TopicPlanner:
             "next_try_at": now,
         })
         logger.info("answer queued", author=author or "", question=q[:40])
+        self._save_state()
         return pid
 
     def _purge_expired_answers(self, now: float) -> None:
         """期限切れの保留エントリをログを残して破棄する"""
         kept: deque[dict] = deque()
+        dropped = 0
         for e in self._pending_answers:
             if now - float(e.get("enqueued_at") or 0) > float(e.get("ttl")
                                                               or _PENDING_ANSWER_TTL_SEC):
                 logger.info("pending answer expired",
                             question=(e.get("question") or "")[:40],
                             state=e.get("state"))
+                dropped += 1
                 continue
             kept.append(e)
         self._pending_answers = kept
+        if dropped:
+            # 破棄も状態変化として残す（復元で期限切れが蘇らないように）
+            self._save_state()
 
     def claim_answer_work(self) -> dict | None:
         """調査ワーカー用：再試行時刻を過ぎた waiting エントリを1件返す。
@@ -669,6 +1121,7 @@ class TopicPlanner:
                 logger.info("answer ready",
                             question=(e.get("question") or "")[:40],
                             docs=len(e["documents"]))
+                self._save_state()
                 return True
         return False
 
@@ -677,6 +1130,7 @@ class TopicPlanner:
         for e in self._pending_answers:
             if e["id"] == pending_id and e["state"] == "waiting":
                 e["next_try_at"] = time.time() + max(0.0, delay_sec)
+                self._save_state()
                 return True
         return False
 
@@ -687,6 +1141,7 @@ class TopicPlanner:
                 e["state"] = "failed"
                 logger.info("answer research exhausted",
                             question=(e.get("question") or "")[:40])
+                self._save_state()
                 return True
         return False
 
@@ -776,8 +1231,20 @@ class TopicPlanner:
             "at": now,
             "intent": topic.intent,
             "arc_stage": topic.arc_stage,
+            # 弧キーを台帳にも保存する（2026-11-22 verifyfix）。従来は
+            # 保存されず、チェーン集計がタイトル由来キーで再計算する
+            # ため弧キー（クエリ由来）と食い違い、弧の継続中はチェーン
+            # 履歴が評価対象から外れていた
+            "arc_key": topic.arc_key or self._arc_key_for(
+                topic.documents[0].title if topic.documents else "",
+                topic.query),
+            # 材料の出所。テーマ×記憶の話題をチェーン集計から外す判定に
+            # 使う（タイトル「覚えていること」で潰れる問題の対策）
+            "source": topic.documents[0].source if topic.documents else "",
         })
-        if topic.kind == "memory" and topic.documents:
+        if topic.documents and (topic.kind == "memory"
+                                or (topic.kind == "theme"
+                                    and topic.documents[0].source == "memory")):
             # 話題化した記憶を記録する。L3 常駐注入のサンプリング側が
             # この台帳を見て、同じ記憶の再浮上をクールダウン中は避ける
             # （STUDY §3-C3 の最小形：二経路の重複を断つ）
@@ -793,7 +1260,7 @@ class TopicPlanner:
         # 進行中のものも消さない（回答で会話を閉じるのが役割。Phase 3）
         if topic.kind == "answer":
             pass
-        elif topic.kind in ("news", "curiosity") and not topic.resumed:
+        elif topic.kind in ("news", "curiosity", "theme") and not topic.resumed:
             self._thread = {
                 "kind": topic.kind,
                 "title": topic.documents[0].title if topic.documents else "",
@@ -810,7 +1277,7 @@ class TopicPlanner:
                     topic.query),
                 "topic_id": topic.topic_id,
             }
-        elif topic.kind in ("news", "curiosity"):
+        elif topic.kind in ("news", "curiosity", "theme"):
             # 継続・続報の commit：弧の所在を同期する。「締め」の発話が
             # 実際に喋れたら、ここで初めて弧を解放する（ADDENDUM：
             # 話題の解放は締め到達時か上限超過のときだけ）
@@ -822,7 +1289,7 @@ class TopicPlanner:
                 th["at"] = now
             if self._planner_enabled and topic.arc_stage == "close":
                 self._complete_arc(topic, now)
-        elif topic.kind not in ("news", "curiosity"):
+        elif topic.kind not in ("news", "curiosity", "theme"):
             self._thread = None
         self._save_state()
 
@@ -834,6 +1301,10 @@ class TopicPlanner:
             self._reserved.pop(topic.documents[0].key, None)
         # 「締め」として計画した発話が失敗したら、締め予定を取り消して
         # 弧は開いたままにする（完遂は commit された締め発話でのみ成立）
+        if topic.arc_stage == "close" and self._tenure_closing_key \
+                and (not topic.arc_key
+                     or topic.arc_key == self._tenure_closing_key):
+            self._tenure_closing_key = ""
         th = self._thread
         if th is not None and topic.arc_stage == "close" \
                 and th.get("closing") \
@@ -841,7 +1312,7 @@ class TopicPlanner:
                      or topic.arc_key == th.get("arc_key")):
             th["closing"] = False
 
-    # ── 話題化した記憶の台帳（L3注入との共有）と占有率 ──────
+    # ── 話題化した記憶の台帳（L3注入との共有）と話題シェア ──────
 
     @staticmethod
     def _memory_text_key(text: str) -> str:
@@ -867,12 +1338,119 @@ class TopicPlanner:
         return False
 
     def memory_share(self, window: int | None = None) -> float:
-        """直近ウィンドウでの memory 話題の占有率（0..1）。台帳が空なら0"""
+        """直近ウィンドウでの memory 話題の話題シェア（0..1）。台帳が空なら0"""
         n = window or self._memory_cap_window
         entries = list(self._ledger)[-n:]
         if not entries:
             return 0.0
         return sum(1 for e in entries if e.get("kind") == "memory") / len(entries)
+
+    def theme_share(self, window: int | None = None) -> float:
+        """直近ウィンドウでの theme 話題の話題シェア（0..1）。台帳が空なら0"""
+        n = window or self._theme_share_window
+        entries = list(self._ledger)[-n:]
+        if not entries:
+            return 0.0
+        return sum(1 for e in entries if e.get("kind") == "theme") / len(entries)
+
+    def _theme_due(self) -> bool:
+        """テーマ話題を差し込むべき局面か（話題シェア目標ベース、2026-11-22）"""
+        if self._theme_share_target <= 0:
+            return False
+        theme = (self._theme_provider() or "").strip()
+        if not theme or not self._seed_ok(theme):
+            return False
+        entries = list(self._ledger)[-self._theme_share_window:]
+        if entries and entries[-1].get("kind") == "theme":
+            return False   # テーマ話題の直後は1回空ける（連投防止）
+        return self.theme_share() < self._theme_share_target
+
+    # ── force_topic の種まきキュー（2026-11-22 themefix） ────
+
+    def enqueue_forced_topic(self, kind: str = "", query: str = "",
+                             label: str = "") -> int:
+        """話題の種まきを受け付ける。次回以降の自動決定で消費される。
+
+        戻り値は投入後のキュー長。旧 force_topic は無ログだったため、
+        投入・消費の両方を必ずログに残す。
+        """
+        kind = (kind or "").strip()
+        if kind == "auto":
+            kind = ""
+        entry = {
+            "kind": kind,
+            "query": (query or "").strip(),
+            "label": (label or "").strip(),
+            "enqueued_at": time.time(),
+        }
+        self._forced_topics.append(entry)
+        while len(self._forced_topics) > _FORCED_TOPIC_MAX:
+            dropped = self._forced_topics.popleft()
+            logger.info("forced topic dropped (queue full)",
+                        kind=dropped.get("kind") or "auto",
+                        query=(dropped.get("query") or "")[:40])
+        logger.info("forced topic enqueued",
+                    kind=kind or "auto", query=entry["query"][:40],
+                    queue=len(self._forced_topics))
+        return len(self._forced_topics)
+
+    def _purge_forced_topics(self, now: float) -> None:
+        kept: deque[dict] = deque()
+        for e in self._forced_topics:
+            if now - float(e.get("enqueued_at") or 0) > _FORCED_TOPIC_TTL_SEC:
+                logger.info("forced topic expired",
+                            kind=e.get("kind") or "auto",
+                            query=(e.get("query") or "")[:40])
+            else:
+                kept.append(e)
+        self._forced_topics = kept
+
+    async def _try_forced_topic(self, allow_web: bool,
+                                allow_web_theme: bool | None = None
+                                ) -> Topic | None:
+        # テーマ話題の検索は、全体の Web 間隔ゲートとは別に許可され
+        # うる（allow_web_theme。plan() の説明を参照）
+        theme_web = allow_web or bool(allow_web_theme)
+        """種まきキューを消費する。材料が取れなければ通常フローへ委ねる"""
+        self._purge_forced_topics(time.time())
+        if not self._forced_topics:
+            return None
+        entry = self._forced_topics.popleft()
+        kind = entry.get("kind") or ""
+        query = entry.get("query") or ""
+        logger.info("forced topic consumed",
+                    kind=kind or "auto", query=query[:40],
+                    waited_sec=round(time.time()
+                                     - float(entry.get("enqueued_at") or 0), 1))
+        topic: Topic | None = None
+        if kind == "news":
+            topic = self._plan_news_filtered(query)
+            if topic is None:
+                logger.info("forced news had no matching article; "
+                            "falling back to any news", query=query[:40])
+                topic = self._plan_news()
+        elif kind == "theme":
+            topic = await self._plan_theme(query, theme_web)
+        elif kind == "curiosity":
+            topic = await self._plan_curiosity(query)
+        elif kind == "memory":
+            topic = self._plan_memory()
+        elif query:
+            # kind 未指定＋クエリ指定は、そのクエリをテーマ的お題として扱う
+            topic = await self._plan_theme(query, theme_web)
+        else:
+            # kind・クエリ未指定：配信テーマがあればテーマ話題、無ければ
+            # 通常抽選に委ねる（None を返して通常フローを進める）
+            theme = (self._theme_provider() or "").strip()
+            if theme:
+                topic = await self._plan_theme("", theme_web)
+        if topic is None:
+            logger.info("forced topic fizzled (no material)",
+                        kind=kind or "auto", query=query[:40])
+            return None
+        if entry.get("label"):
+            topic.label = entry["label"]
+        return topic
 
     # ── 種類のUtilityスコア ─────────────────────────────────
 
@@ -885,7 +1463,7 @@ class TopicPlanner:
         scores: dict[str, float] = {}
 
         # memory：常時利用可能な床。ニュースが強いときは少し譲る。
-        # 定数床のままだと重み抽選で選ばれ続ける（実測で占有率59%）ため、
+        # 定数床のままだと重み抽選で選ばれ続ける（実測で話題シェア59%）ため、
         # news/curiosity と同様に同種クールダウンと鮮度減衰を効かせる
         # （Phase 2 案B）。最後に memory を話した時刻は commit() が
         # _last_kind_at に記録済みなので、新しい状態は持たない。
@@ -944,7 +1522,7 @@ class TopicPlanner:
         scores = self._score_kinds(allow_web, context)
         for k in (exclude or set()):
             scores[k] = 0.0
-        # 占有率ハードキャップ（STUDY §3-C1）：直近ウィンドウで memory が
+        # 話題シェアハードキャップ（STUDY §3-C1）：直近ウィンドウで memory が
         # 支配的なら、材料のある他候補が残っている間は memory を候補から
         # 外す。重み調整ではなく quota として効かせるのが要点で、台帳の
         # サンプルが少ないうちは誤爆を避けるため効かせない
@@ -1021,8 +1599,14 @@ class TopicPlanner:
 
     # ── 話題の継続（スレッド） ──────────────────────────────
 
-    async def _try_continue(self, allow_web: bool) -> Topic | None:
-        """直近の話題の続きを話し、会話に流れを作る（最大2回まで・確率60%）"""
+    async def _try_continue(self, allow_web: bool,
+                            force_close: bool = False) -> Topic | None:
+        """直近の話題の続きを話し、会話に流れを作る（最大2回まで・確率60%）。
+
+        force_close=True は tenure 到達時の強制クローズ用：確率と継続
+        上限を無視し、「締め」の発話として弧を進める（材料の取得と
+        期限切れ・ban の扱いは通常経路と同じ）。
+        """
         th = self._thread
         if not th or not allow_web:
             return None
@@ -1042,17 +1626,22 @@ class TopicPlanner:
             # （弧が永遠に続かないための上限。ADDENDUM の完遂条件の片方）
             self._expire_thread("arc_max_sec")
             return None
-        if int(th.get("continuations") or 0) >= self._arc_max_continuations:
+        if not force_close \
+                and int(th.get("continuations") or 0) \
+                >= self._arc_max_continuations:
             return None
-        if random.random() > 0.6:
+        if not force_close and random.random() > 0.6:
             return None
         kind = th.get("kind")
         # 弧の段階と次発言の意図はルールで決める（Phase 3 / STUDY §6-(a1)）。
         # 継続上限・発話数上限に達する回が「締め」、展開の一部は「問いかけ」
         speeches = int(th.get("speeches")
                        or int(th.get("continuations") or 0) + 1)
-        stage, intent = self._decide_arc(
-            speeches, int(th.get("continuations") or 0), now)
+        if force_close:
+            stage, intent = "close", "close"
+        else:
+            stage, intent = self._decide_arc(
+                speeches, int(th.get("continuations") or 0), now)
         arc_key = th.get("arc_key") or self._arc_key_for(
             th.get("title") or "", th.get("query") or "")
         if kind == "news":
@@ -1070,16 +1659,48 @@ class TopicPlanner:
             seed = self._seed_from_query(th.get("query") or "")
             if not seed or self._search is None:
                 return None
-            q = random.choice(_CURIOSITY_TEMPLATES).format(kw=seed)
+            # クエリは種そのまま（2026-11-22 themefix のクエリ単純化）
+            q = seed
             if q == th.get("query"):
                 return None
-            docs = await self._search.search(q, limit=self.max_documents)
+            docs = await self._search_with_cap(q)
             if not docs:
                 return None
             self._advance_thread(th, now, stage, arc_key, started_at,
                                  speeches)
             logger.info("topic continue", kind="curiosity", query=q[:40])
             return Topic(kind="curiosity", label=f"続き: {q[:30]}",
+                         query=q, documents=docs[: self.max_documents],
+                         resumed=True, arc_stage=stage,
+                         prev_speech=self._last_speech_text,
+                         intent=intent, arc_key=arc_key)
+        if kind == "theme":
+            # テーマ話題の継続（2026-11-22 themefix）：テーマ単体／
+            # テーマ＋キーワード1つで調べ直し、弧を進める
+            if self._search is None:
+                return None
+            theme = (self._theme_provider() or "").strip()
+            head = theme or self._seed_from_query(th.get("query") or "")
+            if not head:
+                return None
+            candidates = self._theme_query_candidates(head) \
+                if theme else [head]
+            docs = []
+            q = ""
+            for cand in candidates:
+                if cand == th.get("query"):
+                    continue
+                docs = await self._search.search(
+                    cand, limit=self.max_documents)
+                if docs:
+                    q = cand
+                    break
+            if not docs:
+                return None
+            self._advance_thread(th, now, stage, arc_key, started_at,
+                                 speeches)
+            logger.info("topic continue", kind="theme", query=q[:40])
+            return Topic(kind="theme", label=f"続き: {q[:30]}",
                          query=q, documents=docs[: self.max_documents],
                          resumed=True, arc_stage=stage,
                          prev_speech=self._last_speech_text,
@@ -1107,6 +1728,15 @@ class TopicPlanner:
         age = now - float(top.get("suspended_at") or 0)
         if age > 600:
             self._stack.pop()
+            return None
+        if self._tenure_enabled \
+                and self._is_tenure_excluded(top.get("title") or "",
+                                             top.get("query") or ""):
+            # tenure で移行済みの主題は復帰させない
+            self._stack.pop()
+            logger.info("topic resume skipped (tenure exclusion)",
+                        kind=top.get("kind"),
+                        title=(top.get("title") or "")[:40])
             return None
         if age > 240 and random.random() < 0.5:
             return None   # 時間が経っていたら半分は見送り（スタックは残す）
@@ -1149,7 +1779,7 @@ class TopicPlanner:
                          arc_stage=stage,
                          prev_speech=self._last_speech_text,
                          intent=intent, arc_key=arc_key)
-        if kind == "curiosity":
+        if kind in ("curiosity", "theme"):
             q = (top.get("query") or "").strip()
             if not q or self._search is None:
                 self._stack.pop()
@@ -1162,8 +1792,8 @@ class TopicPlanner:
             if self._planner_enabled:
                 self._restore_thread(top, now, stage, arc_key, started_at,
                                      speeches, continuations)
-            logger.info("topic resume", kind="curiosity", query=q[:40])
-            return Topic(kind="curiosity", label=f"続報: {q[:30]}",
+            logger.info("topic resume", kind=kind, query=q[:40])
+            return Topic(kind=kind, label=f"続報: {q[:30]}",
                          query=q, documents=docs[: self.max_documents],
                          resumed=True, arc_stage=stage,
                          prev_speech=self._last_speech_text,
@@ -1195,6 +1825,9 @@ class TopicPlanner:
                 best, best_score = d, score
         if best is None or best_score < 0.06:
             return None
+        if self._tenure_enabled \
+                and self._is_tenure_excluded(best.title, best.title):
+            return None   # tenure で移行済みの主題の続報は追わない
         self._reserved[best.key] = now
         return best
 
@@ -1209,6 +1842,13 @@ class TopicPlanner:
                 if d.key not in self._reserved]
         if not pool:
             return None
+        if self._tenure_enabled:
+            # tenure で移行済みの主題は候補から外す（全滅したら従来どおり
+            # 選ぶ。話題を枯らさないことを優先する）
+            fresh = [d for d in pool
+                     if not self._is_tenure_excluded(d.title, d.title)]
+            if fresh:
+                pool = fresh
         recent_tokens = [_title_tokens(t) for t in self._recent_titles(8)]
         speech_tokens = list(self._recent_speech_tokens)
         scored: list[tuple[WebDocument, float]] = []
@@ -1267,18 +1907,22 @@ class TopicPlanner:
     def _build_query(self) -> str:
         """好奇心検索のクエリを作る。配信テーマ優先、無ければ記憶のキーワード。
 
+        クエリは「種そのまま」か「テーマ＋キーワード1つ」までに単純化した
+        （2026-11-22 themefix）。旧方式は種にテンプレート（最新／おすすめ等）
+        を付け、テーマ時は記憶キーワードまで混ぜた複合クエリになり、検索が
+        連続で空振りした（BFラン分析の問題7）。テーマ語は ban の対象外
+        （ban_word 側で免除）なので、テーマを ban で落とす分岐は持たない。
         台帳にある直近のクエリと同じ種は避ける（最大3回引き直す）。
         """
         theme = (self._theme_provider() or "").strip()
-        banned = self.banned_words()
-        if banned and any(w in theme for w in banned):
-            theme = ""
         if theme and not self._seed_ok(theme):
             theme = ""
+        banned = self.banned_words()
         # 直近で種に使ったキーワードはクールダウン中は避ける（Phase 4.5）
         keywords = [k for k in self._keyword_provider()
                     if k.strip() and not any(w in k for w in banned)
                     and not self._seed_on_cooldown(k)
+                    and not self._is_tenure_excluded(k, k)
                     and self._seed_ok(k)]
         ledger_queries = {e.get("query", "") for e in self._ledger}
         # 取り組んでいる意図があれば、その主題を種にすることがある
@@ -1290,42 +1934,46 @@ class TopicPlanner:
             seed = (it.get("title") or "").strip()
             if seed and not any(w in seed for w in banned) \
                     and not self._seed_on_cooldown(seed) \
+                    and not self._is_tenure_excluded(seed, seed) \
                     and self._seed_ok(seed) \
                     and self._theme_overlap(seed) < _THEME_OVERLAP_SEED_MAX:
                 intention_seeds.append(seed)
         if intention_seeds and random.random() < 0.5:
             seed = random.choice(intention_seeds)
-            q = random.choice(_CURIOSITY_TEMPLATES).format(kw=seed)
-            if q not in ledger_queries and q not in self._history:
+            if seed not in ledger_queries and seed not in self._history:
                 self._mark_seed_used(seed)
-                return q
+                return seed
         best = ""
-        best_seed = ""
+        best_mark = ""
         for _ in range(3):
-            seed = ""
+            q = ""
+            mark = ""
             if theme and keywords and random.random() < 0.5:
-                seed = f"{theme} {random.choice(keywords)}"
+                kw = random.choice(keywords)
+                q = f"{theme} {kw}"
+                mark = kw
             elif theme:
-                seed = theme
+                q = theme
             elif keywords:
-                seed = random.choice(keywords)
-            if not seed:
+                q = random.choice(keywords)
+                mark = q
+            if not q:
                 return ""
-            q = random.choice(_CURIOSITY_TEMPLATES).format(kw=seed)
             best = q
-            best_seed = seed
+            best_mark = mark
             if q not in ledger_queries and q not in self._history:
-                if seed != theme:
-                    self._mark_seed_used(seed)
+                if mark:
+                    self._mark_seed_used(mark)
                 return q
-        if best_seed and best_seed != theme:
-            self._mark_seed_used(best_seed)
+        if best_mark:
+            self._mark_seed_used(best_mark)
         return best
 
     # ── メイン ────────────────────────────────────────────────
 
     async def plan(self, kind: str = "", query: str = "",
                    allow_web: bool = True,
+                   allow_web_theme: bool | None = None,
                    context: dict | None = None) -> Topic:
         """
         次の話題を決めて材料を集める。
@@ -1333,9 +1981,17 @@ class TopicPlanner:
         kind を指定すればその種類を強制する（ダッシュボードの手動実行用）。
         query を指定した場合は curiosity（そのクエリで検索）になる。
         材料が集まらなければ memory にフォールバックする。
+        自動決定では、保留回答→force_topic の種まき→コメント拾い→
+        復帰→継続の順に割り込みを確認し、どれも無ければ配信テーマの
+        話題シェア目標（_theme_due）を確認してから通常の抽選に入る。
         消費はここでは確定しない。発話できたら commit()、できなければ
         release() を呼ぶこと（ニュース記事は予約だけされる）。
         """
+        # テーマ話題の検索可否は全体の allow_web とは独立に扱える
+        # （2026-11-22 verifyfix）。テーマ設定中、テーマ話題まで間隔
+        # ゲートで検索を止めると材料なしお題に劣化するため、呼び出し
+        # 側は allow_web_theme でテーマ検索だけを許可できる
+        theme_web = allow_web or bool(allow_web_theme)
         if query:
             kind = "curiosity"
         if not kind and not query:
@@ -1343,7 +1999,16 @@ class TopicPlanner:
             # comment hook・復帰・継続のどれよりも前に差し込む
             auto: Topic | None = self._try_pending_answer()
             if auto is None:
+                # force_topic の種まき（2026-11-22 themefix）：運用が
+                # 明示的に積んだ話題は、保留回答の次に優先して消費する
+                auto = await self._try_forced_topic(allow_web,
+                                                    allow_web_theme)
+            if auto is None:
                 auto = self._try_comment_hook()
+            if auto is None:
+                # 話題の任期（2026-11-22 longstream）：同じ主題が長く
+                # なりすぎていたら、復帰・継続より前に移行を試みる
+                auto = await self._try_tenure_transition(allow_web)
             if auto is None:
                 auto = await self._try_resume(allow_web)
             if auto is None:
@@ -1355,21 +2020,33 @@ class TopicPlanner:
                 if auto.query:
                     self._history.append(auto.query)
                 return auto
-        kind = kind or self._pick_kind(allow_web, context)
-
         topic: Topic | None = None
-        if kind == "news":
-            topic = self._plan_news()
-            if topic is None:
-                # ニュース在庫が尽きたら、材料なしの記憶話題へ黙って落ちず、
-                # ニュースを除いて選び直す（2026-11-14の2時間テストで、
-                # 在庫切れのまま「強制ニュース→材料なし」が約100分続いた）
-                logger.warning("news pool exhausted, re-picking kind without news")
-                kind = self._pick_kind(allow_web, context, exclude={"news"})
-                if kind == "curiosity":
-                    topic = await self._plan_curiosity(query)
-        elif kind == "curiosity":
-            topic = await self._plan_curiosity(query)
+        if not kind and not query and self._theme_due():
+            # 配信テーマの話題シェア目標（2026-11-22 themefix）：テーマ設定中は
+            # 話題決定の一定割合をテーマ話題にする。保留回答・種まき・
+            # コメント拾い・弧の継続より後、新規話題の抽選より前に差し込む
+            topic = await self._plan_theme("", theme_web)
+            if topic is not None:
+                kind = "theme"
+                logger.info("theme topic selected (quota)",
+                            share=round(self.theme_share(), 2),
+                            target=self._theme_share_target)
+        if topic is None:
+            kind = kind or self._pick_kind(allow_web, context)
+            if kind == "news":
+                topic = self._plan_news()
+                if topic is None:
+                    # ニュース在庫が尽きたら、材料なしの記憶話題へ黙って落ちず、
+                    # ニュースを除いて選び直す（2026-11-14の2時間テストで、
+                    # 在庫切れのまま「強制ニュース→材料なし」が約100分続いた）
+                    logger.warning("news pool exhausted, re-picking kind without news")
+                    kind = self._pick_kind(allow_web, context, exclude={"news"})
+                    if kind == "curiosity":
+                        topic = await self._plan_curiosity(query)
+            elif kind == "curiosity":
+                topic = await self._plan_curiosity(query)
+            elif kind == "theme":
+                topic = await self._plan_theme(query, theme_web)
 
         if topic is None:
             topic = self._plan_memory()
@@ -1423,6 +2100,13 @@ class TopicPlanner:
                 logger.info("memory topic redrawn (banned word)",
                             text=text[:40])
                 continue
+            if self._tenure_enabled \
+                    and self._matches_tenure_exclusion(text):
+                # tenure で移行済みの主題に触れる記憶は話題化しない
+                item_banned = True
+                logger.info("memory topic redrawn (tenure exclusion)",
+                            text=text[:40])
+                continue
             if self._theme_overlap(text) < _THEME_OVERLAP_MEMORY_MAX:
                 break
             logger.info("memory topic redrawn (theme overlap)",
@@ -1463,6 +2147,163 @@ class TopicPlanner:
             arc_key=self._arc_key_for(doc.title, doc.title),
         )
 
+    def _plan_news_filtered(self, query: str = "") -> Topic | None:
+        """クエリ（無ければ配信テーマ）に合うニュース記事だけから選ぶ。
+
+        force_topic(kind=news) の絞り込み用（2026-11-22 themefix）。
+        タイトルのトークンとクエリのトークンの重なりで判定し、最も
+        重なりの大きい記事を採る。合う記事が無ければ None。
+        """
+        needle = (query or (self._theme_provider() or "")).strip()
+        if not needle or self._news is None:
+            return None
+        base = _title_tokens(needle)
+        if not base:
+            return None
+        now = time.time()
+        self._expire_reservations(now)
+        pool = [d for d in self._news.unused_items()
+                if d.key not in self._reserved]
+        best: WebDocument | None = None
+        best_score = 0.0
+        for d in pool:
+            toks = _title_tokens(d.title)
+            if not toks:
+                continue
+            shared = len(toks & base)
+            if shared < 2:
+                continue
+            score = shared / min(len(toks), len(base))
+            if score > best_score:
+                best, best_score = d, score
+        if best is None:
+            return None
+        self._reserved[best.key] = now
+        return Topic(
+            kind="news",
+            label=f"ニュース: {best.title[:30]}",
+            query=best.title,
+            documents=[best],
+            arc_stage="introduce",
+            intent=self._fresh_intent(),
+            arc_key=self._arc_key_for(best.title, best.title),
+        )
+
+    def _theme_query_candidates(self, theme: str) -> list[str]:
+        """テーマ検索クエリの候補（テーマ単体→テーマ＋キーワード1つ）"""
+        queries = [theme]
+        keywords = [k.strip() for k in self._keyword_provider()
+                    if k.strip() and self._seed_ok(k)
+                    and not self._seed_on_cooldown(k)
+                    and k.strip() not in theme]
+        if keywords:
+            queries.append(f"{theme} {random.choice(keywords)}")
+        return queries
+
+    async def _plan_theme(self, query: str = "",
+                          allow_web: bool = True) -> Topic | None:
+        """配信テーマに沿った話題を作る（2026-11-22 themefix で新設）。
+
+        材料は (1) テーマ単体／テーマ＋キーワード1つの Web 検索、
+        (2) テーマ関連の記憶、(3) 材料なしのお題（検索が死んでいても
+        テーマ発話自体は成立させるための終端）の順に探す。
+        query が指定された場合は、そのクエリをテーマ的お題として扱う。
+        """
+        theme = (self._theme_provider() or "").strip()
+        head = (query or theme).strip()
+        if not head:
+            return None
+        if allow_web and self._search is not None:
+            candidates = [head] if query \
+                else self._theme_query_candidates(theme)
+            for q in candidates:
+                docs = await self._search.search(q, limit=self.max_documents)
+                if docs:
+                    return Topic(
+                        kind="theme",
+                        label=f"テーマ: {q[:30]}",
+                        query=q,
+                        documents=docs[: self.max_documents],
+                        arc_stage="introduce",
+                        intent=self._fresh_intent(),
+                        arc_key=self._arc_key_for("", q),
+                    )
+                logger.info("theme search returned nothing", query=q)
+                self._search_failures.append(time.time())
+        topic = self._plan_theme_memory(theme or head)
+        if topic is not None:
+            return topic
+        # 材料なしのお題。お題ドキュメント（source="theme"）を1件だけ
+        # 付け、プロンプト側で「資料」ではなく「お題」として描画させる
+        doc = WebDocument(
+            title=f"配信テーマ: {head}",
+            snippet=("自分の感想や最近の出来事との接点、視聴者への"
+                     "問いかけを交えて話す。具体的な事実（価格・日程・"
+                     "数値など）は断定しない。"),
+            source="theme", site="配信テーマ")
+        return Topic(
+            kind="theme",
+            label=f"テーマ: {head[:30]}",
+            query=head,
+            documents=[doc],
+            arc_stage="introduce",
+            intent=self._fresh_intent(),
+            arc_key=self._arc_key_for("", head),
+        )
+
+    def _plan_theme_memory(self, theme: str) -> Topic | None:
+        """記憶からテーマ関連のエピソードを探してテーマ話題にする"""
+        if self._memory_provider is None or not theme:
+            return None
+        base = _title_tokens(theme)
+        if not base:
+            return None
+        banned = self.banned_words()
+        for _ in range(5):
+            try:
+                item = self._memory_provider()
+            except Exception:
+                return None
+            if not item:
+                return None
+            text = (item.get("text") or "").strip()
+            if len(text) < 10:
+                continue
+            if any(w in text for w in banned):
+                continue
+            toks = _title_tokens(text)
+            if len(toks & base) < 2:
+                continue
+            doc = WebDocument(title="覚えていること", snippet=text[:300],
+                              source="memory", site="思い出")
+            return Topic(
+                kind="theme",
+                label=f"テーマ×思い出: {text[:24]}",
+                query=theme,
+                documents=[doc],
+                arc_stage="introduce",
+                intent=self._fresh_intent(),
+                arc_key=self._arc_key_for("", theme),
+            )
+        return None
+
+    # curiosity 系の検索1回あたりの時間上限（秒）。プロバイダ巡回
+    # （各8秒）＋最小間隔＋クールダウン待ちで、空振りでも数十秒の
+    # サイクル時間を消費した（2026-11-21 BFラン: 182秒間隔の一因）。
+    # 上限を超えたら検索なしとして次の話題へ進む
+    _CURIOSITY_SEARCH_TIMEOUT_SEC = 30.0
+
+    async def _search_with_cap(self, q: str) -> list | None:
+        """時間上限付きの検索。タイムアウト時は None（空振りは []）"""
+        try:
+            return await asyncio.wait_for(
+                self._search.search(q, limit=self.max_documents),
+                timeout=self._CURIOSITY_SEARCH_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            logger.info("curiosity search timed out", query=q,
+                        timeout_sec=self._CURIOSITY_SEARCH_TIMEOUT_SEC)
+            return None
+
     async def _plan_curiosity(self, query: str = "") -> Topic | None:
         if self._search is None:
             return None
@@ -1473,7 +2314,10 @@ class TopicPlanner:
             # 直近で使ったクエリなら1回だけ引き直す
             q = (self._build_query() or q).strip()
 
-        docs = await self._search.search(q, limit=self.max_documents)
+        docs = await self._search_with_cap(q)
+        if docs is None:
+            self._search_failures.append(time.time())
+            return None
         if not docs:
             logger.info("curiosity search returned nothing", query=q)
             self._search_failures.append(time.time())
@@ -1489,6 +2333,8 @@ class TopicPlanner:
         )
 
     def status(self) -> dict:
+        chain = self._subject_chain(time.time()) \
+            if self._tenure_enabled else None
         return {
             "weights": self.weights,
             "recent_queries": list(self._history),
@@ -1514,7 +2360,18 @@ class TopicPlanner:
             "ledger": list(self._ledger)[-10:],
             "kind_counts": {
                 k: sum(1 for e in self._ledger if e.get("kind") == k)
-                for k in ("memory", "news", "curiosity", "filler")
+                for k in ("memory", "news", "curiosity", "filler", "theme")
+            },
+            "stream_theme": {
+                "theme": (self._theme_provider() or "").strip(),
+                "share_target": self._theme_share_target,
+                "theme_share": round(self.theme_share(), 2),
+                "speeches": self._theme_stat_speeches,
+                "mentions": self._theme_stat_mentions,
+                "mention_rate": round(
+                    self._theme_stat_mentions / self._theme_stat_speeches, 3)
+                if self._theme_stat_speeches else 0.0,
+                "forced_pending": len(self._forced_topics),
             },
             "memory_share": round(self.memory_share(), 2),
             "memory_cap": {"ratio": self._memory_cap_ratio,
@@ -1527,4 +2384,21 @@ class TopicPlanner:
                      "closing": bool(self._thread.get("closing"))}
                     if self._thread else None),
             "arc_stats": dict(self._arc_stats),
+            "tenure": {
+                "enabled": self._tenure_enabled,
+                "speeches": self._tenure_speeches,
+                "sec": self._tenure_sec,
+                "cooldown_sec": self._tenure_cooldown_sec,
+                "excluded": [
+                    {"arc_key": k[:40],
+                     "title": (v.get("title") or "")[:40],
+                     "remaining_sec": round(
+                         float(v.get("until") or 0) - time.time(), 1)}
+                    for k, v in self._tenure_excluded.items()
+                    if float(v.get("until") or 0) > time.time()],
+                "chain": ({"arc_key": chain["arc_key"][:40],
+                           "speeches": chain["speeches"],
+                           "elapsed_sec": round(chain["elapsed"], 1)}
+                          if chain else None),
+            },
         }

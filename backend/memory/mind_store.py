@@ -368,17 +368,6 @@ class MindStore:
         ).fetchall()
         return [self._row_to_opinion(r) for r in rows]
 
-    def search_opinions(self, query: str, limit: int = 5) -> list[Opinion]:
-        """主題・理由への部分一致で active な意見を探す（Phase 1 の最小検索）"""
-        q = f"%{query.strip()}%"
-        rows = self._conn.execute(
-            "SELECT * FROM opinions WHERE status = 'active'"
-            " AND (topic_label LIKE ? OR reasons LIKE ?)"
-            " ORDER BY confidence DESC, updated_at DESC LIMIT ?",
-            (q, q, limit),
-        ).fetchall()
-        return [self._row_to_opinion(r) for r in rows]
-
     # ── 意図 ──────────────────────────────────────────────────
 
     def get_intention_by_title(self, title: str) -> Intention | None:
@@ -650,17 +639,6 @@ class MindStore:
                          basis=row["basis"], approved=row["approved"],
                          provenance=row["provenance"],
                          created_at=row["created_at"])
-
-    def list_narratives(self) -> list[Narrative]:
-        rows = self._conn.execute(
-            "SELECT * FROM narrative_versions ORDER BY version DESC"
-        ).fetchall()
-        return [
-            Narrative(id=r["id"], version=r["version"], text=r["text"],
-                      basis=r["basis"], approved=r["approved"],
-                      provenance=r["provenance"], created_at=r["created_at"])
-            for r in rows
-        ]
 
     # ── 思考ジャーナル ────────────────────────────────────────
 

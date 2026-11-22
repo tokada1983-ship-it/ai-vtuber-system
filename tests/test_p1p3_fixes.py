@@ -29,7 +29,7 @@ from helpers import RAW, FakeHub, NoAudio, StubLLM, StubTTS, make_orchestrator
 AIZUCHI = "Character1ちゃん、それはどういうことなの？ わたしにも教えて？"
 SHORT_PHRASE = "ありがとうございます。"
 NORMAL_A = "新しい話題だよ。今日は天気の話をしよう。"
-NORMAL_B = "Character2の新しい話題だよ。別の切り口で話すね。"
+NORMAL_B = "ミライの新しい話題だよ。別の切り口で話すね。"
 LONG_REPEAT = "調査の結果を報告するね。今日のニュースを詳しく調べてみたよ。"
 
 
@@ -143,7 +143,7 @@ class FakePlannerEx:
     def banned_words(self) -> set:
         return set()
 
-    def reset_thread(self) -> None:
+    def reset_thread(self, reason: str = "reset") -> None:
         pass
 
     def note_speech(self, idle: bool = False, text: str = "") -> None:
@@ -167,11 +167,11 @@ def make_duo_p1p3(llm_a=None, llm_b=None, fallback_a=(), fallback_b=(),
     cfg.tts.irodori_server.auto_start = False
     cfg.knowledge.enabled = False
     cfg.characters = [
-        CharacterConfig(name="Character1", id="Character1", data_dir=str(tmp),
-                        prompt_file=_write_char(tmp, "Character1"),
-                        aliases=["character1"], fallback_lines=list(fallback_a)),
-        CharacterConfig(name="Character2", id="Character2", data_dir=str(tmp),
-                        prompt_file=_write_char(tmp, "Character2"),
+        CharacterConfig(name="クロエ", id="chloe", data_dir=str(tmp),
+                        prompt_file=_write_char(tmp, "クロエ"),
+                        aliases=["くろえ"], fallback_lines=list(fallback_a)),
+        CharacterConfig(name="ミライ", id="mirai", data_dir=str(tmp),
+                        prompt_file=_write_char(tmp, "ミライ"),
                         fallback_lines=list(fallback_b)),
     ]
     cfg.ensemble = EnsembleConfig(turn_gap_sec=0, idle_banter_probability=0.0,

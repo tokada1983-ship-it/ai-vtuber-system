@@ -95,8 +95,8 @@ class MemoryConsolidator:
         self._store = memory_store
         self._filter = response_filter
         self._viewer_store = viewer_store
-        self._last_attempt: datetime | None = None   # 成否によらず試行した時刻
-        self._last_success: datetime | None = None
+        # 旧 last_attempt / last_success プロパティは読み手が無く、
+        # 書き込みだけが残っていたため削除した（F10）
         self._is_running = False
 
     def bind_store(
@@ -125,12 +125,8 @@ class MemoryConsolidator:
             return ConsolidationResult(skipped=True, reason="整理対象の会話がありません")
 
         self._is_running = True
-        self._last_attempt = datetime.now()
         try:
-            result = await self._run(messages, llm)
-            if result.ok:
-                self._last_success = datetime.now()
-            return result
+            return await self._run(messages, llm)
         finally:
             self._is_running = False
 
@@ -297,13 +293,3 @@ class MemoryConsolidator:
         except Exception:
             return None
         return data if isinstance(data, dict) else None
-
-    # ── 状態 ──────────────────────────────────────────────────
-
-    @property
-    def last_attempt(self) -> datetime | None:
-        return self._last_attempt
-
-    @property
-    def last_success(self) -> datetime | None:
-        return self._last_success

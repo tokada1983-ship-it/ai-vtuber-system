@@ -291,6 +291,81 @@ function avatarConfigUrl() {
 function pick(list) { return list[Math.floor(Math.random() * list.length)]; }
 
 // ── 再生ステートマシン ──────────────────────────────────────────
+
+// ── 切替直後の早期リカバリ（early replay） ────────────────────
+// クリップ切替直後に再生が始まらない型への対策:
+//   (a) play() が即時拒否され、再生位置が 0 のまま止まる型
+//   (b) 数フレーム（実測 0.06〜0.14 秒）進んでから止まる型
+//   (c) 0.2〜0.3 秒まで進んでから凍結する型（2026-11-21 BF ランの
+//       停滞2件: check=1 で ct=0.25／0.26）
+// (b) は初版（切替1.2秒後に1回だけ・再生位置 <0.05 で判定）では
+// 閾値の外で全件すり抜けたため、1.2 秒間隔で繰り返し判定する方式に
+// 改めた（2026-11-21 streamfix）。しかし (c) は「切替時点からの
+// 前進量」で測る判定では check=1 で progressed と誤判定され、監視が
+// 打ち切られて6秒ウォッチドッグ頼みになった（回復約7秒）。
+// そのため判定を「経過時間に対する再生位置の割合（ペース）」に変えた:
+//   - ペース順調（再生位置が経過時間の半分以上）かつ前回チェック
+//     から 0.03 秒以上進んでいれば正常（progressed）として打ち切る。
+//     通常の切替は最初のチェックでここに入る（実測 ct≈1.19／
+//     経過1.2秒）ため誤発火しない。
+//   - readyState>=2 で前回チェックから全く進んでいなければ、
+//     paused かどうかによらず play() を打ち直す（replayed）。
+//     (c) 型は check=1 では前進量が残るため lagging（遅れ）と記録
+//     され、check=2（≒2.4秒）で打ち直しが発動する。
+//   - 進んではいるがペースに届かない場合は lagging として監視継続
+//     （再生開始が遅いだけのクリップを打ち直さない）。
+//   - 最大 EARLY_REPLAY_MAX_CHECKS 回（≒4.8秒）まで繰り返し、
+//     それでも進捗しなければ6秒ウォッチドッグ（最終防衛線）に委ねる。
+// 判定結果は page_event（early_replay_check）として残す。初回と
+// 最終の結果は必ず送り、途中分は間引く。理由の語彙は progressed／
+// replayed／lagging／not_ready（旧 not_paused／beyond_threshold は
+// ペース判定の導入で lagging／replayed に統合された）。
+const EARLY_REPLAY_INTERVAL_MS = 1200;
+const EARLY_REPLAY_MAX_CHECKS = 4;
+const EARLY_REPLAY_PROGRESS_SEC = 0.03;
+const EARLY_REPLAY_PACE_RATIO = 0.5;
+
+function watchEarlyReplay(url, el) {
+  let lastCt = el.currentTime || 0;
+  let checks = 0;
+  const step = () => {
+    if (health.currentClip !== url || els[front] !== el) return;
+    if (el.ended) return;
+    checks += 1;
+    const ct = el.currentTime || 0;
+    const advanced = ct - lastCt;
+    lastCt = ct;
+    const paceMin = EARLY_REPLAY_PACE_RATIO *
+      (EARLY_REPLAY_INTERVAL_MS / 1000) * checks;
+    if (advanced > EARLY_REPLAY_PROGRESS_SEC && ct >= paceMin) {
+      sendPageEvent('early_replay_check', 'clip=' + clipName(url) +
+        ' result=progressed check=' + checks + ' ct=' + ct.toFixed(2));
+      return;
+    }
+    let outcome;
+    if (el.readyState < 2) {
+      outcome = 'not_ready';
+    } else if (advanced <= EARLY_REPLAY_PROGRESS_SEC) {
+      sendPageEvent('early_replay', 'clip=' + clipName(url) +
+        ' check=' + checks + ' ct=' + ct.toFixed(2) +
+        ' readyState=' + el.readyState + ' networkState=' + el.networkState);
+      const rp = el.play(); if (rp) rp.catch(() => {});
+      outcome = 'replayed';
+    } else {
+      outcome = 'lagging';
+    }
+    const isLast = checks >= EARLY_REPLAY_MAX_CHECKS;
+    if (checks === 1 || isLast) {
+      sendPageEvent('early_replay_check', 'clip=' + clipName(url) +
+        ' result=' + outcome + ' check=' + checks +
+        ' paused=' + el.paused + ' readyState=' + el.readyState +
+        ' ct=' + ct.toFixed(2));
+    }
+    if (!isLast) setTimeout(step, EARLY_REPLAY_INTERVAL_MS);
+  };
+  setTimeout(step, EARLY_REPLAY_INTERVAL_MS);
+}
+
 function swapTo(url, { loop = false } = {}) {
   const cur = els[front];
   const nxt = els[1 - front];
@@ -310,20 +385,8 @@ function swapTo(url, { loop = false } = {}) {
   setTimeout(() => { try { cur.pause(); } catch (e) {} }, 300);
   front = 1 - front;
   els[front].onended = onClipEnded;
-  // 切替直後の開始失敗への早期リカバリ（2026-11-21 分析E）：
-  // 実配信の停滞10件が全て「切替直後・paused=true・readyState=4・再生位置ほぼ0」
-  // だったため、6秒ウォッチドッグを待たず、切替1.2秒後に同条件なら play を
-  // 1回だけ打ち直す。正常な切替では paused=false か再生位置が進むため発火しない。
-  const startedEl = els[front];
-  setTimeout(() => {
-    if (health.currentClip !== url || els[front] !== startedEl) return;
-    if (startedEl.paused && !startedEl.ended && startedEl.readyState >= 2 &&
-        (startedEl.currentTime || 0) < 0.05) {
-      sendPageEvent('early_replay', 'clip=' + clipName(url) +
-        ' readyState=' + startedEl.readyState + ' networkState=' + startedEl.networkState);
-      const rp = startedEl.play(); if (rp) rp.catch(() => {});
-    }
-  }, 1200);
+  // 切替直後の開始失敗への早期リカバリ（watchEarlyReplay が担当）
+  watchEarlyReplay(url, els[front]);
 }
 
 function nextIdleUrl() {

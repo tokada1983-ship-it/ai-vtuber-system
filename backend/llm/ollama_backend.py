@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import AsyncIterator
 
 import httpx
@@ -15,6 +16,20 @@ from backend.logger import get_logger
 from backend.models import ChatMessage, LLMResponse
 
 logger = get_logger(__name__)
+
+# ストリーミング生成の読み取りタイムアウト（秒）。中途停滞（数十トークン
+# 進んでから無音になる型）は、この時間だけ無音が続いたら失敗として
+# 切り上げる。プリフィル（数千トークン）とモデルの再読込（実測約15秒）
+# には十分な余裕を持たせてある（2026-11-21 BFラン: 120秒待ちが
+# 346秒間隔の一因になったことへの対策）
+_STREAM_READ_TIMEOUT_SEC = 60.0
+
+
+def _ns_to_ms(value) -> int | None:
+    """Ollama がナノ秒で返す所要時間をミリ秒へ（無い場合は None）"""
+    if not isinstance(value, (int, float)):
+        return None
+    return int(value / 1_000_000)
 
 
 class OllamaBackend(LLMBackend):
@@ -51,33 +66,60 @@ class OllamaBackend(LLMBackend):
         return await self.service.ensure_model(self._cfg.model)
 
     async def probe(self) -> bool:
-        """回復確認用の最小生成プローブ（failback 判定用。Phase 4）。
+        """回復確認用の生成プローブ（failback 判定用。Phase 4）。
 
-        設定中モデルへ num_predict=1 の短い生成を1回だけ投げ、応答が
-        返れば健全とみなして _healthy を戻す。サーバ生存確認（/api/tags）
-        だけでは「モデルが実際に生成できるか」までは分からないため、
-        実生成で確認する。通常の発話経路には影響しない（結果は捨てる）。
+        実生成に近い条件で判定する: ある程度の長さのストリーミング生成が
+        最後まで流れることをもって健全とする。以前の num_predict=1 の
+        一括生成では「短いリクエストは通るが、実生成（大きなプロンプト＋
+        長いストリーム）は途中で止まる」状態を健全と誤判定し、primary へ
+        戻しては再失敗する往復が起きた（2026-11-21 BFラン）。生成結果の
+        テキストは捨てる（通常の発話経路には影響しない）。
         """
         payload: dict = {
             "model": self._cfg.model,
-            "messages": [{"role": "user", "content": "ping"}],
-            "stream": False,
+            "messages": [{"role": "user", "content":
+                           "今日の配信の見どころを、3文くらいで紹介してください。"}],
+            "stream": True,
             "keep_alive": self.service.keep_alive,
-            "options": {"temperature": 0.0, "num_predict": 1},
+            "options": {"temperature": 0.0, "num_predict": 48},
         }
         extra = self._cfg.extra_payload or {}
         if "think" in extra:
             payload["think"] = extra["think"]
+        # 実生成と同じコンテキスト長で投げる（段が違うと判定がずれる）
+        if self._adaptive is not None:
+            payload["options"]["num_ctx"] = self._adaptive.current_num_ctx
+        elif "num_ctx" in extra:
+            payload["options"]["num_ctx"] = extra["num_ctx"]
+        started = time.monotonic()
+        eval_count = 0
+        done = False
         try:
-            resp = await self._get_client().post(
-                self._url, json=payload,
-                timeout=httpx.Timeout(20.0, connect=5.0))
-            resp.raise_for_status()
-            data = resp.json()
-            ok = isinstance(data.get("message"), dict)
+            async with self._get_client().stream(
+                    "POST", self._url, json=payload,
+                    timeout=httpx.Timeout(45.0, connect=5.0)) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if chunk.get("done"):
+                        eval_count = int(chunk.get("eval_count") or 0)
+                        done = True
+                        break
         except Exception as e:
-            logger.debug("Ollama probe failed", error=str(e))
-            ok = False
+            logger.debug("Ollama probe failed",
+                         error_type=type(e).__name__, error=str(e))
+        # done まで流れ、かつ相応のトークン数が出ていること（1トークンで
+        # 即 done する応答は「生成できる」とはみなさない）
+        ok = done and eval_count >= 16
+        logger.info("Ollama probe", model=self._cfg.model, ok=ok,
+                    eval_count=eval_count,
+                    duration_ms=int((time.monotonic() - started) * 1000))
         self._healthy = ok
         return ok
 
@@ -261,6 +303,7 @@ class OllamaBackend(LLMBackend):
         payload = self._build_payload(system_prompt, messages, stream=False,
                                       temperature=temperature)
         url = self._url
+        started = time.monotonic()
 
         try:
             try:
@@ -280,9 +323,21 @@ class OllamaBackend(LLMBackend):
                 "eval_count": data.get("eval_count"),
                 "prompt_eval_count": data.get("prompt_eval_count"),
                 "thinking_chars": len(message.get("thinking") or ""),
+                "total_duration_ms": _ns_to_ms(data.get("total_duration")),
+                "eval_duration_ms": _ns_to_ms(data.get("eval_duration")),
             }
             self._observe_ctx_meta()
             self._healthy = True
+            # 成功時も含めて生成レイテンシとトークン数を残す（劣化の前兆＝
+            # 緩やかなレイテンシ増加を後から追えるようにするため。
+            # 2026-11-21 BFランでは失敗時の記録しかなく分布が取れなかった）
+            logger.info(
+                "Ollama generation", model=self._cfg.model, route=route,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                eval_count=data.get("eval_count"),
+                prompt_eval_count=data.get("prompt_eval_count"),
+                total_duration_ms=self._last_gen_meta["total_duration_ms"],
+                eval_duration_ms=self._last_gen_meta["eval_duration_ms"])
             result = parse_tag_output(raw_text, gen_meta=self._last_gen_meta) \
                 if self.protocol == "tag" else parse_llm_output(raw_text)
             logger.debug("Ollama response", speech=result.speech[:40] if result.speech else "skip")
@@ -293,7 +348,12 @@ class OllamaBackend(LLMBackend):
             self._healthy = False
             return LLMResponse(speech="", skip=True)
         except httpx.TimeoutException:
-            logger.warning("Ollama: request timed out — model may be loading")
+            # 120秒の無応答はモデルのロード待ちでは説明がつかない
+            # （実測の再読込は約15秒）。停滞として unhealthy を立て、
+            # 呼び出し側のフェイルオーバー判定に乗せる
+            logger.warning("Ollama: request timed out — model may be loading",
+                           duration_ms=int((time.monotonic() - started) * 1000))
+            self._healthy = False
             return LLMResponse(speech="", skip=True)
         except Exception as e:
             logger.warning("Ollama error", error_type=type(e).__name__, error=repr(e)[:300])
@@ -310,10 +370,14 @@ class OllamaBackend(LLMBackend):
     ) -> AsyncIterator[str]:
         payload = self._build_payload(system_prompt, messages, stream=True,
                                       temperature=temperature)
+        started = time.monotonic()
 
         for attempt in range(2):
             try:
-                async with self._get_client().stream("POST", self._url, json=payload) as resp:
+                async with self._get_client().stream(
+                        "POST", self._url, json=payload,
+                        timeout=httpx.Timeout(120.0, connect=10.0,
+                                              read=_STREAM_READ_TIMEOUT_SEC)) as resp:
                     resp.raise_for_status()
                     self._healthy = True
                     # NDJSON を直接読む。content だけを下流へ流し、思考
@@ -343,8 +407,26 @@ class OllamaBackend(LLMBackend):
                                 "prompt_eval_count": chunk.get(
                                     "prompt_eval_count"),
                                 "thinking_chars": thinking_chars,
+                                "total_duration_ms": _ns_to_ms(
+                                    chunk.get("total_duration")),
+                                "eval_duration_ms": _ns_to_ms(
+                                    chunk.get("eval_duration")),
                             }
                             self._observe_ctx_meta()
+                            # 成功時も含めて生成レイテンシとトークン数を残す
+                            # （generate() 側と同じ観測。劣化の前兆検出用）
+                            logger.info(
+                                "Ollama generation (stream)",
+                                model=self._cfg.model, route=route,
+                                duration_ms=int(
+                                    (time.monotonic() - started) * 1000),
+                                eval_count=chunk.get("eval_count"),
+                                prompt_eval_count=chunk.get(
+                                    "prompt_eval_count"),
+                                total_duration_ms=self._last_gen_meta[
+                                    "total_duration_ms"],
+                                eval_duration_ms=self._last_gen_meta[
+                                    "eval_duration_ms"])
                             break
                 return
             except httpx.ConnectError:
@@ -353,10 +435,15 @@ class OllamaBackend(LLMBackend):
                     continue
                 logger.warning("Ollama stream: connection refused — is Ollama running?")
                 self._healthy = False
+                self._last_gen_meta = {**self._last_gen_meta,
+                                       "stream_error": "ConnectError"}
                 return
             except Exception as e:
-                logger.warning("Ollama stream error", error_type=type(e).__name__, error=repr(e)[:300])
+                logger.warning("Ollama stream error", error_type=type(e).__name__, error=repr(e)[:300],
+                               duration_ms=int((time.monotonic() - started) * 1000))
                 self._healthy = False
+                self._last_gen_meta = {**self._last_gen_meta,
+                                       "stream_error": type(e).__name__}
                 return
 
     @property

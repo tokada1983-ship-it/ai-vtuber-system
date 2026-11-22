@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from backend import factory
 from backend.config import AppConfig, AvatarConfig, CharacterConfig
@@ -33,6 +34,9 @@ from backend.memory.viewer_store import ViewerProfileStore
 from backend.models import Comment, Emotion
 from backend.safety.response_filter import ResponseFilter
 from backend.tts.base import TTSBackend
+
+if TYPE_CHECKING:
+    from backend.knowledge.topic_planner import TopicPlanner
 
 logger = get_logger(__name__)
 
@@ -72,6 +76,16 @@ class CharacterAgent:
         self.episodic_rag = RAGRetriever()   # エピソード記憶（1件1チャンク）
         self.long_term_memory: LongTermMemory | None = None
         self.memory_store: MemoryStore | None = None
+        # 配信中の記憶整理（2026-11-22 longstream）：「ここまでの流れ」
+        # ダイジェスト。オーケストレータが整理サイクルごとに差し替える
+        self.stream_digest: str = ""
+        # 話題プランナー（会話単位で共有される1個）。Orchestrator が
+        # 構築後に set_topic_planner で差し込む。build_idle_memory の
+        # §3-C3 フィルタが、プランナーのクールダウン台帳を参照する
+        # ために使う。config（self.app.orchestrator）は設定値だけの
+        # オブジェクトでプランナーを持たないため、そちらから引くと
+        # 常に None になりフィルタが無効化する（2026-11-22 c3fix）
+        self._topic_planner: TopicPlanner | None = None
         # 「個」のストア（意見・意図・選好・自己物語）。memory_store と同じ
         # memories.db に同居するが、担当するテーブルは分離している。
         self.mind_store: MindStore | None = None
@@ -79,6 +93,10 @@ class CharacterAgent:
         # load_memory と refresh_mind() のときだけ差し替える（発話間のみ更新）。
         self._mind_snapshot: MindSnapshot | None = None
         self.viewer_store: ViewerProfileStore | None = None
+        # 会話単位で共有する視聴者台帳（F2）。Orchestrator が構築後に
+        # set_shared_viewer_store で差し込む。セットされている間、
+        # load_memory はキャラ別 DB を作らず共有ストアを使い回す。
+        self._shared_viewer_store: ViewerProfileStore | None = None
         self.chat_history: ChatHistory | None = None
         self.consolidator = MemoryConsolidator(memory_store=None, response_filter=response_filter)
 
@@ -148,9 +166,13 @@ class CharacterAgent:
         )
         self.mind_store = MindStore(db_path=char_dir / "memories.db")
         self.refresh_mind()
-        self.viewer_store = ViewerProfileStore(
-            db_path=char_dir / "viewer_profiles.db",
-            points_cfg=self.app.viewer_points)
+        if self._shared_viewer_store is not None:
+            # 台帳は会話単位で1つ（F2）。キャラ別 DB は作らない
+            self.viewer_store = self._shared_viewer_store
+        else:
+            self.viewer_store = ViewerProfileStore(
+                db_path=char_dir / "viewer_profiles.db",
+                points_cfg=self.app.viewer_points)
         self.chat_history = ChatHistory(
             name, prompts_dir=data_dir,
             max_entries=self.app.local_chat.history_max_entries,
@@ -163,13 +185,45 @@ class CharacterAgent:
                     episodic=self.memory_store.count(),
                     core_chars=len(self.long_term_memory.get_raw()))
 
+    def set_shared_viewer_store(self, store: ViewerProfileStore) -> None:
+        """会話単位の共有視聴者台帳を受け取り、自分の台帳として差し替える。
+
+        構築時に作られたキャラ別ストアはここで閉じる（接続を残さない）。
+        整理器の書き込み先も共有ストアへ付け替える。
+        """
+        if self.viewer_store is not None and self.viewer_store is not store:
+            try:
+                self.viewer_store.close()
+            except Exception:
+                pass
+        self._shared_viewer_store = store
+        self.viewer_store = store
+        self.consolidator.bind_store(self.memory_store, viewer_store=store)
+
+    def set_topic_planner(self, planner: TopicPlanner | None) -> None:
+        """会話単位で共有される話題プランナーを受け取る。
+
+        Orchestrator が出演者の組み立て時に差し込む（視聴者台帳の
+        共有と同じ方式）。build_idle_memory の §3-C3 フィルタが、
+        話題化したばかりの記憶を L3 常駐注入から外すために使う。
+        knowledge 無効時は None が差し込まれ、フィルタは働かない。
+        """
+        self._topic_planner = planner
+
     def close(self) -> None:
-        for store in (self.memory_store, self.viewer_store, self.mind_store):
+        for store in (self.memory_store, self.mind_store):
             if store is not None:
                 try:
                     store.close()
                 except Exception:
                     pass
+        # 共有台帳は他の出演者も使っているため、1体の都合では閉じない
+        if (self.viewer_store is not None
+                and self.viewer_store is not self._shared_viewer_store):
+            try:
+                self.viewer_store.close()
+            except Exception:
+                pass
 
     def recall(self, query: str) -> str:
         """
@@ -275,8 +329,10 @@ class CharacterAgent:
             # §3-C3 の最小形）。プランナーのクールダウン台帳を共有し、
             # 「話題として話した記憶」と「常駐注入される記憶」の二経路で
             # 同じエピソードが繰り返される（お菓子ループの温床）を断つ。
-            # 除外で枠が空く場合は、少し広く引いて別の記憶で埋める
-            planner = getattr(orch, "_planner", None)
+            # 除外で枠が空く場合は、少し広く引いて別の記憶で埋める。
+            # プランナーは set_topic_planner で差し込まれた共有
+            # インスタンスを使う（config には存在しない。c3fix で是正）
+            planner = self._topic_planner
             if planner is not None and recent:
                 try:
                     fresh = [e for e in recent
@@ -290,6 +346,11 @@ class CharacterAgent:
                     pass
             if recent:
                 parts.append("\n".join(["## 最近おぼえたこと"] + [f"- {e.text}" for e in recent]))
+        # この配信のここまでの流れ（配信中の記憶整理で更新される要約。
+        # 長時間配信で古い材料が圧縮されても、流れの骨格はここに残る）
+        digest = (getattr(self, "stream_digest", "") or "").strip()
+        if digest:
+            parts.append("## この配信のここまでの流れ\n" + digest)
         if extra:
             parts.append(extra)
         return "\n\n".join(parts).strip()

@@ -87,7 +87,9 @@ def test_memory_store_opens_legacy_db_without_viewer_column(tmp_path):
     store = MemoryStore(db_path=db)
     assert store.count() == 1
     store.add("新しい記憶", viewer_name="たろう")
-    assert [e.text for e in store.by_viewer("たろう")] == ["新しい記憶"]
+    # F10: by_viewer は削除されたため、全件から viewer_name で絞る
+    assert [e.text for e in store.all()
+            if e.viewer_name == "たろう"] == ["新しい記憶"]
     store.close()
 
 
@@ -288,10 +290,10 @@ class TestEncode:
 
 class TestExport:
     def test_model_name_is_ollama_safe(self):
-        name = export.runtime_model_name("Character1", "20260929-163000")
+        name = export.runtime_model_name("クロエ", "20260929-163000")
         assert name == name.lower() and all(c.isalnum() or c in "-._" for c in name)
-        assert name == export.runtime_model_name("Character1", "20260929-163000")   # 決定的
-        assert export.runtime_model_name("Sample Noir", "r1") == "persona-sample-noir-r1"
+        assert name == export.runtime_model_name("クロエ", "20260929-163000")   # 決定的
+        assert export.runtime_model_name("Chloe Noir", "r1") == "persona-chloe-noir-r1"
 
     def test_modelfile_modes(self, tmp_path):
         (tmp_path / "merged").mkdir()

@@ -4,13 +4,14 @@ from __future__ import annotations
 import asyncio
 import json
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 from backend.avatar import live2d as live2d_util
 from backend.avatar import video as video_util
 from backend.config import save_config
 from backend.logger import get_logger
+from backend.orchestrator import PreviousLoopsStuckError
 from backend.memory.character_preset import AvatarPreset as AvatarPresetModel
 from backend.memory.character_preset import CharacterPreset
 from backend.runtime import (
@@ -78,6 +79,11 @@ async def chat_page():
     """ローカルテストモード: ローカルユーザーと1対1でチャットする画面"""
     return (FRONTEND / "chat.html").read_text(encoding="utf-8")
 
+@router.get("/speechlog", response_class=HTMLResponse)
+async def speechlog_page():
+    """配信画面右端の発言ログ欄（OBSブラウザソース用、?demo=1 で表示確認）"""
+    return (FRONTEND / "speech_log.html").read_text(encoding="utf-8")
+
 @router.get("/api/status")
 async def api_status():
     return {
@@ -85,6 +91,8 @@ async def api_status():
         "llm_backend": orchestrator._status.llm_backend,
         "tts_backend": orchestrator._status.tts_backend,
         "uptime_sec": orchestrator._status.uptime_sec,
+        # アバター画面のハートビート状態（F10: 観測口が無く死角だった）
+        "avatar_health": hub.avatar_health(),
     }
 
 @router.get("/api/devices")
@@ -98,6 +106,7 @@ async def api_diagnose():
     result = await diagnose(orchestrator._cfg)
     result["stt"] = orchestrator.stt_status
     result["tts_health"] = orchestrator.tts_health
+    result["avatar_health"] = hub.avatar_health()
     # 疎通はするが合成が返らないハング状態は、実行時の観測でしか分からない
     health = result["tts_health"]
     if health["consecutive_timeouts"] > 0:
@@ -178,13 +187,49 @@ async def api_live2d_model_info(path: str = ""):
     info = live2d_util.describe_model(target)
     return {"ok": True, "path": target, **info}
 
+# /api/start の直列化ロック。開始処理（数秒〜数十秒かかる）の途中に
+# 2回目の start が割り込むと、開始途中の状態のまま再起動経路へ入って
+# しまうため、稼働チェックと開始を不可分にする。
+_start_lock = asyncio.Lock()
+
+
 @router.post("/api/start")
 async def api_start(body: dict):
     video_id = body.get("video_id", "")
-    await orchestrator.start(video_id)
-    # 配信中であることを外部ウォッチドッグへ伝える状態ファイルを作成
-    write_stream_state(video_id)
-    return {"ok": True, "video_id": video_id}
+    async with _start_lock:
+        # 冪等化：このプロセスで配信セッションが既に開始済みの場合は、
+        # 再起動せず現状を返す（2026-11-21 の二重投入で、再起動時の
+        # 残タスクが新セッションを無言で塞ぐ事象が発生したため）。
+        # ウォッチドッグの復旧は新プロセスへの /api/start で行われ、
+        # その時点ではセッション未開始なので通常どおり開始できる。
+        if orchestrator.is_running:
+            current_video_id = orchestrator._status.video_id
+            if video_id and video_id != current_video_id:
+                # 開始済みセッションと違う video_id が来ても、黙って
+                # 差し替えず現行セッションを維持する（video_id の
+                # 変更は /api/video_id の役割）
+                logger.warning(
+                    "/api/start ignored: session already running "
+                    "with a different video_id",
+                    requested_video_id=video_id,
+                    current_video_id=current_video_id)
+            else:
+                logger.info(
+                    "/api/start ignored: session already running",
+                    video_id=current_video_id)
+            return {"ok": True, "already_running": True,
+                    "video_id": current_video_id}
+        try:
+            await orchestrator.start(video_id)
+        except PreviousLoopsStuckError as e:
+            # 前セッションのループが止め切れていない。開始成功を
+            # 装わず、呼び出し元へ失敗を返す（復旧はプロセス再起動）
+            logger.error("/api/start failed: previous loops stuck",
+                         error=str(e))
+            raise HTTPException(status_code=409, detail=str(e))
+        # 配信中であることを外部ウォッチドッグへ伝える状態ファイルを作成
+        write_stream_state(video_id)
+        return {"ok": True, "video_id": video_id}
 
 # /api/stop の応答上限（秒）。停止処理は段階別タイムアウト付きだが、
 # それでも終わらない場合は応答だけ先に返し、処理は裏で継続させる。
@@ -623,8 +668,14 @@ async def api_knowledge_search(body: dict):
 @router.post("/api/knowledge/topic")
 async def api_force_topic(body: dict):
     """
-    いますぐ自分から話題を振らせる。
-    kind: "" (自動) / "memory" / "news" / "curiosity"、query 指定でその話題を検索して話す。
+    話題の種まき（2026-11-22 themefix で意味を変更）。
+
+    旧実装はその場で _speak_idle を1回叩く fire-and-forget で、テーマを
+    運ばずログも残らなかった。新実装はプランナの優先キューへ積み、
+    次回以降の話題決定で最優先に消費させる（投入・消費ともログに残る）。
+    kind: "" (自動) / "memory" / "news" / "curiosity" / "theme"。
+    news は query（無ければ配信テーマ）で絞り込み、query 指定は
+    テーマ的お題として扱う。レスポンス形式は従来と互換（queued を追加）。
     """
     if orchestrator._llm is None:
         return {"ok": False, "error": "配信が開始されていません"}
@@ -632,9 +683,10 @@ async def api_force_topic(body: dict):
     query = (body.get("query") or "").strip()
     # character を指定するとそのキャラが話題を振る（省略時は順番）
     agent = orchestrator.get_agent(body.get("character", "")) if body.get("character") else None
-    asyncio.create_task(orchestrator._speak_idle(kind=kind, query=query, agent=agent))
+    queued = orchestrator.seed_topic(kind=kind, query=query)
     return {"ok": True, "kind": kind or "auto", "query": query,
-            "character": agent.name if agent else "auto"}
+            "character": agent.name if agent else "auto",
+            "queued": queued}
 
 
 def _chat_status() -> dict:
